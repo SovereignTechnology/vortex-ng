@@ -13,3 +13,4 @@ workspace = true
 
 [dependencies]
 vortex-ng-core = { workspace = true }
+bdk_wallet = { workspace = true }

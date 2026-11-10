@@ -38,6 +38,8 @@ nostr = { version = "=0.45.5", default-features = false, features = ["std", "os-
 # rust-bitcoin's minimal JSON-RPC client (HTTP over TCP, basic auth) for Core-compatible nodes.
 jsonrpc = "0.21.0"
 serde_json = { version = "1", features = ["raw_value"] }
+# Descriptor wallets (rust-bitcoin 0.32) with BIP39 seeds; synced from our own chain backend.
+bdk_wallet = { version = "3.2.0", default-features = false, features = ["std", "keys-bip39"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -43,7 +43,9 @@ skip = [
     # crypto_box 0.9 (RustCrypto aead 0.5) uses rand_core 0.6 / getrandom 0.2; rust-nostr uses rand 0.10.
     { name = "rand_core", version = "=0.6.4" },
     { name = "getrandom", version = "=0.2.17" },
-    # Build-time only: curve25519-dalek-derive (crypto_box) on syn 2; displaydoc (icu, via nostr's url) on syn 3.
+    # secp256k1 0.29's rand feature (enabled by bdk_wallet) uses rand 0.8; rust-nostr uses rand 0.10.
+    { name = "rand", version = "=0.8.8" },
+    # Build-time only: curve25519-dalek-derive (crypto_box) on syn 2; serde_derive, displaydoc and others on syn 3.
     { name = "syn", version = "=2.0.119" },
 ]
 
