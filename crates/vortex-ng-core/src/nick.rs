@@ -16,6 +16,18 @@ fn hash_part(pubkey: &PublicKey) -> String {
     bitcoin::base58::encode(&digest[..NICK_HASH_LENGTH])
 }
 
+/// A fresh random nick key (OS randomness), for one taker session or one maker process.
+pub fn random_nick_key() -> bitcoin::secp256k1::SecretKey {
+    use crypto_box::aead::rand_core::RngCore;
+    loop {
+        let mut bytes = [0u8; 32];
+        crypto_box::aead::OsRng.fill_bytes(&mut bytes);
+        if let Ok(key) = bitcoin::secp256k1::SecretKey::from_slice(&bytes) {
+            return key;
+        }
+    }
+}
+
 /// The nick a peer with the ephemeral key `pubkey` uses.
 pub fn nick_from_pubkey(pubkey: &PublicKey) -> String {
     let mut encoded = hash_part(pubkey);

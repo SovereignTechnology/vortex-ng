@@ -33,6 +33,8 @@ vortex-ng-taker = { path = "crates/vortex-ng-taker" }
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "base64"] }
 # NaCl crypto_box (Curve25519-XSalsa20-Poly1305), libsodium-compatible, as JoinMarket uses.
 crypto_box = "0.9.1"
+# rust-nostr, as nfx pins it (0.45.5: newest 0.45.x at least 7 days old when chosen, 2026-11-10).
+nostr = { version = "=0.45.5", default-features = false, features = ["std", "os-rng", "nip44", "nip59"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
