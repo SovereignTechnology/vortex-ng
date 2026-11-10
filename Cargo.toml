@@ -35,6 +35,9 @@ bitcoin = { version = "=0.32.102", default-features = false, features = ["std", 
 crypto_box = "0.9.1"
 # rust-nostr, as nfx pins it (0.45.5: newest 0.45.x at least 7 days old when chosen, 2026-11-10).
 nostr = { version = "=0.45.5", default-features = false, features = ["std", "os-rng", "nip44", "nip59"] }
+# rust-bitcoin's minimal JSON-RPC client (HTTP over TCP, basic auth) for Core-compatible nodes.
+jsonrpc = "0.21.0"
+serde_json = { version = "1", features = ["raw_value"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
