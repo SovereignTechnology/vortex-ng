@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vortex-ng-core",
+    "crates/vortex-ng-nostr",
+    "crates/vortex-ng-wallet",
+    "crates/vortex-ng-chain",
+    "crates/vortex-ng-ln",
+    "crates/vortex-ng-maker",
+    "crates/vortex-ng-taker",
+    "crates/vortex-ngd",
+    "crates/vortex-ng-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/SovereignTechnology/vortex-ng"
+publish = false
+
+[workspace.dependencies]
+vortex-ng-core = { path = "crates/vortex-ng-core" }
+vortex-ng-nostr = { path = "crates/vortex-ng-nostr" }
+vortex-ng-wallet = { path = "crates/vortex-ng-wallet" }
+vortex-ng-chain = { path = "crates/vortex-ng-chain" }
+vortex-ng-ln = { path = "crates/vortex-ng-ln" }
+vortex-ng-maker = { path = "crates/vortex-ng-maker" }
+vortex-ng-taker = { path = "crates/vortex-ng-taker" }
+
+# Same pin as rbitcoin, so types and behaviour match the in-house reference node.
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unexpected_cfgs = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+expect_used = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

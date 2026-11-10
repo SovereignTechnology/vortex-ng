@@ -1,0 +1,15 @@
+[package]
+name = "vortex-ng-nostr"
+description = "The Nostr message channel for the JoinMarket protocol (JMP draft: Nostr message channel)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vortex-ng-core = { workspace = true }

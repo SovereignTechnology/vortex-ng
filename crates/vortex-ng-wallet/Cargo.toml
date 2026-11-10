@@ -1,0 +1,15 @@
+[package]
+name = "vortex-ng-wallet"
+description = "JoinMarket-compatible wallet: mixdepths per pit (sw0, tr0, wsh0) and fidelity bonds"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vortex-ng-core = { workspace = true }

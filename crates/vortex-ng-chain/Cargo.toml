@@ -1,0 +1,15 @@
+[package]
+name = "vortex-ng-chain"
+description = "Chain backend over Core-compatible JSON-RPC (Bitcoin Core or rbitcoin)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vortex-ng-core = { workspace = true }

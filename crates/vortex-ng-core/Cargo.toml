@@ -1,0 +1,15 @@
+[package]
+name = "vortex-ng-core"
+description = "JoinMarket protocol logic over Nostr, with no I/O: codec, nicks, offers, PoDLE, bonds, per-pit transaction rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }

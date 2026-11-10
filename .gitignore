@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.cargo-home/
+*.swp
+.DS_Store
+# Never commit wallets, seeds, macaroons, cookies or relay keys.
+*.wallet
+*.macaroon
+.cookie
+*.seed
