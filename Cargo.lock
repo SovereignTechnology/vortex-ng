@@ -1176,6 +1176,7 @@ name = "vortex-ng-wallet"
 version = "0.0.1"
 dependencies = [
  "bdk_wallet",
+ "vortex-ng-chain",
  "vortex-ng-core",
 ]
 

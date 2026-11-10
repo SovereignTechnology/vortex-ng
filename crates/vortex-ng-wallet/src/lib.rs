@@ -20,6 +20,9 @@ use bdk_wallet::keys::bip39::{Language, Mnemonic};
 use bdk_wallet::{KeychainKind, LocalOutput, Wallet};
 use vortex_ng_core::offer::Pit;
 
+pub mod sign;
+pub mod sync;
+
 pub use bdk_wallet;
 
 /// Mixdepths per pit.
@@ -111,6 +114,7 @@ impl Seed {
 pub struct PitWallet {
     pit: Pit,
     mixdepths: Vec<Wallet>,
+    master: Xpriv,
 }
 
 impl std::fmt::Debug for PitWallet {
@@ -133,7 +137,11 @@ impl PitWallet {
                     .map_err(|e| WalletError::Descriptor(e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(PitWallet { pit, mixdepths })
+        Ok(PitWallet {
+            pit,
+            mixdepths,
+            master: seed.master,
+        })
     }
 
     /// The pit.
