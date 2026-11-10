@@ -425,3 +425,93 @@ fn an_unprofitable_fill_is_refused_before_the_podle() {
         ("error", ERROR_TEXT)
     );
 }
+
+#[test]
+fn an_undeclared_utxo_of_the_maker_is_never_signed() {
+    let secp = Secp256k1::new();
+    let mut maker = funded_maker();
+    let (taker, chain) = new_taker();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 2, None).unwrap();
+    let out = maker.handle(
+        "J5taker",
+        Command::Fill {
+            oid: 0,
+            amount: AMOUNT,
+            nacl_pubkey: taker.nacl.public_hex(),
+            commitment: podle.commitment(),
+        },
+        &chain,
+        NOW,
+    );
+    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    let auth = Command::Encrypted {
+        name: "auth".into(),
+        ciphertext: session.encrypt(&podle.revelation()).unwrap(),
+    };
+    let out = maker.handle("J5taker", auth, &chain, NOW);
+    let ioauth = Ioauth::parse(&session.decrypt(private(&out[0]).1).unwrap()).unwrap();
+    // The maker's other UTXO (300,000), which it did not declare, slipped in by the taker.
+    let other = maker
+        .wallet
+        .utxos(0)
+        .unwrap()
+        .into_iter()
+        .find(|u| !ioauth.utxos.contains(&u.outpoint))
+        .unwrap();
+    let script = |a: &str| {
+        Address::from_str(a)
+            .unwrap()
+            .require_network(Network::Regtest)
+            .unwrap()
+            .script_pubkey()
+    };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: ioauth.utxos[0],
+                ..spend(0)
+            },
+            TxIn {
+                previous_output: other.outpoint,
+                ..spend(0)
+            },
+            TxIn {
+                previous_output: taker.utxo,
+                ..spend(0)
+            },
+        ],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(AMOUNT),
+                script_pubkey: script(&ioauth.cj_address),
+            },
+            TxOut {
+                value: Amount::from_sat(500_000 - AMOUNT - 100 + 400),
+                script_pubkey: script(&ioauth.change_address),
+            },
+        ],
+    };
+    let mut chain = chain;
+    chain.utxos.insert(
+        other.outpoint,
+        Utxo {
+            value: other.txout.value,
+            script_pubkey: other.txout.script_pubkey.clone(),
+            confirmations: 9,
+            coinbase: false,
+        },
+    );
+    let tx_b64 = STANDARD.encode(serialize(&tx));
+    let out = maker.handle(
+        "J5taker",
+        Command::Encrypted {
+            name: "tx".into(),
+            ciphertext: session.encrypt(&tx_b64).unwrap(),
+        },
+        &chain,
+        NOW,
+    );
+    assert_eq!(private(&out[0]), ("error", ERROR_TEXT));
+}

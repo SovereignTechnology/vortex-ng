@@ -2,21 +2,24 @@
 //! `!sig` payload per input, re-verified with `vortex_ng_core::sig` before it is returned.
 
 use bdk_wallet::bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
-use bdk_wallet::bitcoin::{Psbt, Transaction, TxOut};
+use bdk_wallet::bitcoin::{OutPoint, Psbt, Transaction, TxOut};
 use vortex_ng_core::offer::Pit;
 use vortex_ng_core::sig::{encode_sw0, encode_tr0, encode_wsh0, verify_sig, wsh0_keys};
 
 use crate::{PitWallet, WalletError};
 
 impl PitWallet {
-    /// Sign mixdepth `m`'s inputs of `tx`, whose prevouts (every input's, in order) the caller has
-    /// checked against the chain and `vortex_ng_core::tx::verify_unsigned` has accepted. Returns
-    /// `(input index, !sig payload)` for each input this mixdepth owns.
+    /// Sign the inputs of `tx` that spend `declared` (the UTXOs mixdepth `m` declared in `!ioauth`), whose
+    /// prevouts (every input's, in order) the caller has checked against the chain and
+    /// `vortex_ng_core::tx::verify_unsigned` has accepted. Returns `(input index, !sig payload)` per
+    /// declared input. Any other UTXO of ours in `tx` is refused, never signed: signing an undeclared
+    /// input would hand its value to the taker.
     pub fn sign_inputs(
         &self,
         m: u32,
         tx: &Transaction,
         prevouts: &[TxOut],
+        declared: &[OutPoint],
     ) -> Result<Vec<(usize, String)>, WalletError> {
         let signing = |e: &dyn std::fmt::Display| WalletError::Descriptor(format!("signing: {e}"));
         if prevouts.len() != tx.input.len() {
@@ -27,6 +30,11 @@ impl PitWallet {
         let mut ours = Vec::new();
         for (i, input) in tx.input.iter().enumerate() {
             if let Some(local) = wallet.get_utxo(input.previous_output) {
+                if !declared.contains(&input.previous_output) {
+                    return Err(WalletError::Descriptor(format!(
+                        "input {i} spends an undeclared UTXO of ours"
+                    )));
+                }
                 if local.txout != prevouts[i] {
                     return Err(WalletError::Descriptor(format!(
                         "prevout of input {i} differs from our record"
@@ -186,7 +194,7 @@ mod tests {
             },
             funding.output[0].clone(),
         ];
-        let sigs = w.sign_inputs(0, &tx, &prevouts).unwrap();
+        let sigs = w.sign_inputs(0, &tx, &prevouts, &[ours]).unwrap();
         assert_eq!(sigs.len(), 1, "{pit:?}");
         assert_eq!(sigs[0].0, 1);
         // The taker's check accepts it.
@@ -200,11 +208,13 @@ mod tests {
         )
         .unwrap();
         // Another mixdepth owns nothing here.
-        assert!(w.sign_inputs(1, &tx, &prevouts).unwrap().is_empty());
+        assert!(w.sign_inputs(1, &tx, &prevouts, &[]).unwrap().is_empty());
+        // An input of ours that was not declared is refused, not signed.
+        assert!(w.sign_inputs(0, &tx, &prevouts, &[]).is_err());
         // A prevout that differs from our record is refused.
         let mut bad = prevouts.clone();
         bad[1].value = Amount::from_sat(1);
-        assert!(w.sign_inputs(0, &tx, &bad).is_err());
+        assert!(w.sign_inputs(0, &tx, &bad, &[ours]).is_err());
     }
 
     #[test]

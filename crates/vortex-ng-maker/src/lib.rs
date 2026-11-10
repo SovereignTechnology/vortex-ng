@@ -147,6 +147,9 @@ impl std::fmt::Debug for Maker {
     }
 }
 
+/// Most sessions a maker keeps open at once; further fills are refused until some end.
+pub const MAX_SESSIONS: usize = 64;
+
 /// The fixed error text a refused taker sees.
 pub const ERROR_TEXT: &str = "coinjoin refused";
 
@@ -245,6 +248,9 @@ impl Maker {
     ) -> Result<Vec<Outgoing>, MakerError> {
         if self.sessions.contains_key(from) {
             return Err(MakerError::State("session exists"));
+        }
+        if self.sessions.len() >= MAX_SESSIONS {
+            return Err(MakerError::State("too many open sessions"));
         }
         let offer = self
             .config
@@ -480,7 +486,12 @@ impl Maker {
         .map_err(|e| MakerError::Tx(e.to_string()))?;
         let sigs = self
             .wallet
-            .sign_inputs(authed.mixdepth, &tx, &prevouts)
+            .sign_inputs(
+                authed.mixdepth,
+                &tx,
+                &prevouts,
+                &authed.our_utxos.keys().copied().collect::<Vec<_>>(),
+            )
             .map_err(|e| MakerError::Internal(e.to_string()))?;
         if sigs.len() != authed.our_utxos.len() {
             return Err(MakerError::Internal("could not sign every input".into()));
