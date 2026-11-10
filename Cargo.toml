@@ -30,7 +30,7 @@ vortex-ng-maker = { path = "crates/vortex-ng-maker" }
 vortex-ng-taker = { path = "crates/vortex-ng-taker" }
 
 # Same pin as rbitcoin, so types and behaviour match the in-house reference node.
-bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "base64"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
