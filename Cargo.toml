@@ -44,8 +44,11 @@ serde_json = { version = "1", features = ["raw_value"] }
 # rust-nostr's relay client. 0.45.6 (2026-11-03) is the only unyanked 0.45.x: 0.45.5/0.45.6 fix a
 # verification-cache bypass. The 7-day rule is met from 2026-11-10.
 nostr-sdk = { version = "=0.45.6" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
 futures = "0.3"
+# Tor in-process (feature `tor` of vortex-ng-nostr). 0.47.0 (2026-10-01): newest release at least 7 days old.
+arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
 # Descriptor wallets (rust-bitcoin 0.32) with BIP39 seeds; synced from our own chain backend.
 bdk_wallet = { version = "3.2.0", default-features = false, features = ["std", "keys-bip39"] }
 

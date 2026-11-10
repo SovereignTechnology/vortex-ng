@@ -10,6 +10,9 @@ pub mod client;
 pub mod event;
 pub mod keys;
 pub mod private;
+pub mod socks;
+#[cfg(feature = "tor")]
+pub mod tor;
 
 pub use nostr;
 

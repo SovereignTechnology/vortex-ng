@@ -44,3 +44,5 @@ deny:
     - echo "${CARGO_DENY_SHA256}  /tmp/deny.tgz" | sha256sum -c -
     - tar -xzf /tmp/deny.tgz -C /tmp && install -m 0755 "/tmp/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny" /usr/local/bin/
     - cargo deny --locked check
+    # The opt-in Tor tree (arti) has its own ignores and exceptions in deny.toml; keep it checked too.
+    - cargo deny --locked --features vortex-ng-nostr/tor check

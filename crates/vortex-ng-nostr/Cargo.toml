@@ -17,6 +17,12 @@ nostr = { workspace = true }
 nostr-sdk = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+arti-client = { workspace = true, optional = true }
+tor-rtcompat = { workspace = true, optional = true }
+
+[features]
+# In-process Tor (arti): one isolated circuit set per nick behind a local SOCKS shim.
+tor = ["dep:arti-client", "dep:tor-rtcompat"]
 
 [dev-dependencies]
 nostr-sdk = { workspace = true, features = ["local-relay"] }

@@ -9,7 +9,18 @@ no-default-features = false
 yanked = "deny"
 unsound = "all"
 unmaintained = "all"
-ignore = []
+ignore = [
+    # The three below arrive only with vortex-ng-nostr's opt-in `tor` feature (arti 0.47).
+    # C SQLite CVE-2026-119375 in BUNDLED libsqlite3-sys < 0.39. Our build does not enable `bundled`
+    # (`cargo tree -e features -i libsqlite3-sys` shows default/pkg-config only): it links the system
+    # SQLite, which the distro patches. arti 0.47 and 0.48 cap rusqlite < 0.41, so no arti release can take
+    # libsqlite3-sys 0.39 yet; re-check at each arti bump and drop this ignore when it can.
+    { id = "RUSTSEC-2026-0459", reason = "system SQLite, not bundled; arti caps rusqlite < 0.41" },
+    # Marvin attack: RSA *decryption* timing. arti uses rsa only to verify legacy Tor relay signatures.
+    { id = "RUSTSEC-2023-0071", reason = "rsa used for signature verification only (arti)" },
+    # paste is unmaintained, a build-time proc macro with no maintained replacement in arti's tree.
+    { id = "RUSTSEC-2024-0436", reason = "build-time proc macro via arti's pwd-grp; no safe upgrade" },
+]
 
 [licenses]
 confidence-threshold = 0.8
@@ -27,11 +38,22 @@ allow = [
     "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA bundle) via nostr-sdk's TLS for wss:// relays
 ]
 
+# Per-crate license exceptions, only in arti's tree (feature `tor`).
+exceptions = [
+    { allow = ["Unlicense"], crate = "async_executors" },     # public-domain dedication
+    { allow = ["MPL-2.0"], crate = "option-ext" },           # file-level copyleft, used unmodified
+    { allow = ["MPL-2.0"], crate = "priority-queue" },       # "LGPL-3.0-or-later OR MPL-2.0": we take MPL-2.0
+]
+
 [bans]
 multiple-versions = "deny"
 # `workspace = true` lines are reported as wildcards by cargo-deny 0.20; the tree has no `version = "*"`.
 wildcards = "allow"
 deny = []
+# arti's tree (feature `tor`) carries its own generation of many crates; its duplicates are its own.
+skip-tree = [
+    { crate = "arti-client@0.47.0", reason = "arti's dependency generation; opt-in feature `tor`" },
+]
 skip = [
     # rust-bitcoin 0.32 (pinned as rbitcoin pins it) and rust-nostr 0.45 are two secp256k1/hashes stacks.
     # vortex-ng-core uses the first, vortex-ng-nostr the second; keys cross as bytes. Until bitcoin 0.33.
