@@ -19,6 +19,8 @@ use vortex_ng_core::podle::generate;
 use vortex_ng_core::sig::verify_sig;
 use vortex_ng_wallet::Seed;
 
+use vortex_ng_chain::Utxo;
+
 use super::*;
 
 const WORDS: &str =

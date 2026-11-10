@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use vortex_ng_chain::Utxo;
+pub use vortex_ng_chain::ChainLookup as Chain;
 use vortex_ng_core::bitcoin::base64::Engine;
 use vortex_ng_core::bitcoin::base64::engine::general_purpose::STANDARD;
 use vortex_ng_core::bitcoin::consensus::encode::deserialize;
@@ -16,6 +16,7 @@ use vortex_ng_core::bitcoin::hex::DisplayHex;
 use vortex_ng_core::bitcoin::secp256k1::{PublicKey, Secp256k1};
 use vortex_ng_core::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use vortex_ng_core::command::Command;
+pub use vortex_ng_core::command::Outgoing;
 use vortex_ng_core::nacl::{NaclKeypair, Session};
 use vortex_ng_core::offer::{Offer, Pit};
 use vortex_ng_core::podle::{DEFAULT_INDICES, Podle};
@@ -23,23 +24,6 @@ use vortex_ng_core::protocol::MAKER_CHANGE_THRESHOLD_SAT;
 use vortex_ng_core::sigmsg;
 use vortex_ng_core::tx::{ChainView as TxChainView, MakerTerms, verify_unsigned};
 use vortex_ng_wallet::{MIXDEPTHS, PitWallet};
-
-/// The chain, as the maker needs it.
-pub trait Chain {
-    /// The output at `outpoint` if unspent (mempool included).
-    fn utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, String>;
-    /// The best block's height.
-    fn tip_height(&self) -> Result<u32, String>;
-}
-
-impl Chain for vortex_ng_chain::CoreRpc {
-    fn utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, String> {
-        vortex_ng_chain::CoreRpc::utxo(self, outpoint).map_err(|e| e.to_string())
-    }
-    fn tip_height(&self) -> Result<u32, String> {
-        vortex_ng_chain::CoreRpc::tip_height(self).map_err(|e| e.to_string())
-    }
-}
 
 /// Maker policy. Defaults follow the deployed JoinMarket implementations.
 #[derive(Clone, Debug)]
@@ -64,22 +48,6 @@ impl MakerConfig {
             taker_utxo_amtpercent: 20,
         }
     }
-}
-
-/// A message for the transport to send.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Outgoing {
-    /// A private message to `to`: the first command (without `!`) and its body.
-    Private {
-        /// Recipient nick.
-        to: String,
-        /// Command name.
-        command: String,
-        /// Body (arguments and any further `!`-joined commands, or a ciphertext).
-        body: String,
-    },
-    /// A public message from a throwaway nick (the `!hp2` commitment broadcast).
-    PublicEphemeral(String),
 }
 
 /// Why the maker dropped a session. Only a fixed `!error` reaches the taker.

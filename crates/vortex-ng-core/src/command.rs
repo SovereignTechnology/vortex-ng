@@ -155,6 +155,22 @@ pub fn parse_plaintext(message: &str) -> Option<Vec<Command>> {
     Some(out)
 }
 
+/// A message a maker or taker wants sent; the transport signs (JMP-0001 line) and wraps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outgoing {
+    /// A private message to `to`: the first command (without `!`) and its body.
+    Private {
+        /// Recipient nick.
+        to: String,
+        /// Command name.
+        command: String,
+        /// Body (arguments and any further `!`-joined commands, or a ciphertext).
+        body: String,
+    },
+    /// A public message from a throwaway nick (the `!hp2` commitment broadcast).
+    PublicEphemeral(String),
+}
+
 /// The decrypted `!ioauth` plaintext: `<utxo,utxo,…> <auth_pubkey> <cj_address> <change_address>
 /// <btc_signature> [hold_seconds]`. In `wsh0` the auth key is the 132-hex concatenation of two keys;
 /// `hold_seconds` is JMP-0014's sixth field.

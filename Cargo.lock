@@ -1170,7 +1170,10 @@ dependencies = [
 name = "vortex-ng-taker"
 version = "0.0.1"
 dependencies = [
+ "vortex-ng-chain",
  "vortex-ng-core",
+ "vortex-ng-maker",
+ "vortex-ng-wallet",
 ]
 
 [[package]]

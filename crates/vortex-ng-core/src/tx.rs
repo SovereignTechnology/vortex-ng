@@ -234,6 +234,15 @@ pub fn verify_unsigned(
     Ok(())
 }
 
+/// Shuffle in place with OS randomness (Fisher-Yates), for input and output order.
+pub fn shuffle<T>(items: &mut [T]) {
+    use crypto_box::aead::rand_core::RngCore;
+    for i in (1..items.len()).rev() {
+        let j = (crypto_box::aead::OsRng.next_u64() % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::absolute::LockTime;

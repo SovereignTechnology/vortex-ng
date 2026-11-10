@@ -250,6 +250,23 @@ impl CoreRpc {
     }
 }
 
+/// The lookups a maker or taker needs from the chain. `CoreRpc` implements it; tests use fakes.
+pub trait ChainLookup {
+    /// The output at `outpoint` if unspent (mempool included).
+    fn utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, String>;
+    /// The best block's height.
+    fn tip_height(&self) -> Result<u32, String>;
+}
+
+impl ChainLookup for CoreRpc {
+    fn utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, String> {
+        CoreRpc::utxo(self, outpoint).map_err(|e| e.to_string())
+    }
+    fn tip_height(&self) -> Result<u32, String> {
+        CoreRpc::tip_height(self).map_err(|e| e.to_string())
+    }
+}
+
 /// Read a `.cookie` file (`user:password`), trimming the trailing newline.
 fn read_cookie(path: &Path) -> Result<String, ChainError> {
     let cookie = std::fs::read_to_string(path)
