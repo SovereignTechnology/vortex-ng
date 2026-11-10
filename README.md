@@ -50,6 +50,20 @@ rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Ecl
 
 Rust 1.98 (pinned in `rust-toolchain.toml`). `cargo test --workspace`.
 
+## Acknowledgements
+
+vortex-ng exists because of the work it builds on:
+
+- **Ben Carman (benthecarman)** and the [LnVortex](https://github.com/ln-vortex/ln-vortex) contributors, for
+  showing that a coinjoin output can be a Lightning channel's funding output, and for the protocol and code
+  that made the idea concrete.
+- **[JoinMarket-NG](https://github.com/joinmarket-ng/joinmarket-ng)** and its contributors, for a clean,
+  well-documented implementation of the JoinMarket protocol, the JMP specifications, and the taproot pit and
+  channel-ring designs that vortex-ng follows; and the original
+  [JoinMarket](https://github.com/JoinMarket-Org/joinmarket-clientserver) project they build on.
+
+Thank you.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your
