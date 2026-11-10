@@ -135,8 +135,10 @@ A JMP-0001 private message is sent as follows.
    `<body> + "nostr-network"` (JMP-0001 "Nick Signature Verification"), and encrypted commands carry the
    JMP-0001 NaCl ciphertext as their body. The line MUST be ASCII.
 2. **Rumor.** An unsigned event of kind 21403 with `pubkey` = the sender's x-only nick key, `content` = the
-   line (or one part of it, below), and tags `["p", "<recipient x-only nick key>"]` and, when split,
-   `["part", "<i>", "<n>", "<id>"]`.
+   line (or one part of it, below), and tags `["p", "<recipient x-only nick key>"]`, one to eight
+   `["relay", "<url>"]` naming where the sender reads its private messages (so the recipient can answer a
+   sender it has seen no public event from; inside the encryption, only the recipient learns them), and, when
+   split, `["part", "<i>", "<n>", "<id>"]`.
 3. **Seal.** Kind 13, signed by the sender's nick key, `content` = NIP-44 v2 encryption of the rumor for the
    recipient, no tags (NIP-59).
 4. **Wrap.** Kind 1059, signed by a one-time random key, `content` = NIP-44 v2 encryption of the seal for the
@@ -160,8 +162,9 @@ receiver's nick; the line verifies per JMP-0001 "Nick Signature Verification" wi
 the x-only form of the line's `hex_pubkey` equals the seal's `pubkey`; and the nick derived from `hex_pubkey`
 equals the line's `from_nick`. It then processes the line as a JMP-0001 private message.
 
-**Where to send.** A sender publishes each wrap to at least two of the recipient's advertised `relay`s (all of
-them if it advertised fewer), learned from the recipient's latest 31402 or 21402 event.
+**Where to send.** A sender publishes each wrap to at least two of the recipient's `relay`s (all of them if
+there are fewer), learned from the recipient's latest 31402 or 21402 event or from the `relay` tags of the
+recipient's last private message.
 
 **Deduplication.** Receivers MUST drop events whose id they have already processed, and SHOULD apply
 joinmarket-ng's message deduplication (`from_nick:command:first_arg` within 30 seconds), since a message

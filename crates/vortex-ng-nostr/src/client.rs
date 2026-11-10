@@ -41,8 +41,8 @@ pub fn unix_now() -> u64 {
 /// Something that arrived for this nick and passed the draft's checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Incoming {
-    /// A verified JMP-0001 private message.
-    Private(PrivMsg),
+    /// A verified JMP-0001 private message, and the relays its sender reads replies on.
+    Private(PrivMsg, Vec<String>),
     /// A maker's offer event.
     Offers(Author, Vec<Offer>),
     /// A public message (`!orderbook`, `!hp2`, `!cancel`).
@@ -53,8 +53,11 @@ pub enum Incoming {
 pub struct NickClient {
     keys: NickKeys,
     network: String,
+    relays: Vec<String>,
     client: Client,
-    notifications: Pin<Box<dyn Stream<Item = ClientNotification> + Send>>,
+    // Only `next(&mut self)` touches the stream; the Mutex (reached via `get_mut`, never locked) makes the
+    // client `Sync`, so futures holding `&NickClient` can be spawned.
+    notifications: std::sync::Mutex<Pin<Box<dyn Stream<Item = ClientNotification> + Send>>>,
     seen: HashSet<EventId>,
     reassembler: Reassembler,
 }
@@ -98,8 +101,13 @@ impl NickClient {
         Ok(NickClient {
             keys,
             network: network.to_string(),
+            relays: relays
+                .iter()
+                .take(crate::private::MAX_REPLY_RELAYS)
+                .cloned()
+                .collect(),
             client,
-            notifications,
+            notifications: std::sync::Mutex::new(notifications),
             seen: HashSet::new(),
             reassembler: Reassembler::new(REASSEMBLY_CAP),
         })
@@ -108,6 +116,11 @@ impl NickClient {
     /// The nick's keys.
     pub fn keys(&self) -> &NickKeys {
         &self.keys
+    }
+
+    /// The relays this nick reads on (advertised in its events and rumors).
+    pub fn relays(&self) -> &[String] {
+        &self.relays
     }
 
     /// Subscribe to this nick's private messages since `since`, and optionally to offers and public messages.
@@ -172,7 +185,7 @@ impl NickClient {
                 .await
                 .map_err(io)?;
         }
-        for wrap in wrap_line(&self.keys, to, line, unix_now())? {
+        for wrap in wrap_line(&self.keys, to, line, &self.relays, unix_now())? {
             let out = self
                 .client
                 .send_event(&wrap)
@@ -193,9 +206,10 @@ impl NickClient {
         let deadline = Instant::now() + wait;
         loop {
             let left = deadline.checked_duration_since(Instant::now())?;
-            let notification = tokio::time::timeout(left, self.notifications.next())
-                .await
-                .ok()??;
+            let notification =
+                tokio::time::timeout(left, self.notifications.get_mut().ok()?.next())
+                    .await
+                    .ok()??;
             let event = match notification {
                 ClientNotification::Event { event, .. } => event,
                 ClientNotification::Shutdown => return None,
@@ -217,10 +231,9 @@ impl NickClient {
         let now = unix_now();
         if event.kind == Kind::GiftWrap {
             let received = unwrap(&self.keys, event).ok()?;
-            let (sender, line) = self.reassembler.push(received, now)?;
-            return open_line(&self.keys, &sender, &line)
-                .ok()
-                .map(Incoming::Private);
+            let delivered = self.reassembler.push(received, now)?;
+            let msg = open_line(&self.keys, &delivered.sender, &delivered.line).ok()?;
+            return Some(Incoming::Private(msg, delivered.relays));
         }
         if event.kind == Kind::Custom(KIND_OFFER) {
             let (author, offers) = read_offer_event(event, &self.network, now).ok()?;
@@ -326,7 +339,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let Some(Incoming::Private(msg)) = maker.next(WAIT).await else {
+        let Some(Incoming::Private(msg, _)) = maker.next(WAIT).await else {
             panic!("no private message")
         };
         assert_eq!(
@@ -353,7 +366,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let Some(Incoming::Private(msg)) = taker.next(WAIT).await else {
+        let Some(Incoming::Private(msg, _)) = taker.next(WAIT).await else {
             panic!("no split message")
         };
         assert_eq!((msg.command.as_str(), msg.body.len()), ("tx", 40_000));

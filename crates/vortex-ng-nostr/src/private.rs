@@ -28,6 +28,8 @@ pub const MAX_PARTS: usize = 4;
 pub const WRAP_TTL: u64 = 600;
 /// How long a receiver keeps an incomplete message, seconds.
 pub const REASSEMBLY_WINDOW: u64 = 60;
+/// Most `relay` tags a rumor carries (where the sender reads its private messages).
+pub const MAX_REPLY_RELAYS: usize = 8;
 /// Incomplete messages kept per sender.
 pub const MAX_PENDING_PER_SENDER: usize = 4;
 
@@ -41,8 +43,12 @@ pub fn wrap_line(
     sender: &NickKeys,
     recipient: &nostr::key::PublicKey,
     line: &str,
+    reply_relays: &[String],
     now: u64,
 ) -> Result<Vec<Event>, ChannelError> {
+    if reply_relays.is_empty() || reply_relays.len() > MAX_REPLY_RELAYS {
+        return Err(ChannelError::Invalid("one to eight reply relays"));
+    }
     if line.is_empty() || !line.is_ascii() {
         return Err(ChannelError::Invalid("line must be non-empty ASCII"));
     }
@@ -63,6 +69,9 @@ pub fn wrap_line(
     let mut wraps = Vec::with_capacity(parts.len());
     for (i, part) in parts.iter().enumerate() {
         let mut tags = vec![Tag::public_key(*recipient)];
+        for relay in reply_relays {
+            tags.push(Tag::parse(["relay", relay.as_str()]).map_err(crypto)?);
+        }
         if parts.len() > 1 {
             let (index, total) = ((i + 1).to_string(), parts.len().to_string());
             tags.push(
@@ -124,6 +133,8 @@ pub struct Received {
     pub content: String,
     /// Set when the line was split.
     pub part: Option<Part>,
+    /// Relays where the sender reads its private messages (from the rumor; at most eight, `ws://`/`wss://`).
+    pub relays: Vec<String>,
 }
 
 /// Unwrap a gift wrap addressed to `recipient`: the wrap's and the seal's signatures and the rumor's author
@@ -172,16 +183,40 @@ pub fn unwrap(recipient: &NickKeys, wrap: &Event) -> Result<Received, ChannelErr
         }
         _ => return Err(ChannelError::Invalid("part")),
     };
+    let relays: Vec<String> = rumor
+        .tags
+        .iter()
+        .filter(|t| t.kind() == "relay")
+        .filter_map(|t| t.content())
+        .filter(|r| r.starts_with("wss://") || r.starts_with("ws://"))
+        .take(MAX_REPLY_RELAYS)
+        .map(str::to_string)
+        .collect();
+    if relays.is_empty() {
+        return Err(ChannelError::Invalid("rumor names no reply relay"));
+    }
     Ok(Received {
         sender: gift.sender,
         content: rumor.content,
         part,
+        relays,
     })
 }
 
 struct Pending {
     parts: Vec<Option<String>>,
     first_seen: u64,
+}
+
+/// A complete line from a sender, with the relays it reads its private messages on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivered {
+    /// The seal's signer.
+    pub sender: nostr::key::PublicKey,
+    /// The whole line.
+    pub line: String,
+    /// The sender's reply relays.
+    pub relays: Vec<String>,
 }
 
 /// Reassembles split lines with bounded memory.
@@ -199,16 +234,16 @@ impl Reassembler {
         }
     }
 
-    /// Feed a received part; returns `(sender, line)` once a line is complete.
-    pub fn push(
-        &mut self,
-        received: Received,
-        now: u64,
-    ) -> Option<(nostr::key::PublicKey, String)> {
+    /// Feed a received part; returns the whole line once it is complete.
+    pub fn push(&mut self, received: Received, now: u64) -> Option<Delivered> {
         self.pending
             .retain(|_, p| now.saturating_sub(p.first_seen) <= REASSEMBLY_WINDOW);
         let Some(part) = received.part else {
-            return Some((received.sender, received.content));
+            return Some(Delivered {
+                sender: received.sender,
+                line: received.content,
+                relays: received.relays,
+            });
         };
         let key = (received.sender, part.id.clone());
         if !self.pending.contains_key(&key) {
@@ -235,7 +270,11 @@ impl Reassembler {
         entry.parts[part.index - 1] = Some(received.content);
         if entry.parts.iter().all(Option::is_some) {
             let done = self.pending.remove(&key)?;
-            return Some((received.sender, done.parts.into_iter().flatten().collect()));
+            return Some(Delivered {
+                sender: received.sender,
+                line: done.parts.into_iter().flatten().collect(),
+                relays: received.relays,
+            });
         }
         None
     }
@@ -270,6 +309,10 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
+    fn relays() -> Vec<String> {
+        vec!["wss://relay.example".to_string()]
+    }
+
     fn keys(b: u8) -> NickKeys {
         NickKeys::from_secret(SecretKey::from_slice(&[b; 32]).unwrap()).unwrap()
     }
@@ -295,7 +338,7 @@ mod tests {
             "fill",
             &format!("0 1000000 {} P{}", "ab".repeat(32), "cd".repeat(32)),
         );
-        let wraps = wrap_line(&taker, &maker.nostr().public_key(), &text, NOW).unwrap();
+        let wraps = wrap_line(&taker, &maker.nostr().public_key(), &text, &relays(), NOW).unwrap();
         assert_eq!(wraps.len(), 1);
         let wrap = &wraps[0];
         assert_eq!(
@@ -310,7 +353,12 @@ mod tests {
         );
         let received = unwrap(&maker, wrap).unwrap();
         assert_eq!(received.sender, taker.nostr().public_key());
-        let (sender, full) = Reassembler::new(16).push(received, NOW).unwrap();
+        let Delivered {
+            sender,
+            line: full,
+            relays: reply,
+        } = Reassembler::new(16).push(received, NOW).unwrap();
+        assert_eq!(reply, relays());
         let msg = open_line(&maker, &sender, &full).unwrap();
         assert_eq!(
             (msg.from.as_str(), msg.command.as_str()),
@@ -324,7 +372,7 @@ mod tests {
     fn long_lines_split_and_reassemble() {
         let (taker, maker) = (keys(1), keys(2));
         let text = line(&taker, &maker, "tx", &"A".repeat(40_000));
-        let wraps = wrap_line(&taker, &maker.nostr().public_key(), &text, NOW).unwrap();
+        let wraps = wrap_line(&taker, &maker.nostr().public_key(), &text, &relays(), NOW).unwrap();
         assert_eq!(wraps.len(), 3);
         for wrap in &wraps {
             assert!(
@@ -337,7 +385,9 @@ mod tests {
         for wrap in wraps.iter().rev() {
             out = r.push(unwrap(&maker, wrap).unwrap(), NOW + 1).or(out);
         }
-        let (sender, full) = out.unwrap();
+        let Delivered {
+            sender, line: full, ..
+        } = out.unwrap();
         assert_eq!(full, text);
         open_line(&maker, &sender, &full).unwrap();
         assert!(
@@ -345,6 +395,7 @@ mod tests {
                 &taker,
                 &maker.nostr().public_key(),
                 &"x".repeat(MAX_PART * MAX_PARTS + 1),
+                &relays(),
                 NOW
             )
             .is_err()
@@ -362,6 +413,7 @@ mod tests {
                 total: 2,
                 id: format!("{id:032x}"),
             }),
+            relays: relays(),
         };
         let mut r = Reassembler::new(100);
         for id in 0..MAX_PENDING_PER_SENDER as u8 {
@@ -371,7 +423,7 @@ mod tests {
         assert!(r.push(part(9, 1), NOW).is_none());
         assert!(r.push(part(9, 2), NOW).is_none());
         // ...while a pending one still completes.
-        assert_eq!(r.push(part(0, 2), NOW).unwrap().1, "xx");
+        assert_eq!(r.push(part(0, 2), NOW).unwrap().line, "xx");
         // Stale parts expire.
         assert!(r.push(part(1, 2), NOW + REASSEMBLY_WINDOW + 1).is_none());
     }
@@ -381,7 +433,8 @@ mod tests {
         let (taker, maker, mallory) = (keys(1), keys(2), keys(4));
         // Mallory forwards a line Taker signed, inside her own seal.
         let text = line(&taker, &maker, "fill", "0 1");
-        let wraps = wrap_line(&mallory, &maker.nostr().public_key(), &text, NOW).unwrap();
+        let wraps =
+            wrap_line(&mallory, &maker.nostr().public_key(), &text, &relays(), NOW).unwrap();
         let received = unwrap(&maker, &wraps[0]).unwrap();
         assert_eq!(
             open_line(&maker, &received.sender, &received.content),
