@@ -1754,6 +1754,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-ng-node"
+version = "0.0.1"
+dependencies = [
+ "nostr",
+ "nostr-sdk",
+ "tokio",
+ "vortex-ng-chain",
+ "vortex-ng-core",
+ "vortex-ng-maker",
+ "vortex-ng-nostr",
+ "vortex-ng-taker",
+ "vortex-ng-wallet",
+]
+
+[[package]]
 name = "vortex-ng-nostr"
 version = "0.0.1"
 dependencies = [

@@ -8,6 +8,7 @@ members = [
     "crates/vortex-ng-ln",
     "crates/vortex-ng-maker",
     "crates/vortex-ng-taker",
+    "crates/vortex-ng-node",
     "crates/vortex-ngd",
     "crates/vortex-ng-cli",
 ]
@@ -28,6 +29,7 @@ vortex-ng-chain = { path = "crates/vortex-ng-chain" }
 vortex-ng-ln = { path = "crates/vortex-ng-ln" }
 vortex-ng-maker = { path = "crates/vortex-ng-maker" }
 vortex-ng-taker = { path = "crates/vortex-ng-taker" }
+vortex-ng-node = { path = "crates/vortex-ng-node" }
 
 # Same pin as rbitcoin, so types and behaviour match the in-house reference node.
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "base64"] }

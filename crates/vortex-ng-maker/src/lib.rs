@@ -139,6 +139,11 @@ impl Maker {
         })
     }
 
+    /// Our offers.
+    pub fn offers(&self) -> &[Offer] {
+        &self.config.offers
+    }
+
     /// The wallet (for syncing and addresses).
     pub fn wallet_mut(&mut self) -> &mut PitWallet {
         &mut self.wallet
