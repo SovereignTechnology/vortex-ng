@@ -20,6 +20,7 @@ use bdk_wallet::keys::bip39::{Language, Mnemonic};
 use bdk_wallet::{KeychainKind, LocalOutput, Wallet};
 use vortex_ng_core::offer::Pit;
 
+pub mod keys;
 pub mod sign;
 pub mod sync;
 
@@ -115,6 +116,7 @@ pub struct PitWallet {
     pit: Pit,
     mixdepths: Vec<Wallet>,
     master: Xpriv,
+    network: Network,
 }
 
 impl std::fmt::Debug for PitWallet {
@@ -141,6 +143,7 @@ impl PitWallet {
             pit,
             mixdepths,
             master: seed.master,
+            network: seed.network,
         })
     }
 
