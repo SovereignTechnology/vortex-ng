@@ -414,6 +414,11 @@ mod tests {
             1,
             "023f9976b86d3f1426638da600348d96dc1f1eb0bd5614cc50db9e9a067c0464a2",
         ),
+        // J_2: printed by joinmarket-ng's own jmcore at the pinned commit (tools/jmng-vectors, 2026-11-10).
+        (
+            2,
+            "023745b000f6db094a794d9ee08637d714393cd009f86087438ac3804e929bfe89",
+        ),
         (
             5,
             "02bbc5c4393395a38446e2bd4d638b7bfd864afb5ffaf4bed4caf797df0e657434",
