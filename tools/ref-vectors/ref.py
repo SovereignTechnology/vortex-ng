@@ -163,3 +163,30 @@ for kb in [3, 8]:
     e = taproot_output_secret(key(kb))
     print(json.dumps({"taproot": {"key_byte": kb, "output_secret": e.to_bytes(32, "big").hex(),
                                   "output_key": ser(mul(e, G)).hex()}}))
+
+
+def sign_der(key_int, m):
+    z = hashlib.sha256(sha(b"\x18Bitcoin Signed Message:\n" + compact_size(len(m)) + m)).digest()
+    zi = int.from_bytes(z, "big")
+    for k in rfc6979(key_int.to_bytes(32, "big"), z):
+        r = mul(k, G)[0] % N
+        s = pow(k, N - 2, N) * (zi + r * key_int) % N
+        if r and s:
+            s = min(s, N - s)
+            body = der_int(r) + der_int(s)
+            return b"\x30" + bytes([len(body)]) + body
+    raise ValueError
+
+
+# Fidelity-bond proof (JMP-0001 "Fidelity Bonds"): 252 bytes, '<72s72s33sH33s32sII', DER left-padded with 0xff.
+cert_key, utxo_key = key(9), key(10)
+cert_pub, utxo_pub = ser(mul(cert_key, G)), ser(mul(utxo_key, G))
+expiry, locktime, txid_display, vout = 52, 1767225600, bytes.fromhex("ab" * 32), 1
+nick_sig = sign_der(cert_key, b"J5TestTaker|J52TestMaker")
+cert_sig = sign_der(utxo_key, b"fidelity-bond-cert|" + cert_pub + b"|" + str(expiry).encode())
+proof = (nick_sig.rjust(72, b"\xff") + cert_sig.rjust(72, b"\xff") + cert_pub + expiry.to_bytes(2, "little")
+         + utxo_pub + txid_display + vout.to_bytes(4, "little") + locktime.to_bytes(4, "little"))
+assert len(proof) == 252
+print(json.dumps({"bond": {"cert_key_byte": 9, "utxo_key_byte": 10, "expiry": expiry, "locktime": locktime,
+                           "txid": txid_display.hex(), "vout": vout, "taker": "J5TestTaker", "maker": "J52TestMaker",
+                           "proof": base64.b64encode(proof).decode()}}))

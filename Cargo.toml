@@ -31,6 +31,8 @@ vortex-ng-taker = { path = "crates/vortex-ng-taker" }
 
 # Same pin as rbitcoin, so types and behaviour match the in-house reference node.
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "base64"] }
+# NaCl crypto_box (Curve25519-XSalsa20-Poly1305), libsodium-compatible, as JoinMarket uses.
+crypto_box = "0.9.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
