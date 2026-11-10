@@ -247,3 +247,107 @@ async fn a_whole_coinjoin_over_a_nostr_relay() {
         handle.abort();
     }
 }
+
+/// Counts the chain lookups a bond check makes.
+#[derive(Default)]
+struct CountingChain {
+    tips: std::sync::atomic::AtomicUsize,
+    utxos: std::sync::atomic::AtomicUsize,
+}
+
+impl ChainLookup for CountingChain {
+    fn utxo(&self, _: &OutPoint) -> Result<Option<Utxo>, String> {
+        self.utxos.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }
+    fn tip_height(&self) -> Result<u32, String> {
+        self.tips.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(300)
+    }
+    fn block_time(&self, _: u32) -> Result<u32, String> {
+        Ok(1_700_000_000)
+    }
+}
+
+fn pit_config() -> TakerConfig {
+    TakerConfig {
+        pit: Pit::Tr0,
+        network: Network::Regtest,
+        amount: AMOUNT,
+        makers: 2,
+        max_cjfee: 1_000,
+        fee_rate_sat_per_kwu: 2_500,
+        max_maker_utxos: 20,
+        bondless_makers_allowance: vortex_ng_taker::DEFAULT_BONDLESS_ALLOWANCE,
+        bondless_require_zero_fee: true,
+        bond_params: Default::default(),
+    }
+}
+
+#[test]
+fn bond_lookups_are_bounded_and_only_for_candidates() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use vortex_ng_core::bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use vortex_ng_core::bond::BondTemplate;
+    let secp = Secp256k1::new();
+    // 600 nicks, each with a proof signed by a key of its own (valid signatures) for an outpoint that does
+    // not exist: the signature alone must not buy a lookup for all of them.
+    let mut proofs = HashMap::new();
+    for i in 0..600u32 {
+        let nick = format!("J5fake{i}");
+        let key = SecretKey::from_slice(&[(i % 250 + 1) as u8; 32]).unwrap();
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([(i % 250) as u8; 32]),
+            vout: i,
+        };
+        let proof = BondTemplate::new(&secp, &key, outpoint, 1_893_456_000, 300)
+            .proof(&secp, "J5taker", &nick)
+            .to_base64()
+            .unwrap();
+        proofs.insert(nick.clone(), proof);
+    }
+    let cfg = pit_config();
+    // Every nick a candidate: the cap holds.
+    let all: HashSet<String> = proofs.keys().cloned().collect();
+    let chain = CountingChain::default();
+    let bonds = verify_bonds(&proofs, &all, "J5taker", &chain, 1_800_000_000, &cfg);
+    assert!(bonds.is_empty(), "no such UTXOs");
+    assert_eq!(chain.tips.load(SeqCst), 1, "the tip is read once");
+    assert_eq!(chain.utxos.load(SeqCst), MAX_BOND_LOOKUPS);
+    // A hundred candidates: a lookup for each of them and for nobody else.
+    let some: HashSet<String> = all.iter().take(100).cloned().collect();
+    let chain = CountingChain::default();
+    verify_bonds(&proofs, &some, "J5taker", &chain, 1_800_000_000, &cfg);
+    assert_eq!(chain.utxos.load(SeqCst), 100);
+    // No candidates: no lookups at all.
+    let chain = CountingChain::default();
+    verify_bonds(
+        &proofs,
+        &HashSet::new(),
+        "J5taker",
+        &chain,
+        1_800_000_000,
+        &cfg,
+    );
+    assert_eq!(chain.utxos.load(SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blocking_work_leaves_the_other_tasks_running() {
+    // A multi-threaded runtime keeps serving a task while another thread's work blocks.
+    let ticker = tokio::spawn(async {
+        let mut ticks = 0;
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            ticks += 1;
+        }
+        ticks
+    });
+    blocking(|| std::thread::sleep(Duration::from_millis(200)));
+    assert_eq!(ticker.await.unwrap(), 5);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_work_just_runs_on_a_current_thread_runtime() {
+    assert_eq!(blocking(|| 7), 7);
+}

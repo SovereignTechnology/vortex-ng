@@ -365,7 +365,7 @@ fn bonds_are_verified_against_the_chain() {
     let params = BondValueParams::default();
     let mut chain = FakeChain::default();
     // Missing UTXO.
-    assert!(verify_bond(&proof, "J5taker", "J5maker", &chain, NOW, params).is_err());
+    assert!(verify_bond(&proof, "J5taker", "J5maker", &chain, 300, NOW, params).is_err());
     chain.utxos.insert(
         outpoint,
         Utxo {
@@ -375,7 +375,7 @@ fn bonds_are_verified_against_the_chain() {
             coinbase: false,
         },
     );
-    let bond = verify_bond(&proof, "J5taker", "J5maker", &chain, NOW, params).unwrap();
+    let bond = verify_bond(&proof, "J5taker", "J5maker", &chain, 300, NOW, params).unwrap();
     // Confirmed in block 291 (tip 300, 10 confirmations).
     let expected = bond_value(
         2_000_000,
@@ -393,17 +393,17 @@ fn bonds_are_verified_against_the_chain() {
     );
     assert!(bond.value > 0);
     // A proof made for another taker, or shown by another maker nick, is refused.
-    assert!(verify_bond(&proof, "J5other", "J5maker", &chain, NOW, params).is_err());
-    assert!(verify_bond(&proof, "J5taker", "J5thief", &chain, NOW, params).is_err());
+    assert!(verify_bond(&proof, "J5other", "J5maker", &chain, 300, NOW, params).is_err());
+    assert!(verify_bond(&proof, "J5taker", "J5thief", &chain, 300, NOW, params).is_err());
     // A UTXO paying anything but the freeze script, or unconfirmed, is refused.
     chain.utxos.get_mut(&outpoint).unwrap().confirmations = 0;
-    assert!(verify_bond(&proof, "J5taker", "J5maker", &chain, NOW, params).is_err());
+    assert!(verify_bond(&proof, "J5taker", "J5maker", &chain, 300, NOW, params).is_err());
     let u = chain.utxos.get_mut(&outpoint).unwrap();
     u.confirmations = 10;
     u.script_pubkey = ScriptBuf::new_p2wsh(
         &freeze_script(&PublicKey::from_secret_key(&secp, &utxo_key), locktime + 1).wscript_hash(),
     );
-    assert!(verify_bond(&proof, "J5taker", "J5maker", &chain, NOW, params).is_err());
+    assert!(verify_bond(&proof, "J5taker", "J5maker", &chain, 300, NOW, params).is_err());
 }
 
 #[test]
@@ -483,4 +483,32 @@ fn selection_is_weighted_by_bond_value() {
         .map(|(n, _)| n)
         .collect();
     assert_eq!(all, ["D", "A", "E"]);
+}
+
+#[test]
+fn candidate_nicks_are_the_makers_selection_would_consider() {
+    let o = |cmd: &str, args: &str| Offer::parse(cmd, args).unwrap();
+    let offers = vec![
+        ("A".to_string(), o("sw0absoffer", "0 10000 1000000 0 250")),
+        ("A".to_string(), o("sw0absoffer", "1 10000 1000000 0 200")),
+        ("C".to_string(), o("sw0absoffer", "0 10000 1000000 0 400")), // above max_cjfee
+        ("D".to_string(), o("tr0absoffer", "0 10000 1000000 0 1")),   // other pit
+        ("E".to_string(), o("sw0absoffer", "0 200000 1000000 0 1")),  // amount below minsize
+    ];
+    let cfg = TakerConfig {
+        pit: Pit::Sw0,
+        network: Network::Regtest,
+        amount: 100_000,
+        makers: 2,
+        max_cjfee: 300,
+        fee_rate_sat_per_kwu: 1_000,
+        max_maker_utxos: 20,
+        bondless_makers_allowance: DEFAULT_BONDLESS_ALLOWANCE,
+        bondless_require_zero_fee: true,
+        bond_params: BondValueParams::default(),
+    };
+    assert_eq!(
+        candidate_nicks(&offers, &cfg),
+        HashSet::from(["A".to_string()])
+    );
 }

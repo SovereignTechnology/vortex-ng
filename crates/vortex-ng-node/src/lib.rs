@@ -22,7 +22,10 @@ use vortex_ng_nostr::ChannelError;
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
 use vortex_ng_nostr::event::{offer_event, public_event};
 use vortex_ng_nostr::keys::{NickKeys, nostr_public};
-use vortex_ng_taker::{Progress, Taker, TakerConfig, TakerError, select_makers, verify_bond};
+use vortex_ng_taker::{
+    Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, select_makers,
+    verify_bond,
+};
 use vortex_ng_wallet::PitWallet;
 
 /// Lifetime of a maker's offer event, seconds.
@@ -39,6 +42,45 @@ pub const REASK_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_ANSWERING_NICKS: usize = 1_000;
 /// See [`MAX_ANSWERING_NICKS`].
 pub const MAX_OFFERS_PER_NICK: usize = 16;
+/// Most bond proofs a taker checks against the chain per round (up to two lookups each). Anyone can sign a proof
+/// with a key of their own, so the signature alone does not earn a lookup.
+pub const MAX_BOND_LOOKUPS: usize = 256;
+
+/// Run synchronous work that may block on the chain backend (`ChainLookup` is a blocking call, a JSON-RPC
+/// request for `CoreRpc`) without stalling the async runtime's other tasks: on a multi-threaded runtime the
+/// worker is handed over for the duration. A current-thread runtime has nothing to hand over to, and just runs it.
+fn blocking<T>(work: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
+/// Check the `!tbond` proofs of the nicks worth it: those with an offer the taker would consider
+/// (`candidates`), at most [`MAX_BOND_LOOKUPS`] of them, against a tip read once.
+fn verify_bonds(
+    proofs: &HashMap<String, String>,
+    candidates: &HashSet<String>,
+    me: &str,
+    chain: &impl ChainLookup,
+    now: u64,
+    cfg: &TakerConfig,
+) -> HashMap<String, VerifiedBond> {
+    let Ok(height) = chain.tip_height() else {
+        return HashMap::new();
+    };
+    proofs
+        .iter()
+        .filter(|(nick, _)| candidates.contains(*nick))
+        .take(MAX_BOND_LOOKUPS)
+        .filter_map(|(nick, proof)| {
+            verify_bond(proof, me, nick, chain, height, now, cfg.bond_params)
+                .ok()
+                .map(|bond| (nick.clone(), bond))
+        })
+        .collect()
+}
 
 /// Why a driver stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,8 +271,7 @@ pub async fn run_maker(
     network: &str,
     until: Instant,
 ) -> Result<(), NodeError> {
-    maker
-        .refresh_bond(chain, unix_now())
+    blocking(|| maker.refresh_bond(chain, unix_now()))
         .map_err(|e| NodeError::Maker(e.to_string()))?;
     let me = client.keys().nick().to_string();
     let mut limiter = OrderbookLimiter::new();
@@ -263,7 +304,7 @@ pub async fn run_maker(
                     match cmd {
                         Command::Orderbook if limiter.allow(&author.nick, Instant::now()) => {
                             // A failed refresh keeps the current certificate while it lasts.
-                            let _ = maker.refresh_bond(chain, unix_now());
+                            let _ = blocking(|| maker.refresh_bond(chain, unix_now()));
                             out.extend(maker.on_orderbook(&author.nick, &me));
                         }
                         Command::Hp2(c) => maker.on_hp2(c),
@@ -276,7 +317,7 @@ pub async fn run_maker(
                 remember(&mut peers, &msg.from, &msg.key, &reply_relays);
                 let mut out = Vec::new();
                 for cmd in commands(&msg) {
-                    out.extend(maker.handle(&msg.from, cmd, chain, unix_now()));
+                    out.extend(blocking(|| maker.handle(&msg.from, cmd, chain, unix_now())));
                 }
                 out
             }
@@ -355,16 +396,8 @@ pub async fn run_taker(
             None => break,
         }
     }
-    let now = unix_now();
-    let bonds: HashMap<String, _> = proofs
-        .iter()
-        .filter(|(nick, _)| per_nick.contains_key(*nick))
-        .filter_map(|(nick, proof)| {
-            verify_bond(proof, &me, nick, chain, now, cfg.bond_params)
-                .ok()
-                .map(|bond| (nick.clone(), bond))
-        })
-        .collect();
+    let candidates = candidate_nicks(&offers, cfg);
+    let bonds = blocking(|| verify_bonds(&proofs, &candidates, &me, chain, unix_now(), cfg));
     let chosen = select_makers(&offers, &bonds, cfg);
     let in_round: HashSet<String> = chosen.iter().map(|(nick, _)| nick.clone()).collect();
     let outgoing = taker.start(chosen).map_err(NodeError::Taker)?;
@@ -380,9 +413,8 @@ pub async fn run_taker(
         }
         remember(&mut peers, &msg.from, &msg.key, &reply_relays);
         for cmd in commands(&msg) {
-            let (outgoing, progress) = taker
-                .handle(&msg.from, cmd, chain)
-                .map_err(NodeError::Taker)?;
+            let (outgoing, progress) =
+                blocking(|| taker.handle(&msg.from, cmd, chain)).map_err(NodeError::Taker)?;
             deliver(client, network, &peers, outgoing).await?;
             if progress == Progress::MakersSigned {
                 return taker.finish(wallet).map_err(NodeError::Taker);

@@ -103,12 +103,14 @@ pub struct VerifiedBond {
 
 /// Verify maker `maker_nick`'s `!tbond` proof to us, `taker_nick`, and value it, as JMP-0001 "Fidelity
 /// Bonds" specifies: both signatures verify, the UTXO is confirmed and pays the freeze script's P2WSH, the
-/// certificate has not expired. The value counts from the time of the block the UTXO confirmed in.
+/// certificate has not expired at `height` (the tip, read once by the caller). The value counts from the time
+/// of the block the UTXO confirmed in. Costs two chain lookups, and none when a signature fails.
 pub fn verify_bond(
     proof: &str,
     taker_nick: &str,
     maker_nick: &str,
     chain: &impl ChainLookup,
+    height: u32,
     now: u64,
     params: BondValueParams,
 ) -> Result<VerifiedBond, String> {
@@ -116,7 +118,6 @@ pub fn verify_bond(
     proof
         .verify_signatures(&Secp256k1::verification_only(), taker_nick, maker_nick)
         .map_err(|e| e.to_string())?;
-    let height = chain.tip_height()?;
     let utxo = chain.utxo(&proof.outpoint)?;
     let confirmations = utxo.as_ref().map_or(0, |u| u.confirmations);
     proof
@@ -144,27 +145,12 @@ pub fn verify_bond(
     })
 }
 
-/// Pick `cfg.makers` makers from `(nick, offer)` pairs and the bonds verified for their nicks, as
-/// joinmarket-ng's `choose_orders` does with `fidelity_bond_weighted_choose`: offers of the pit that cover
-/// the amount within the fee limit, the cheapest per nick; one nick per bond (the cheapest); bondless makers
-/// only at zero fee when `bondless_require_zero_fee`; then each slot is, with probability
-/// `bondless_makers_allowance`, a uniform pick among the zero-fee offers, and otherwise a pick weighted by
-/// bond value, each falling back to the other. If no more makers qualify than are wanted, all are taken.
-pub fn select_makers(
-    offers: &[(String, Offer)],
-    bonds: &HashMap<String, VerifiedBond>,
+/// The offers a taker would consider: of the pit, covering the amount within the fee limit, the cheapest per
+/// nick, cheapest first.
+fn ranked_offers<'a>(
+    offers: &'a [(String, Offer)],
     cfg: &TakerConfig,
-) -> Vec<(String, Offer)> {
-    select_makers_with(offers, bonds, cfg, &mut random_u64)
-}
-
-/// [`select_makers`] drawing its randomness from `rng`.
-pub fn select_makers_with(
-    offers: &[(String, Offer)],
-    bonds: &HashMap<String, VerifiedBond>,
-    cfg: &TakerConfig,
-    rng: &mut dyn FnMut() -> u64,
-) -> Vec<(String, Offer)> {
+) -> Vec<(&'a str, u64, &'a Offer)> {
     let mut best: BTreeMap<&str, (u64, &Offer)> = BTreeMap::new();
     for (nick, offer) in offers {
         if offer.offer_type.pit != cfg.pit {
@@ -186,6 +172,39 @@ pub fn select_makers_with(
         .map(|(nick, (fee, offer))| (nick, fee, offer))
         .collect();
     ranked.sort_by_key(|(_, fee, _)| *fee);
+    ranked
+}
+
+/// The nicks with an offer the taker would consider. Only these are worth a bond lookup.
+pub fn candidate_nicks(offers: &[(String, Offer)], cfg: &TakerConfig) -> HashSet<String> {
+    ranked_offers(offers, cfg)
+        .into_iter()
+        .map(|(nick, _, _)| nick.to_string())
+        .collect()
+}
+
+/// Pick `cfg.makers` makers from `(nick, offer)` pairs and the bonds verified for their nicks, as
+/// joinmarket-ng's `choose_orders` does with `fidelity_bond_weighted_choose`: offers of the pit that cover
+/// the amount within the fee limit, the cheapest per nick; one nick per bond (the cheapest); bondless makers
+/// only at zero fee when `bondless_require_zero_fee`; then each slot is, with probability
+/// `bondless_makers_allowance`, a uniform pick among the zero-fee offers, and otherwise a pick weighted by
+/// bond value, each falling back to the other. If no more makers qualify than are wanted, all are taken.
+pub fn select_makers(
+    offers: &[(String, Offer)],
+    bonds: &HashMap<String, VerifiedBond>,
+    cfg: &TakerConfig,
+) -> Vec<(String, Offer)> {
+    select_makers_with(offers, bonds, cfg, &mut random_u64)
+}
+
+/// [`select_makers`] drawing its randomness from `rng`.
+pub fn select_makers_with(
+    offers: &[(String, Offer)],
+    bonds: &HashMap<String, VerifiedBond>,
+    cfg: &TakerConfig,
+    rng: &mut dyn FnMut() -> u64,
+) -> Vec<(String, Offer)> {
+    let mut ranked = ranked_offers(offers, cfg);
     let value = |nick: &str| bonds.get(nick).map_or(0, |b| b.value);
     // A bond shown by several nicks counts once, for the cheapest of them (`ranked` is cheapest first).
     let mut seen = HashSet::new();
