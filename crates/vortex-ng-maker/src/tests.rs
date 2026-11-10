@@ -40,6 +40,9 @@ impl Chain for FakeChain {
     fn tip_height(&self) -> Result<u32, String> {
         Ok(self.tip)
     }
+    fn block_time(&self, height: u32) -> Result<u32, String> {
+        Ok(1_700_000_000 + height * 600)
+    }
 }
 
 fn spend(txid_byte: u8) -> TxIn {
@@ -516,4 +519,151 @@ fn an_undeclared_utxo_of_the_maker_is_never_signed() {
         NOW,
     );
     assert_eq!(private(&out[0]), ("error", ERROR_TEXT));
+}
+
+/// A maker with two offers and two fidelity bonds (1,000,000 sats until 2028-01, 2,000,000 until
+/// 2030-01), confirmed at height 1. Returns the bonds' outpoints too.
+fn bonded_maker() -> (Maker, OutPoint, OutPoint, Block) {
+    let mut wallet = PitWallet::new(
+        &Seed::from_mnemonic(WORDS, "bonds", Network::Regtest).unwrap(),
+        Pit::Sw0,
+    )
+    .unwrap();
+    let funding = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![spend(9)],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: wallet.bond_address(96).unwrap().script_pubkey(),
+            },
+            TxOut {
+                value: Amount::from_sat(2_000_000),
+                script_pubkey: wallet.bond_address(120).unwrap().script_pubkey(),
+            },
+        ],
+    };
+    let txid = funding.compute_txid();
+    let genesis = genesis_block(Network::Regtest);
+    let block = Block {
+        header: Header {
+            version: BlockVersion::TWO,
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: genesis.header.time + 600,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 9,
+        },
+        txdata: vec![funding],
+    };
+    wallet.apply_block(&block, 1).unwrap();
+    let offers = vec![
+        Offer::parse("sw0reloffer", "0 10000 10000000 100 0.001").unwrap(),
+        Offer::parse("sw0absoffer", "1 10000 10000000 100 500").unwrap(),
+    ];
+    let maker = Maker::new(MakerConfig::new(offers), wallet).unwrap();
+    (
+        maker,
+        OutPoint { txid, vout: 0 },
+        OutPoint { txid, vout: 1 },
+        block,
+    )
+}
+
+fn tbond_of(out: &Outgoing) -> BondProofOf {
+    let (_, body) = private(out);
+    let (_, proof) = body.split_once("!tbond ").expect("a !tbond");
+    vortex_ng_core::bond::BondProof::from_base64(proof).unwrap()
+}
+
+type BondProofOf = vortex_ng_core::bond::BondProof;
+
+#[test]
+fn the_most_valuable_bond_is_proven_to_each_taker() {
+    let (mut maker, small, big, block) = bonded_maker();
+    let chain = FakeChain {
+        utxos: HashMap::new(),
+        tip: 300,
+    };
+    let value = maker.refresh_bond(&chain, NOW).unwrap().unwrap();
+    let expected = bond_value(
+        2_000_000,
+        1_700_000_600,
+        u64::from(vortex_ng_core::bond::timenumber_locktime(120).unwrap()),
+        NOW,
+        BondValueParams::default(),
+    );
+    assert_eq!(value, expected);
+    let out = maker.on_orderbook("J5taker", "J5maker");
+    assert_eq!(out.len(), 2, "one private message per offer");
+    let secp = Secp256k1::new();
+    for o in &out {
+        let proof = tbond_of(o);
+        proof
+            .verify_signatures(&secp, "J5taker", "J5maker")
+            .unwrap();
+        assert!(
+            proof
+                .verify_signatures(&secp, "J5other", "J5maker")
+                .is_err()
+        );
+        assert_eq!(proof.outpoint, big);
+        let spk = maker.wallet.bond_address(120).unwrap().script_pubkey();
+        proof.check_utxo(300, Some(&spk), 10).unwrap();
+    }
+    assert!(
+        private(&out[0])
+            .1
+            .starts_with("0 10000 10000000 100 0.001!tbond ")
+    );
+    // The same certificate while it is valid; a new one once the big bond is spent.
+    let cert = tbond_of(&out[0]).cert_pubkey;
+    maker.refresh_bond(&chain, NOW).unwrap();
+    assert_eq!(
+        tbond_of(&maker.on_orderbook("J5t", "J5m")[0]).cert_pubkey,
+        cert
+    );
+    let spend_big = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: big,
+            ..spend(0)
+        }],
+        output: vec![TxOut::NULL],
+    };
+    let next = Block {
+        header: Header {
+            prev_blockhash: block.block_hash(),
+            nonce: 10,
+            ..block.header
+        },
+        txdata: vec![spend_big],
+    };
+    maker.wallet_mut().apply_block(&next, 2).unwrap();
+    maker.refresh_bond(&chain, NOW).unwrap().unwrap();
+    assert_eq!(
+        tbond_of(&maker.on_orderbook("J5t", "J5m")[0]).outpoint,
+        small
+    );
+}
+
+#[test]
+fn without_a_bond_offers_carry_no_tbond() {
+    let mut maker = funded_maker();
+    let chain = FakeChain {
+        utxos: HashMap::new(),
+        tip: 300,
+    };
+    assert_eq!(maker.refresh_bond(&chain, NOW).unwrap(), None);
+    let out = maker.on_orderbook("J5taker", "J5maker");
+    assert_eq!(out.len(), 1);
+    assert!(!private(&out[0]).1.contains("!tbond"));
+    // `!orderbook` is public only: a private one gets no answer.
+    assert!(
+        maker
+            .handle("J5taker", Command::Orderbook, &chain, NOW)
+            .is_empty()
+    );
 }

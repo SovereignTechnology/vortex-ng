@@ -7,7 +7,7 @@
 //! It stops at [`Progress::MakersSigned`] before signing its own inputs: that is where a Lightning channel
 //! funding output gets its peer's `funding_signed` (the channel-funding draft), before [`Taker::finish`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use vortex_ng_chain::ChainLookup;
 use vortex_ng_core::bitcoin::absolute::LockTime;
@@ -20,6 +20,7 @@ use vortex_ng_core::bitcoin::{
     Address, Amount, CompressedPublicKey, Network, OutPoint, ScriptBuf, Sequence, Transaction,
     TxIn, TxOut, Witness,
 };
+use vortex_ng_core::bond::{BondProof, BondValueParams, bond_value};
 use vortex_ng_core::command::{Command, Ioauth, Outgoing};
 use vortex_ng_core::nacl::{NaclKeypair, Session};
 use vortex_ng_core::offer::{Offer, Pit};
@@ -28,7 +29,7 @@ use vortex_ng_core::protocol::MAKER_CHANGE_THRESHOLD_SAT;
 use vortex_ng_core::script::{taproot_output_secret, wsh0_script_pubkey};
 use vortex_ng_core::sig::verify_sig;
 use vortex_ng_core::sigmsg;
-use vortex_ng_core::tx::shuffle;
+use vortex_ng_core::tx::{random_u64, shuffle};
 use vortex_ng_wallet::PitWallet;
 use vortex_ng_wallet::bdk_wallet::LocalOutput;
 
@@ -78,11 +79,92 @@ pub struct TakerConfig {
     pub fee_rate_sat_per_kwu: u64,
     /// Most inputs one maker may contribute (the taker pays their mining fee).
     pub max_maker_utxos: usize,
+    /// Per-slot chance of a uniform pick among zero-fee offers instead of a bond-weighted pick
+    /// (joinmarket-ng's `bondless_makers_allowance`; [`DEFAULT_BONDLESS_ALLOWANCE`]).
+    pub bondless_makers_allowance: f64,
+    /// Admit makers without a bond only at a zero coinjoin fee (joinmarket-ng's
+    /// `bondless_require_zero_fee`, on by default there: it keeps sybils from farming fees).
+    pub bondless_require_zero_fee: bool,
+    /// The bond value formula's parameters.
+    pub bond_params: BondValueParams,
 }
 
-/// Pick `cfg.makers` makers from `(nick, offer)` pairs: offers of the pit that cover the amount within the
-/// fee limit, the cheapest offer per nick, cheapest makers first.
-pub fn select_makers(offers: &[(String, Offer)], cfg: &TakerConfig) -> Vec<(String, Offer)> {
+/// joinmarket-ng's default `bondless_makers_allowance`.
+pub const DEFAULT_BONDLESS_ALLOWANCE: f64 = 0.05;
+
+/// A maker's fidelity bond, verified against the chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedBond {
+    /// The bond UTXO: one bond counts once, whichever nicks present it.
+    pub outpoint: OutPoint,
+    /// Its value (joinmarket's formula).
+    pub value: u64,
+}
+
+/// Verify maker `maker_nick`'s `!tbond` proof to us, `taker_nick`, and value it, as JMP-0001 "Fidelity
+/// Bonds" specifies: both signatures verify, the UTXO is confirmed and pays the freeze script's P2WSH, the
+/// certificate has not expired. The value counts from the time of the block the UTXO confirmed in.
+pub fn verify_bond(
+    proof: &str,
+    taker_nick: &str,
+    maker_nick: &str,
+    chain: &impl ChainLookup,
+    now: u64,
+    params: BondValueParams,
+) -> Result<VerifiedBond, String> {
+    let proof = BondProof::from_base64(proof).map_err(|e| e.to_string())?;
+    proof
+        .verify_signatures(&Secp256k1::verification_only(), taker_nick, maker_nick)
+        .map_err(|e| e.to_string())?;
+    let height = chain.tip_height()?;
+    let utxo = chain.utxo(&proof.outpoint)?;
+    let confirmations = utxo.as_ref().map_or(0, |u| u.confirmations);
+    proof
+        .check_utxo(
+            height,
+            utxo.as_ref().map(|u| u.script_pubkey.as_script()),
+            confirmations,
+        )
+        .map_err(|e| e.to_string())?;
+    let value = utxo.map_or(0, |u| u.value.to_sat());
+    let confirmed_at = height
+        .checked_add(1)
+        .and_then(|h| h.checked_sub(confirmations))
+        .ok_or("more confirmations than blocks")?;
+    let time = chain.block_time(confirmed_at)?;
+    Ok(VerifiedBond {
+        outpoint: proof.outpoint,
+        value: bond_value(
+            value,
+            u64::from(time),
+            u64::from(proof.locktime),
+            now,
+            params,
+        ),
+    })
+}
+
+/// Pick `cfg.makers` makers from `(nick, offer)` pairs and the bonds verified for their nicks, as
+/// joinmarket-ng's `choose_orders` does with `fidelity_bond_weighted_choose`: offers of the pit that cover
+/// the amount within the fee limit, the cheapest per nick; one nick per bond (the cheapest); bondless makers
+/// only at zero fee when `bondless_require_zero_fee`; then each slot is, with probability
+/// `bondless_makers_allowance`, a uniform pick among the zero-fee offers, and otherwise a pick weighted by
+/// bond value, each falling back to the other. If no more makers qualify than are wanted, all are taken.
+pub fn select_makers(
+    offers: &[(String, Offer)],
+    bonds: &HashMap<String, VerifiedBond>,
+    cfg: &TakerConfig,
+) -> Vec<(String, Offer)> {
+    select_makers_with(offers, bonds, cfg, &mut random_u64)
+}
+
+/// [`select_makers`] drawing its randomness from `rng`.
+pub fn select_makers_with(
+    offers: &[(String, Offer)],
+    bonds: &HashMap<String, VerifiedBond>,
+    cfg: &TakerConfig,
+    rng: &mut dyn FnMut() -> u64,
+) -> Vec<(String, Offer)> {
     let mut best: BTreeMap<&str, (u64, &Offer)> = BTreeMap::new();
     for (nick, offer) in offers {
         if offer.offer_type.pit != cfg.pit {
@@ -99,13 +181,72 @@ pub fn select_makers(offers: &[(String, Offer)], cfg: &TakerConfig) -> Vec<(Stri
             *entry = (fee, offer);
         }
     }
-    let mut ranked: Vec<_> = best.into_iter().collect();
-    ranked.sort_by_key(|(_, (fee, _))| *fee);
-    ranked
+    let mut ranked: Vec<(&str, u64, &Offer)> = best
         .into_iter()
-        .take(cfg.makers)
-        .map(|(n, (_, o))| (n.to_string(), o.clone()))
-        .collect()
+        .map(|(nick, (fee, offer))| (nick, fee, offer))
+        .collect();
+    ranked.sort_by_key(|(_, fee, _)| *fee);
+    let value = |nick: &str| bonds.get(nick).map_or(0, |b| b.value);
+    // A bond shown by several nicks counts once, for the cheapest of them (`ranked` is cheapest first).
+    let mut seen = HashSet::new();
+    ranked.retain(|(nick, _, _)| match bonds.get(*nick) {
+        Some(bond) if bond.value > 0 => seen.insert(bond.outpoint),
+        _ => true,
+    });
+    if cfg.bondless_require_zero_fee {
+        ranked.retain(|(nick, _, offer)| value(nick) > 0 || offer.cjfee.is_zero());
+    }
+    let take = |picked: Vec<(&str, u64, &Offer)>| {
+        picked
+            .into_iter()
+            .map(|(nick, _, offer)| (nick.to_string(), offer.clone()))
+            .collect()
+    };
+    if ranked.len() <= cfg.makers {
+        return take(ranked);
+    }
+    let unit = |r: u64| (r >> 11) as f64 / (1u64 << 53) as f64;
+    let mut chosen = Vec::with_capacity(cfg.makers);
+    for _ in 0..cfg.makers {
+        let allowance_pool: Vec<usize> = (0..ranked.len())
+            .filter(|&i| !cfg.bondless_require_zero_fee || ranked[i].2.cjfee.is_zero())
+            .collect();
+        let uniform = |rng: &mut dyn FnMut() -> u64| {
+            (!allowance_pool.is_empty())
+                .then(|| allowance_pool[(rng() % allowance_pool.len() as u64) as usize])
+        };
+        let weighted = |rng: &mut dyn FnMut() -> u64| {
+            let total: f64 = ranked.iter().map(|(n, _, _)| value(n) as f64).sum();
+            if total <= 0.0 {
+                return None;
+            }
+            let target = unit(rng()) * total;
+            let mut cumulative = 0.0;
+            let mut last = None;
+            for (i, (nick, _, _)) in ranked.iter().enumerate() {
+                let v = value(nick);
+                if v == 0 {
+                    continue;
+                }
+                cumulative += v as f64;
+                last = Some(i);
+                if target < cumulative {
+                    return Some(i);
+                }
+            }
+            last
+        };
+        let pick = if unit(rng()) < cfg.bondless_makers_allowance {
+            uniform(rng).or_else(|| weighted(rng))
+        } else {
+            weighted(rng).or_else(|| uniform(rng))
+        };
+        let Some(i) = pick else {
+            break;
+        };
+        chosen.push(ranked.remove(i));
+    }
+    take(chosen)
 }
 
 /// The PoDLE for one of our UTXOs (`tr0` uses the BIP86 output secret, `wsh0` adds the cosigner).

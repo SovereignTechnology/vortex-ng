@@ -7,7 +7,7 @@
 //!
 //! Chain lookups are synchronous (`ChainLookup`); a production daemon runs them on a blocking thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use vortex_ng_chain::ChainLookup;
@@ -22,13 +22,23 @@ use vortex_ng_nostr::ChannelError;
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
 use vortex_ng_nostr::event::{offer_event, public_event};
 use vortex_ng_nostr::keys::{NickKeys, nostr_public};
-use vortex_ng_taker::{Progress, Taker, TakerConfig, TakerError, select_makers};
+use vortex_ng_taker::{Progress, Taker, TakerConfig, TakerError, select_makers, verify_bond};
 use vortex_ng_wallet::PitWallet;
 
 /// Lifetime of a maker's offer event, seconds.
 pub const OFFER_TTL: u64 = 1800;
 /// How long a relay connection may take.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A maker answers one nick's `!orderbook` at most once per this interval.
+pub const ORDERBOOK_NICK_INTERVAL: Duration = Duration::from_secs(5);
+/// A maker answers at most this many `!orderbook` requests a minute, from all nicks together.
+pub const ORDERBOOK_ANSWERS_PER_MINUTE: u32 = 120;
+/// A taker asks again (`!orderbook`) at most this often while it discovers makers that have not answered.
+pub const REASK_INTERVAL: Duration = Duration::from_secs(1);
+/// Most maker nicks a taker hears offers from in one gathering, and most offers it keeps per nick.
+pub const MAX_ANSWERING_NICKS: usize = 1_000;
+/// See [`MAX_ANSWERING_NICKS`].
+pub const MAX_OFFERS_PER_NICK: usize = 16;
 
 /// Why a driver stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +49,8 @@ pub enum NodeError {
     Taker(TakerError),
     /// The deadline passed.
     Timeout,
+    /// The maker could not start (its bond, its chain).
+    Maker(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -47,6 +59,7 @@ impl std::fmt::Display for NodeError {
             NodeError::Channel(e) => write!(f, "{e}"),
             NodeError::Taker(e) => write!(f, "{e}"),
             NodeError::Timeout => f.write_str("deadline passed"),
+            NodeError::Maker(e) => write!(f, "maker: {e}"),
         }
     }
 }
@@ -161,6 +174,52 @@ fn remember(
     }
 }
 
+/// The maker's `!orderbook` rate limits (the Nostr draft's SHOULD): each answer costs a proof and a gift
+/// wrap per offer.
+struct OrderbookLimiter {
+    last: HashMap<String, Instant>,
+    window: Instant,
+    count: u32,
+}
+
+impl OrderbookLimiter {
+    fn new() -> OrderbookLimiter {
+        OrderbookLimiter {
+            last: HashMap::new(),
+            window: Instant::now(),
+            count: 0,
+        }
+    }
+
+    fn allow(&mut self, nick: &str, now: Instant) -> bool {
+        if now.duration_since(self.window) >= Duration::from_secs(60) {
+            self.window = now;
+            self.count = 0;
+            self.last
+                .retain(|_, t| now.duration_since(*t) < ORDERBOOK_NICK_INTERVAL);
+        }
+        if self.count >= ORDERBOOK_ANSWERS_PER_MINUTE
+            || self
+                .last
+                .get(nick)
+                .is_some_and(|t| now.duration_since(*t) < ORDERBOOK_NICK_INTERVAL)
+        {
+            return false;
+        }
+        self.last.insert(nick.to_string(), now);
+        self.count += 1;
+        true
+    }
+}
+
+/// Publish `!orderbook` from the taker's nick.
+async fn ask_orderbook(client: &NickClient, network: &str) -> Result<(), NodeError> {
+    let relays: Vec<&str> = client.relays().iter().map(String::as_str).collect();
+    let event = public_event(client.keys(), network, "!orderbook", &relays, unix_now())?;
+    client.publish(&event).await?;
+    Ok(())
+}
+
 /// Run `maker` on `client` until `until`: publish its offers, answer `!orderbook` with its offers, and run
 /// sessions for the takers that fill them.
 pub async fn run_maker(
@@ -170,6 +229,11 @@ pub async fn run_maker(
     network: &str,
     until: Instant,
 ) -> Result<(), NodeError> {
+    maker
+        .refresh_bond(chain, unix_now())
+        .map_err(|e| NodeError::Maker(e.to_string()))?;
+    let me = client.keys().nick().to_string();
+    let mut limiter = OrderbookLimiter::new();
     client
         .subscribe(unix_now().saturating_sub(60), false, true)
         .await?;
@@ -197,7 +261,11 @@ pub async fn run_maker(
                 let mut out = Vec::new();
                 for cmd in cmds {
                     match cmd {
-                        Command::Orderbook => out.extend(maker.on_orderbook(&author.nick)),
+                        Command::Orderbook if limiter.allow(&author.nick, Instant::now()) => {
+                            // A failed refresh keeps the current certificate while it lasts.
+                            let _ = maker.refresh_bond(chain, unix_now());
+                            out.extend(maker.on_orderbook(&author.nick, &me));
+                        }
                         Command::Hp2(c) => maker.on_hp2(c),
                         _ => {}
                     }
@@ -220,9 +288,10 @@ pub async fn run_maker(
     Ok(())
 }
 
-/// Run one CoinJoin as the taker: gather offers for `gather`, pick makers, run the round, and return the
-/// fully signed transaction (signed last, after every maker; channel funding hooks in before
-/// `Taker::finish`).
+/// Run one CoinJoin as the taker: ask for the orderbook, gather the makers' private answers (offers and
+/// `!tbond` proofs; offer events serve only to discover makers that missed the request) for `gather`,
+/// verify the bonds, pick makers, run the round, and return the fully signed transaction (signed last,
+/// after every maker; channel funding hooks in before `Taker::finish`).
 pub async fn run_taker(
     taker: &mut Taker,
     wallet: &PitWallet,
@@ -233,25 +302,71 @@ pub async fn run_taker(
     until: Instant,
 ) -> Result<Transaction, NodeError> {
     let network = channel_network(cfg.network);
+    let me = client.keys().nick().to_string();
     client
         .subscribe(unix_now().saturating_sub(60), true, false)
         .await?;
+    ask_orderbook(client, network).await?;
+    let mut asked = Instant::now();
     let mut offers: Vec<(String, Offer)> = Vec::new();
+    let mut per_nick: HashMap<String, usize> = HashMap::new();
+    let mut proofs: HashMap<String, String> = HashMap::new();
     let mut peers: HashMap<String, Peer> = HashMap::new();
     let gather_until = Instant::now() + gather;
     while let Some(left) = gather_until.checked_duration_since(Instant::now()) {
         match client.next(left).await {
-            Some(Incoming::Offers(author, list)) => {
-                remember(&mut peers, &author.nick, &author.key, &author.relays);
-                offers.extend(list.into_iter().map(|o| (author.nick.clone(), o)));
+            Some(Incoming::Offers(author, _)) => {
+                if peers.contains_key(&author.nick) || peers.len() < MAX_ANSWERING_NICKS {
+                    remember(&mut peers, &author.nick, &author.key, &author.relays);
+                }
+                // The events are a discovery cache (the draft): a maker that has not answered may have
+                // subscribed after our request, so ask again.
+                if !per_nick.contains_key(&author.nick) && asked.elapsed() >= REASK_INTERVAL {
+                    ask_orderbook(client, network).await?;
+                    asked = Instant::now();
+                }
+            }
+            Some(Incoming::Private(msg, reply_relays)) => {
+                if !per_nick.contains_key(&msg.from) && per_nick.len() >= MAX_ANSWERING_NICKS {
+                    continue;
+                }
+                // Only a nick that answers with offers is remembered, and its `!tbond` kept: senders of
+                // anything else cannot grow the taker's state.
+                for cmd in commands(&msg) {
+                    match cmd {
+                        Command::Offer(offer) => {
+                            let count = per_nick.entry(msg.from.clone()).or_default();
+                            if *count < MAX_OFFERS_PER_NICK {
+                                *count += 1;
+                                offers.push((msg.from.clone(), offer));
+                            }
+                        }
+                        Command::Tbond(proof) if per_nick.contains_key(&msg.from) => {
+                            proofs.entry(msg.from.clone()).or_insert(proof);
+                        }
+                        _ => {}
+                    }
+                }
+                if per_nick.contains_key(&msg.from) {
+                    remember(&mut peers, &msg.from, &msg.key, &reply_relays);
+                }
             }
             Some(_) => {}
             None => break,
         }
     }
-    let chosen = select_makers(&offers, cfg);
-    let in_round: std::collections::HashSet<String> =
-        chosen.iter().map(|(nick, _)| nick.clone()).collect();
+    let now = unix_now();
+    let bonds: HashMap<String, _> = proofs
+        .iter()
+        .filter(|(nick, _)| per_nick.contains_key(*nick))
+        .filter_map(|(nick, proof)| {
+            verify_bond(proof, &me, nick, chain, now, cfg.bond_params)
+                .ok()
+                .map(|bond| (nick.clone(), bond))
+        })
+        .collect();
+    let chosen = select_makers(&offers, &bonds, cfg);
+    let in_round: HashSet<String> = chosen.iter().map(|(nick, _)| nick.clone()).collect();
     let outgoing = taker.start(chosen).map_err(NodeError::Taker)?;
     deliver(client, network, &peers, outgoing).await?;
     while let Some(left) = until.checked_duration_since(Instant::now()) {

@@ -242,6 +242,16 @@ impl CoreRpc {
             .ok_or(ChainError::Parse("block hash"))
     }
 
+    /// The timestamp of the block at `height` (`getblockheader`), for a fidelity bond's confirmation time.
+    pub fn block_time(&self, height: u32) -> Result<u32, ChainError> {
+        let hash = self.block_hash(height)?;
+        let header = self.call("getblockheader", json!([hash.to_string(), true]))?;
+        header["time"]
+            .as_u64()
+            .and_then(|t| u32::try_from(t).ok())
+            .ok_or(ChainError::Parse("block time"))
+    }
+
     /// The block with `hash`.
     pub fn block(&self, hash: &BlockHash) -> Result<Block, ChainError> {
         let v = self.call("getblock", json!([hash.to_string(), 0]))?;
@@ -256,6 +266,8 @@ pub trait ChainLookup {
     fn utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, String>;
     /// The best block's height.
     fn tip_height(&self) -> Result<u32, String>;
+    /// The timestamp of the block at `height`.
+    fn block_time(&self, height: u32) -> Result<u32, String>;
 }
 
 impl ChainLookup for CoreRpc {
@@ -264,6 +276,9 @@ impl ChainLookup for CoreRpc {
     }
     fn tip_height(&self) -> Result<u32, String> {
         CoreRpc::tip_height(self).map_err(|e| e.to_string())
+    }
+    fn block_time(&self, height: u32) -> Result<u32, String> {
+        CoreRpc::block_time(self, height).map_err(|e| e.to_string())
     }
 }
 
@@ -459,6 +474,21 @@ mod tests {
             Ok(r#"{"errors":["Insufficient data or no feerate found"],"blocks":0}"#),
         )]);
         assert_eq!(none.estimate_fee_rate(2).unwrap(), None);
+    }
+
+    #[test]
+    fn block_time_from_header() {
+        let node = rpc(&[
+            (
+                "getblockhash",
+                Ok(r#""0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206""#),
+            ),
+            (
+                "getblockheader",
+                Ok(r#"{"hash":"0f91","height":0,"time":1296688602}"#),
+            ),
+        ]);
+        assert_eq!(node.block_time(0).unwrap(), 1_296_688_602);
     }
 
     #[test]

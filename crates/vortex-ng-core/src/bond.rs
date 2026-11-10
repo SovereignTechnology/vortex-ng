@@ -24,6 +24,85 @@ pub const PROOF_LEN: usize = 252;
 pub const RETARGET_INTERVAL: u32 = 2016;
 const SIG_FIELD: usize = 72;
 
+/// Bond timelocks: one per month from January 2020 for 80 years (joinmarket's `TIMENUMBER_COUNT`).
+pub const TIMENUMBER_COUNT: u32 = 960;
+
+/// Days from 1970-01-01 to the civil date `y-m-d` (proleptic Gregorian; Hinnant's algorithm).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = i64::from((m + 9) % 12);
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The timelock of bond timenumber `n`: 00:00 UTC on the 1st of month `n` counted from January 2020.
+pub fn timenumber_locktime(n: u32) -> Option<u32> {
+    if n >= TIMENUMBER_COUNT {
+        return None;
+    }
+    let (year, month) = (2020 + i64::from(n / 12), 1 + n % 12);
+    u32::try_from(days_from_civil(year, month, 1) * 86_400).ok()
+}
+
+/// Interest rate and exponent of the bond value formula (joinmarket-ng defaults 0.015 and 1.3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BondValueParams {
+    /// Yearly interest rate.
+    pub interest_rate: f64,
+    /// Exponent applied to the value.
+    pub exponent: f64,
+}
+
+impl Default for BondValueParams {
+    fn default() -> Self {
+        BondValueParams {
+            interest_rate: 0.015,
+            exponent: 1.3,
+        }
+    }
+}
+
+/// A timelocked bond's value, as joinmarket computes it (`calculate_timelocked_fidelity_bond_value`):
+/// `(value * a)^exponent` with `a = max(0, min(1, e^(rT) - 1) - min(1, e^(r * max(0, t - L)) - 1))`,
+/// `T` = locktime - confirmation, `L` = locktime, `t` = now, all in Gregorian years. Truncated like
+/// joinmarket-ng's `int(...)`.
+pub fn bond_value(
+    utxo_value: u64,
+    confirmation_time: u64,
+    locktime: u64,
+    now: u64,
+    params: BondValueParams,
+) -> u64 {
+    const YEAR: f64 = 60.0 * 60.0 * 24.0 * 365.2425;
+    let r = params.interest_rate;
+    let t_lock = (locktime as f64 - confirmation_time as f64) / YEAR;
+    let (l, t) = (locktime as f64 / YEAR, now as f64 / YEAR);
+    let a = (((r * t_lock).exp() - 1.0).min(1.0) - ((r * (t - l).max(0.0)).exp() - 1.0).min(1.0))
+        .max(0.0);
+    let value = (utxo_value as f64 * a).powf(params.exponent);
+    if value.is_finite() && value >= 0.0 {
+        value as u64
+    } else {
+        0
+    }
+}
+
+/// Blocks of margin and retarget periods of validity for a fresh certificate (joinmarket's
+/// `BLOCK_COUNT_SAFETY` and `CERT_MAX_VALIDITY_TIME`).
+pub const BLOCK_COUNT_SAFETY: u32 = 2;
+/// See [`BLOCK_COUNT_SAFETY`].
+pub const CERT_MAX_VALIDITY: u32 = 1;
+
+/// The `cert_expiry` (a retarget period number) a maker gives a certificate made at `height`:
+/// `(height + 2) / 2016 + 1`, as joinmarket's `yieldgenerator` and joinmarket-ng's maker compute it.
+pub fn cert_expiry_at(height: u32) -> u16 {
+    let periods = height.saturating_add(BLOCK_COUNT_SAFETY) / RETARGET_INTERVAL + CERT_MAX_VALIDITY;
+    u16::try_from(periods).unwrap_or(u16::MAX)
+}
+
 /// Why a proof was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BondError {
@@ -264,6 +343,81 @@ impl BondProof {
     }
 }
 
+/// A maker's bond, ready to prove to any taker: the bond's UTXO key has signed a certificate delegating to
+/// a random hot key, which then signs each `taker_nick|maker_nick` (joinmarket's hot-wallet bond mode).
+pub struct BondTemplate {
+    cert_key: SecretKey,
+    cert_sig: Vec<u8>,
+    cert_expiry: u16,
+    utxo_pubkey: PublicKey,
+    outpoint: OutPoint,
+    locktime: u32,
+}
+
+impl std::fmt::Debug for BondTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BondTemplate")
+            .field("cert_expiry", &self.cert_expiry)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BondTemplate {
+    /// Delegate the bond at `outpoint` (locked until `locktime`, spendable by `utxo_key`) to a fresh
+    /// certificate key, valid until [`cert_expiry_at`]`(height)`.
+    pub fn new<C: Signing>(
+        secp: &Secp256k1<C>,
+        utxo_key: &SecretKey,
+        outpoint: OutPoint,
+        locktime: u32,
+        height: u32,
+    ) -> BondTemplate {
+        let cert_key = crate::nick::random_nick_key();
+        let cert_expiry = cert_expiry_at(height);
+        let cert_pubkey = PublicKey::from_secret_key(secp, &cert_key);
+        let cert_sig = BondProof::sign_certificate(secp, utxo_key, &cert_pubkey, cert_expiry);
+        BondTemplate {
+            cert_key,
+            cert_sig,
+            cert_expiry,
+            utxo_pubkey: PublicKey::from_secret_key(secp, utxo_key),
+            outpoint,
+            locktime,
+        }
+    }
+
+    /// The proof for `taker_nick`, as `!tbond` carries it.
+    pub fn proof<C: Signing>(
+        &self,
+        secp: &Secp256k1<C>,
+        taker_nick: &str,
+        maker_nick: &str,
+    ) -> BondProof {
+        BondProof::create(
+            secp,
+            &self.cert_key,
+            self.cert_sig.clone(),
+            self.cert_expiry,
+            self.utxo_pubkey,
+            self.outpoint,
+            self.locktime,
+            taker_nick,
+            maker_nick,
+        )
+    }
+
+    /// The bond UTXO.
+    pub fn outpoint(&self) -> OutPoint {
+        self.outpoint
+    }
+
+    /// Whether a taker at `height` (plus the safety margin) still accepts the certificate.
+    pub fn usable_at(&self, height: u32) -> bool {
+        height.saturating_add(BLOCK_COUNT_SAFETY)
+            < u32::from(self.cert_expiry).saturating_mul(RETARGET_INTERVAL)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -282,6 +436,90 @@ mod tests {
             txid: Txid::from_str(&"ab".repeat(32)).unwrap(),
             vout: 1,
         }
+    }
+
+    #[test]
+    fn cert_expiry_matches_joinmarket() {
+        // ((blocks + 2) // 2016) + 1
+        for (height, expiry) in [(0, 1), (2013, 1), (2014, 2), (300, 1), (870_000, 432)] {
+            assert_eq!(cert_expiry_at(height), expiry, "{height}");
+        }
+    }
+
+    #[test]
+    fn template_proofs_verify_and_pass_the_chain_checks() {
+        let secp = Secp256k1::new();
+        let utxo_key = key(7);
+        let locktime = timenumber_locktime(96).unwrap();
+        let template = BondTemplate::new(&secp, &utxo_key, outpoint(), locktime, 4_100);
+        assert!(template.usable_at(4_100) && !template.usable_at(6_046));
+        let proof = template.proof(&secp, "J5taker", "J5maker");
+        let proof = BondProof::from_base64(&proof.to_base64().unwrap()).unwrap();
+        proof
+            .verify_signatures(&secp, "J5taker", "J5maker")
+            .unwrap();
+        assert!(
+            proof
+                .verify_signatures(&secp, "J5other", "J5maker")
+                .is_err()
+        );
+        assert_eq!(proof.cert_expiry, 3);
+        let spk = ScriptBuf::new_p2wsh(
+            &freeze_script(&PublicKey::from_secret_key(&secp, &utxo_key), locktime).wscript_hash(),
+        );
+        proof.check_utxo(4_100, Some(&spk), 1).unwrap();
+        assert_eq!(
+            proof.check_utxo(6_049, Some(&spk), 1),
+            Err(BondError::Expired)
+        );
+        // A fresh certificate key per template.
+        let other = BondTemplate::new(&secp, &utxo_key, outpoint(), locktime, 4_100)
+            .proof(&secp, "J5taker", "J5maker");
+        assert_ne!(other.cert_pubkey, proof.cert_pubkey);
+    }
+
+    #[test]
+    fn timenumbers_match_joinmarket() {
+        // calendar.timegm of the 1st of each month, as joinmarket's timenumber_to_timestamp.
+        for (n, ts) in [
+            (0, 1_577_836_800),
+            (1, 1_580_515_200),
+            (11, 1_606_780_800),
+            (12, 1_609_459_200),
+            (37, 1_675_209_600),
+            (959, 4_099_766_400u32),
+        ] {
+            assert_eq!(timenumber_locktime(n), Some(ts), "{n}");
+        }
+        assert_eq!(timenumber_locktime(TIMENUMBER_COUNT), None);
+    }
+
+    #[test]
+    fn bond_values_match_joinmarket_formula() {
+        // From joinmarket-ng's formula in Python (int(pow(v * a, 1.3))); f64 libm may differ by an ulp.
+        let close = |a: u64, b: u64| a.abs_diff(b) <= b / 1_000_000_000 + 1;
+        let conf = 1_704_067_200; // 2024-01-01
+        let lock = u64::from(timenumber_locktime(72).unwrap()); // 2026-01-01
+        let p = BondValueParams::default();
+        assert!(close(
+            bond_value(100_000_000, conf, lock, 1_748_736_000, p),
+            268_628_101
+        )); // 2025-06-01
+        assert!(close(
+            bond_value(100_000_000, conf, lock, 1_798_761_600, p),
+            110_357_012
+        )); // 2027-01-01
+        assert_eq!(bond_value(100_000_000, conf, lock, 4_070_908_800, p), 0); // 2099: long expired
+        assert!(close(
+            bond_value(
+                50_000_000,
+                conf,
+                u64::from(timenumber_locktime(84).unwrap()),
+                1_748_736_000,
+                p
+            ),
+            186_522_658
+        ));
     }
 
     #[test]

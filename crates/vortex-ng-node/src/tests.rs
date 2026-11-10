@@ -1,5 +1,7 @@
 //! A whole CoinJoin over a real relay: two makers and a taker, each with its own nick and wallet, talking
-//! only through gift-wrapped Nostr events on nostr-sdk's in-process relay.
+//! only through gift-wrapped Nostr events on nostr-sdk's in-process relay. The makers hold fidelity bonds
+//! and charge a fee, so under joinmarket-ng's default policy (bondless makers only at zero fee) the round
+//! happens only if their `!tbond` proofs cross the relay and verify against the chain.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,12 +37,18 @@ impl ChainLookup for SharedChain {
     fn tip_height(&self) -> Result<u32, String> {
         Ok(300)
     }
+    fn block_time(&self, height: u32) -> Result<u32, String> {
+        Ok(1_700_000_000 + height * 600)
+    }
 }
 
+/// A wallet with `value` confirmed in mixdepth 0 and, with `bond`, a fidelity bond of that many sats
+/// locked until timenumber 120 (2030-01), all registered in `utxos` with 10 confirmations.
 fn funded(
     pit: Pit,
     who: &str,
     value: u64,
+    bond: Option<u64>,
     salt: u8,
     utxos: &mut HashMap<OutPoint, Utxo>,
 ) -> PitWallet {
@@ -62,10 +70,14 @@ fn funded(
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey: address.script_pubkey(),
-        }],
+        output: [(value, address.script_pubkey())]
+            .into_iter()
+            .chain(bond.map(|b| (b, wallet.bond_address(120).unwrap().script_pubkey())))
+            .map(|(v, spk)| TxOut {
+                value: Amount::from_sat(v),
+                script_pubkey: spk,
+            })
+            .collect(),
     };
     let genesis = genesis_block(Network::Regtest);
     let block = Block {
@@ -80,18 +92,23 @@ fn funded(
         txdata: vec![funding.clone()],
     };
     wallet.apply_block(&block, 1).unwrap();
-    utxos.insert(
-        OutPoint {
-            txid: funding.compute_txid(),
-            vout: 0,
-        },
-        Utxo {
-            value: Amount::from_sat(value),
-            script_pubkey: address.script_pubkey(),
-            confirmations: 10,
-            coinbase: false,
-        },
-    );
+    for (vout, out) in funding.output.iter().enumerate() {
+        utxos.insert(
+            OutPoint {
+                txid: funding.compute_txid(),
+                vout: vout as u32,
+            },
+            Utxo {
+                value: out.value,
+                script_pubkey: out.script_pubkey.clone(),
+                confirmations: 10,
+                coinbase: false,
+            },
+        );
+    }
+    if bond.is_some() {
+        assert_eq!(wallet.bonds().len(), 1);
+    }
     wallet
 }
 
@@ -102,9 +119,12 @@ async fn a_whole_coinjoin_over_a_nostr_relay() {
     let pit = Pit::Tr0;
     let mut utxos = HashMap::new();
     let maker_wallets: Vec<PitWallet> = (0..2)
-        .map(|i| funded(pit, &format!("maker{i}"), 500_000, 10 + i, &mut utxos))
+        .map(|i| {
+            let bond = Some(1_000_000 + u64::from(i));
+            funded(pit, &format!("maker{i}"), 500_000, bond, 10 + i, &mut utxos)
+        })
         .collect();
-    let mut taker_wallet = funded(pit, "taker", 600_000, 20, &mut utxos);
+    let mut taker_wallet = funded(pit, "taker", 600_000, None, 20, &mut utxos);
     let chain = SharedChain(Arc::new(utxos));
     let until = Instant::now() + Duration::from_secs(60);
 
@@ -140,6 +160,9 @@ async fn a_whole_coinjoin_over_a_nostr_relay() {
         max_cjfee: 1_000,
         fee_rate_sat_per_kwu: 2_500,
         max_maker_utxos: 20,
+        bondless_makers_allowance: vortex_ng_taker::DEFAULT_BONDLESS_ALLOWANCE,
+        bondless_require_zero_fee: true,
+        bond_params: Default::default(),
     };
     let cj = taker_wallet
         .next_receive_address(1)

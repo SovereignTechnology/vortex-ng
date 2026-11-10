@@ -120,6 +120,8 @@ JMP-0001 `<from_nick>!PUBLIC` prefix:
   requesting nick containing its offers for the pits it serves, each followed by its `!tbond` proof for that
   taker, exactly as JMP-0001 "Phase 1" and "Fidelity Bonds" specify. A maker MAY answer only for pits that
   appear in the request's `f` tags when present. Makers SHOULD apply per-nick and aggregate rate limits.
+  Ephemeral events reach only peers subscribed at the time, so a taker MAY repeat `!orderbook` while it
+  gathers, at most once a second, when an offer event reveals a maker that has not answered yet.
 - `!hp2 <commitment>`: the PoDLE commitment broadcast of JMP-0001 "Phase 3". It MUST be published from a fresh
   throwaway nick, over a connection and Tor circuit used for nothing else, which is closed afterwards.
 - `!cancel <oid>`: as JMP-0001.

@@ -52,6 +52,7 @@ impl PitWallet {
                 .apply_block_connected_to(block, height, connected_to)
                 .map_err(|e| WalletError::CannotConnect(e.to_string()))?;
         }
+        self.bonds.scan(block, height);
         Ok(())
     }
 
@@ -75,6 +76,7 @@ impl PitWallet {
         let connect = connect.ok_or_else(|| {
             WalletError::CannotConnect("source shares no block with the wallet".into())
         })?;
+        self.bonds.drop_above(connect.height);
         let mut height = if connect.height == 0 {
             birthday.max(1)
         } else {

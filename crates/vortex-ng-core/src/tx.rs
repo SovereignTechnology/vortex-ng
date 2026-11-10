@@ -234,6 +234,12 @@ pub fn verify_unsigned(
     Ok(())
 }
 
+/// A uniformly random `u64` from the operating system.
+pub fn random_u64() -> u64 {
+    use crypto_box::aead::rand_core::RngCore;
+    crypto_box::aead::OsRng.next_u64()
+}
+
 /// Shuffle in place with OS randomness (Fisher-Yates), for input and output order.
 pub fn shuffle<T>(items: &mut [T]) {
     use crypto_box::aead::rand_core::RngCore;

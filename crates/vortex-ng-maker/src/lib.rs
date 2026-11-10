@@ -15,6 +15,7 @@ use vortex_ng_core::bitcoin::consensus::encode::deserialize;
 use vortex_ng_core::bitcoin::hex::DisplayHex;
 use vortex_ng_core::bitcoin::secp256k1::{PublicKey, Secp256k1};
 use vortex_ng_core::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use vortex_ng_core::bond::{BondTemplate, BondValueParams, bond_value};
 use vortex_ng_core::command::Command;
 pub use vortex_ng_core::command::Outgoing;
 use vortex_ng_core::nacl::{NaclKeypair, Session};
@@ -36,6 +37,8 @@ pub struct MakerConfig {
     pub taker_utxo_age: u32,
     /// Minimum value of the taker's committed UTXO, percent of the amount (`taker_utxo_amtpercent`).
     pub taker_utxo_amtpercent: u64,
+    /// The bond value formula's parameters, for choosing which of our bonds to prove.
+    pub bond_params: BondValueParams,
 }
 
 impl MakerConfig {
@@ -46,6 +49,7 @@ impl MakerConfig {
             podle_indices: DEFAULT_INDICES.to_vec(),
             taker_utxo_age: 5,
             taker_utxo_amtpercent: 20,
+            bond_params: BondValueParams::default(),
         }
     }
 }
@@ -104,6 +108,7 @@ pub struct Maker {
     wallet: PitWallet,
     sessions: HashMap<String, Stage>,
     used_commitments: HashSet<[u8; 32]>,
+    bond: Option<BondTemplate>,
 }
 
 impl std::fmt::Debug for Maker {
@@ -136,6 +141,7 @@ impl Maker {
             wallet,
             sessions: HashMap::new(),
             used_commitments: HashSet::new(),
+            bond: None,
         })
     }
 
@@ -154,23 +160,82 @@ impl Maker {
         self.used_commitments.insert(commitment);
     }
 
-    /// Answer `!orderbook` from `from`: our offers in one private message (bonds come with M2's bond step).
-    pub fn on_orderbook(&self, from: &str) -> Vec<Outgoing> {
-        let mut lines: Vec<String> = self.config.offers.iter().map(Offer::to_command).collect();
-        if lines.is_empty() {
-            return Vec::new();
+    /// Pick the wallet's most valuable fidelity bond and certify it for `!tbond` proofs (JMP-0001 "Fidelity
+    /// Bonds"; the bond with the highest value, as joinmarket's makers choose). The current certificate is
+    /// kept while it stays valid and its bond stays the best one. Returns the bond's value, or `None` (and
+    /// no proofs) when the wallet holds no bond worth anything at `now`.
+    pub fn refresh_bond(
+        &mut self,
+        chain: &impl Chain,
+        now: u64,
+    ) -> Result<Option<u64>, MakerError> {
+        let height = chain.tip_height().map_err(MakerError::Internal)?;
+        let mut best: Option<(u64, vortex_ng_wallet::bonds::BondUtxo)> = None;
+        for bond in self.wallet.bonds() {
+            let confirmed = chain
+                .block_time(bond.height)
+                .map_err(MakerError::Internal)?;
+            let value = bond_value(
+                bond.value.to_sat(),
+                u64::from(confirmed),
+                u64::from(bond.locktime),
+                now,
+                self.config.bond_params,
+            );
+            if value > 0 && best.as_ref().is_none_or(|(v, _)| value > *v) {
+                best = Some((value, bond));
+            }
         }
-        let first = lines.remove(0);
-        let (command, args) = first
-            .trim_start_matches('!')
-            .split_once(' ')
-            .unwrap_or(("", ""));
-        let body = format!("{args}{}", lines.concat());
-        vec![Outgoing::Private {
-            to: from.to_string(),
-            command: command.to_string(),
-            body,
-        }]
+        let Some((value, bond)) = best else {
+            self.bond = None;
+            return Ok(None);
+        };
+        let keep = self
+            .bond
+            .as_ref()
+            .is_some_and(|t| t.outpoint() == bond.outpoint && t.usable_at(height));
+        if !keep {
+            let key = self
+                .wallet
+                .bond_key(bond.timenumber)
+                .map_err(|e| MakerError::Internal(e.to_string()))?;
+            self.bond = Some(BondTemplate::new(
+                &Secp256k1::signing_only(),
+                &key,
+                bond.outpoint,
+                bond.locktime,
+                height,
+            ));
+        }
+        Ok(Some(value))
+    }
+
+    /// Answer `!orderbook` from taker `from` to us, `me`: one private message per offer, each followed by
+    /// `!tbond` with our bond's proof for that taker when we have one (as joinmarket-ng's makers send it).
+    pub fn on_orderbook(&self, from: &str, me: &str) -> Vec<Outgoing> {
+        let tbond = self.bond.as_ref().and_then(|t| {
+            t.proof(&Secp256k1::signing_only(), from, me)
+                .to_base64()
+                .ok()
+        });
+        self.config
+            .offers
+            .iter()
+            .filter_map(|offer| {
+                let line = offer.to_command();
+                let (command, args) = line.trim_start_matches('!').split_once(' ')?;
+                let mut body = args.to_string();
+                if let Some(proof) = &tbond {
+                    body.push_str("!tbond ");
+                    body.push_str(proof);
+                }
+                Some(Outgoing::Private {
+                    to: from.to_string(),
+                    command: command.to_string(),
+                    body,
+                })
+            })
+            .collect()
     }
 
     /// Handle one verified command from taker `from`. Errors drop the session and answer `!error`.
@@ -182,7 +247,8 @@ impl Maker {
         now: u64,
     ) -> Vec<Outgoing> {
         let result = match command {
-            Command::Orderbook => return self.on_orderbook(from),
+            // `!orderbook` is a public command (JMP-0001); the transport answers it with `on_orderbook`.
+            Command::Orderbook => return Vec::new(),
             Command::Hp2(c) => {
                 self.on_hp2(c);
                 return Vec::new();

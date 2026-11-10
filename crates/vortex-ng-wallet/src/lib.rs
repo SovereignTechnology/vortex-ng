@@ -20,6 +20,7 @@ use bdk_wallet::keys::bip39::{Language, Mnemonic};
 use bdk_wallet::{KeychainKind, LocalOutput, Wallet};
 use vortex_ng_core::offer::Pit;
 
+pub mod bonds;
 pub mod keys;
 pub mod sign;
 pub mod sync;
@@ -117,6 +118,7 @@ pub struct PitWallet {
     mixdepths: Vec<Wallet>,
     master: Xpriv,
     network: Network,
+    bonds: bonds::BondIndex,
 }
 
 impl std::fmt::Debug for PitWallet {
@@ -144,6 +146,7 @@ impl PitWallet {
             mixdepths,
             master: seed.master,
             network: seed.network,
+            bonds: bonds::BondIndex::new(&seed.master, seed.network)?,
         })
     }
 
@@ -215,6 +218,7 @@ impl PitWallet {
                 .apply_block(block, height)
                 .map_err(|e| WalletError::CannotConnect(e.to_string()))?;
         }
+        self.bonds.scan(block, height);
         Ok(())
     }
 

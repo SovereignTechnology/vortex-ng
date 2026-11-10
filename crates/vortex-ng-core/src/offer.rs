@@ -138,6 +138,11 @@ impl RelativeFee {
         u64::try_from(rounded).ok()
     }
 
+    /// Whether the fee is exactly zero.
+    pub fn is_zero(&self) -> bool {
+        self.mantissa == 0
+    }
+
     /// The text as the maker sent it.
     pub fn as_str(&self) -> &str {
         &self.text
@@ -151,6 +156,16 @@ pub enum CjFee {
     Relative(RelativeFee),
     /// Satoshis.
     Absolute(u64),
+}
+
+impl CjFee {
+    /// Whether the advertised coinjoin fee is zero (joinmarket-ng lets bondless makers in only at zero fee).
+    pub fn is_zero(&self) -> bool {
+        match self {
+            CjFee::Relative(r) => r.is_zero(),
+            CjFee::Absolute(a) => *a == 0,
+        }
+    }
 }
 
 /// An offer: `!<type> <oid> <minsize> <maxsize> <txfee> <cjfee>` (JMP-0001 "Phase 1", JMP-0010).
