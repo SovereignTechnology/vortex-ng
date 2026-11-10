@@ -15,6 +15,7 @@ pub mod offer;
 pub mod podle;
 pub mod protocol;
 pub mod script;
+pub mod sig;
 pub mod sigmsg;
 pub mod tx;
 
