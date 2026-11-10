@@ -26,6 +26,11 @@ pub struct Author {
     pub features: Vec<String>,
 }
 
+/// The indexable network tag value: `joinmarket-<network>` (relays index only single-letter tags).
+pub fn network_hashtag(network: &str) -> String {
+    format!("joinmarket-{network}")
+}
+
 fn tag(values: &[&str]) -> Result<Tag, ChannelError> {
     Tag::parse(values.iter().copied()).map_err(|e| ChannelError::Crypto(e.to_string()))
 }
@@ -38,6 +43,7 @@ fn common_tags(keys: &NickKeys, network: &str, relays: &[&str]) -> Result<Vec<Ta
         tag(&["n", keys.nick()])?,
         tag(&["jmpk", &keys.jmpk_hex()])?,
         tag(&["network", network])?,
+        tag(&["t", &network_hashtag(network)])?,
     ];
     for relay in relays {
         tags.push(tag(&["relay", relay])?);
@@ -132,7 +138,9 @@ pub fn verify_author(event: &Event, kind: u16, network: &str) -> Result<Author, 
     if event.kind != Kind::Custom(kind) {
         return Err(ChannelError::Invalid("kind"));
     }
-    if single(event, "network")? != network {
+    if single(event, "network")? != network
+        || !values(event, "t").contains(&network_hashtag(network).as_str())
+    {
         return Err(ChannelError::Invalid("network"));
     }
     let jmpk = single(event, "jmpk")?;
@@ -297,6 +305,7 @@ mod tests {
             tag(&["n", alice.nick()]).unwrap(),
             tag(&["jmpk", &alice.jmpk_hex()]).unwrap(),
             tag(&["network", "regtest"]).unwrap(),
+            tag(&["t", "joinmarket-regtest"]).unwrap(),
             tag(&["relay", RELAYS[0]]).unwrap(),
             Tag::expiration(Timestamp::from_secs(NOW + 60)),
         ];
@@ -340,6 +349,7 @@ mod tests {
             tag(&["n", k.nick()]).unwrap(),
             tag(&["jmpk", &k.jmpk_hex()]).unwrap(),
             tag(&["network", "regtest"]).unwrap(),
+            tag(&["t", "joinmarket-regtest"]).unwrap(),
             tag(&["relay", RELAYS[0]]).unwrap(),
             Tag::expiration(Timestamp::from_secs(NOW + 60)),
         ])

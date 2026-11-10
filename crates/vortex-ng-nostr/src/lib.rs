@@ -6,6 +6,7 @@
 //! The nick key is the Nostr key. Seal and wrap timestamps are the current time (not randomized), since
 //! these messages are read live by subscriptions filtered with `since`.
 
+pub mod client;
 pub mod event;
 pub mod keys;
 pub mod private;

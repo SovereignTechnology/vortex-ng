@@ -67,11 +67,13 @@ other channels.
 | `n` | the author's nick | 31402, 21402 |
 | `jmpk` | hex of the author's 33-byte compressed nick key | 31402, 21402 |
 | `network` | `mainnet`, `testnet4`, `signet` or `regtest` | 31402, 21402 |
+| `t` | `joinmarket-<network>` (an indexable copy of `network`; relays only index single-letter tags) | 31402, 21402 |
 | `relay` | a relay URL where the author reads its private messages; one tag per relay, at least one | 31402, 21402 |
 | `F` | feature identifiers joined with `+` (JMP-0003); MAY be empty | 31402 |
 | `expiration` | NIP-40 unix time | 31402, 1059 |
 
-Receivers MUST ignore events whose `network` differs from their own.
+Receivers MUST ignore events whose `network` differs from their own. Relays index only single-letter tags
+(NIP-01), so subscriptions filter on `t`, `f`, `p` and `d`, never on `network`, `jmpk` or `relay`.
 
 ### Offers (kind 31402)
 
@@ -83,7 +85,7 @@ A maker publishes its live offers for one pit as one addressable event:
   "content": "!sw0reloffer 0 50000 10000000 0 0.00025!sw0absoffer 1 50000 10000000 0 250",
   "tags": [
     ["d", "mainnet:sw0"],
-    ["t", "joinmarket-offer"],
+    ["t", "joinmarket-offer"], ["t", "joinmarket-mainnet"],
     ["f", "sw0reloffer"], ["f", "sw0absoffer"],
     ["n", "J5Ckon1LuuapPSBM"],
     ["jmpk", "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"],
@@ -111,7 +113,7 @@ A JMP-0001 public message is an ephemeral event whose `content` is the message's
 JMP-0001 `<from_nick>!PUBLIC` prefix:
 
 ```json
-{ "kind": 21402, "content": "!orderbook", "tags": [["n", "..."], ["jmpk", "..."], ["network", "mainnet"], ["relay", "wss://..."]] }
+{ "kind": 21402, "content": "!orderbook", "tags": [["n", "..."], ["jmpk", "..."], ["network", "mainnet"], ["t", "joinmarket-mainnet"], ["relay", "wss://..."]] }
 ```
 
 - `!orderbook`: a taker requests offers. A maker that sees it SHOULD answer with a private message to the
@@ -167,9 +169,9 @@ published to several relays arrives several times.
 
 ### Subscriptions
 
-- A maker subscribes to kind 1059 with `#p` = its key, and to kind 21402 with `#network`.
-- A taker subscribes to kind 31402 with `#network` (and `#f` for the pits it wants), and to kind 1059 with
-  `#p` = its key.
+- A maker subscribes to kind 1059 with `#p` = its key, and to kind 21402 with `#t` = `joinmarket-<network>`.
+- A taker subscribes to kind 31402 with `#t` = `joinmarket-<network>` (and `#f` for the pits it wants), and to
+  kind 1059 with `#p` = its key.
 - Subscriptions for private messages SHOULD use `since` = the time the nick was created.
 - If a relay requires NIP-42 authentication to deliver kind 1059 events, the client authenticates with the nick
   key on that nick's connection.

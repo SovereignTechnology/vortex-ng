@@ -39,6 +39,11 @@ nostr = { version = "=0.45.6", default-features = false, features = ["std", "os-
 # rust-bitcoin's minimal JSON-RPC client (HTTP over TCP, basic auth) for Core-compatible nodes.
 jsonrpc = "0.21.0"
 serde_json = { version = "1", features = ["raw_value"] }
+# rust-nostr's relay client. 0.45.6 (2026-11-03) is the only unyanked 0.45.x: 0.45.5/0.45.6 fix a
+# verification-cache bypass. The 7-day rule is met from 2026-11-10.
+nostr-sdk = { version = "=0.45.6" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+futures = "0.3"
 # Descriptor wallets (rust-bitcoin 0.32) with BIP39 seeds; synced from our own chain backend.
 bdk_wallet = { version = "3.2.0", default-features = false, features = ["std", "keys-bip39"] }
 
