@@ -19,10 +19,13 @@ the unchanged JMP-0001 private-message line.
 
 ## Motivation
 
-JoinMarket's directory servers are a small set of long-lived onion services that every peer depends on for
-discovery and, without a direct connection, for message relay. Nostr offers many independent relays, a
-standard signed-event format, standard end-to-end encryption (NIP-44) and a standard way to hide a message's
-sender from relays (NIP-59). Mapping JoinMarket's message channel onto Nostr gives peers a decentralized
+JoinMarket's message channel was built on IRC: peers met in a channel such as `#joinmarket-pit` on a few IRC
+servers. It now runs mostly on directory nodes, a small set of long-lived onion services (joinmarket-ng ships
+eight for mainnet) that every peer depends on for discovery and, without a direct connection, for message
+relay. Whoever runs a server or directory sees which nicks talk, when, and every unencrypted command, and taking
+a handful of them down stops discovery. Nostr offers many independent relays that anyone can run, a standard
+signed-event format, standard end-to-end encryption (NIP-44) and a standard way to hide a message's sender from
+relays (NIP-59). Mapping JoinMarket's message channel onto Nostr gives peers a decentralized
 transport without changing any CoinJoin semantics, so existing taker and maker logic is reused unchanged and
 only a new message channel is implemented. joinmarket-ng issue #118 asks for this research; its `nostr`
 branch publishes offers as kind 31402 events, which this specification keeps.
@@ -47,6 +50,30 @@ The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are to be interpreted a
 Kind numbers 21402 and 21403 are provisional until agreed with joinmarket-ng; 31402 is the kind joinmarket-ng's
 proof of concept uses.
 
+### From IRC to Nostr
+
+This channel keeps the IRC design: the same commands in the same order, with Nostr relays where the IRC servers
+were. Only the transport changes, and it hides more. The left column is reference JoinMarket's IRC channel
+(`jmdaemon/irc.py`, joinmarket-clientserver 0.9.11, whose default configuration still runs two IRC servers
+beside the onion directories).
+
+| On IRC | On this channel |
+|---|---|
+| A few IRC servers, reached over Tor | Any set of Nostr relays, reached over Tor (onion relays preferred) |
+| Channel `#joinmarket-pit` (`-test`, `-sig` suffixes per network) | Subscriptions filtered on `#t` = `joinmarket-<network>` |
+| Online = joined to the channel; the server stores nothing | Online = subscribed, plus an unexpired offer event; relays store only events that expire within an hour |
+| IRC nick = JoinMarket nick from an ephemeral key | Nostr `pubkey` = the same ephemeral nick key; nick derived exactly as JMP-0001 |
+| Maker announces its offers in the channel on joining and whenever they change | Maker publishes a kind 31402 offer event, expiring within 1 h and republished at least every 30 min |
+| Taker says `!orderbook` in the channel; makers answer by PRIVMSG with offers and `!tbond` | Same command as a kind 21402 event; answers come as gift-wrapped private messages |
+| Taker collects answers for `order_wait_time` | Same |
+| PRIVMSG: the server sees sender nick, recipient nick, time, and the plaintext commands (`!fill`, `!pubkey`, `!error`, `!push`, offers, `!hp2`); only `!auth`, `!ioauth`, `!tx`, `!sig` are NaCl-encrypted | NIP-59 gift wrap: the relay sees only the recipient key, the time and the size; the sender and every command are encrypted (NIP-44), and the NaCl layer is kept inside |
+| PRIVMSG split into 450-byte chunks ending ` ;` (more) and ` ~` (last) | Lines over 16,000 bytes split into at most 4 parts with a `part` tag |
+| `!hp2` sent privately to a random maker, which re-broadcasts it in the channel | `!hp2` published as kind 21402 from a throwaway nick on its own connection and Tor circuit |
+| Nick leaves (QUIT/PART, `on_nick_leave`): its offers are dropped | The offer event's `expiration` passes, or the maker deletes it (NIP-09); its offers are dropped |
+| `!cancel` in the channel | `!cancel` as kind 21402, plus a republished or deleted offer event |
+| `hostid` = the server's host and port (`onion-network` on onion directories) | `hostid` = `nostr-network` |
+| Several servers at once (the message channel collection) | Several relays at once |
+
 ### Identity
 
 A peer's nick key is a secp256k1 key pair, ephemeral as in JMP-0001. Its nick is derived from the 33-byte
@@ -57,8 +84,18 @@ Because the x-only encoding drops the key's parity, every event a nick authors t
 MUST carry the tag `["jmpk", "<hex of the 33-byte compressed key>"]`. A receiver MUST drop the event unless the
 x-only form of `jmpk` equals the event's `pubkey` and the nick re-derived from `jmpk` equals the event's `n` tag.
 
-A taker SHOULD use a fresh nick for each CoinJoin. A maker keeps its nick for the life of its process, as on
-other channels.
+Every key used on this channel is new and used for nothing else:
+
+- A taker MUST use a fresh nick for each CoinJoin, and a fresh throwaway nick for each `!hp2`.
+- A maker generates a new nick each time its process starts and keeps it for the life of the process, as on
+  other channels. It SHOULD NOT store the nick key across restarts. Its fidelity bond, not its nick, is its
+  long-lived identity.
+- Each gift wrap is signed by its own one-time random key (NIP-59), never reused.
+- A nick key MUST NOT be the user's own Nostr identity, MUST NOT be derived from wallet keys, and MUST NOT be
+  used anywhere else.
+- A nick key MUST NOT publish any event this specification does not define: no kind 0 profile, no kind 3
+  follows, no kind 10002 relay list, no NIP-05 name. Where a nick reads its private messages travels only in
+  `relay` tags.
 
 ### Common tags
 
@@ -68,7 +105,7 @@ other channels.
 | `jmpk` | hex of the author's 33-byte compressed nick key | 31402, 21402 |
 | `network` | `mainnet`, `testnet4`, `signet` or `regtest` | 31402, 21402 |
 | `t` | `joinmarket-<network>` (an indexable copy of `network`; relays only index single-letter tags) | 31402, 21402 |
-| `relay` | a relay URL where the author reads its private messages; one tag per relay, at least one | 31402, 21402 |
+| `relay` | a relay URL (at most 256 bytes) where the author reads its private messages; one tag per relay, one to eight | 31402, 21402 |
 | `F` | feature identifiers joined with `+` (JMP-0003); MAY be empty | 31402 |
 | `expiration` | NIP-40 unix time | 31402, 1059 |
 
@@ -183,10 +220,96 @@ published to several relays arrives several times.
 
 ### Network privacy
 
-- Implementations MUST be able to reach relays over Tor and SHOULD do so by default.
-- A relay connection MUST serve exactly one nick, and each nick's connections SHOULD use their own Tor circuit
-  (stream isolation). A throwaway nick (for `!hp2`) gets its own connection and circuit and closes them after
-  publishing.
+- Implementations MUST reach relays over Tor by default. A direct connection is an explicit opt-in.
+- Implementations SHOULD prefer a relay's onion address when it has one.
+- A relay connection MUST serve exactly one nick, and each nick's connections MUST use their own Tor circuits
+  (stream isolation).
+- A throwaway nick (for `!hp2`) gets its own connection and circuit and closes them after publishing.
+- A relay links everything sent over one connection. An implementation SHOULD therefore publish gift wraps over
+  a separate connection and circuit from the one on which that nick subscribes to its own private messages.
+  Otherwise the relay can tie each wrap to its sender, despite NIP-59.
+- An implementation MUST NOT perform NIP-42 AUTH on a connection it publishes gift wraps over. AUTH there would
+  name the sender. AUTH is used only on a nick's subscribe connection, with that nick's key, and only where the
+  relay requires it to deliver the nick's kind 1059 events.
+- NIP-11 documents are fetched over Tor on a circuit no nick uses.
+
+### Relay requirements
+
+A relay that carries this channel needs to hold very little, and only for a short time. These are the
+requirements a relay meets to conform to this specification; the conformance check below tests them.
+
+| Kind | Carries | The relay | Holds it |
+|---|---|---|---|
+| 31402 (addressable) | offers | keeps the latest per `pubkey` and `d`; serves `#t`, `#f`, `#d` filters | until its `expiration` (at most 1 h) |
+| 21402 (ephemeral) | `!orderbook`, `!hp2`, `!cancel` | forwards to matching live subscriptions only | never |
+| 1059 (gift wrap) | private messages | stores; serves `#p` with `since` | until its `expiration` (10 min) |
+| 5 (deletion) | a maker withdrawing an offer event by its `a` coordinate | applies it to the author's own events (NIP-09) | as long as the offer it deletes could live |
+| 22242 (AUTH) | only where the relay limits kind 1059 reads to the recipient | accepts AUTH from any key | never |
+
+Kinds 13 and 21403 are encrypted inside the wrap and never reach a relay. A conforming relay:
+
+- **Retention.** MUST keep kind 31402 and 1059 events until they expire, unless replaced or deleted. MUST NOT
+  serve an expired event, and SHOULD delete it at expiry: a store of old gift wraps is a record of who received
+  messages and when, and nothing in the protocol reads it. Nothing on this channel needs to be kept longer than
+  one hour. NIP-11 has no field that advertises retention, so clients test it.
+- **Ephemeral events.** MUST forward kind 21402 to matching live subscriptions and MUST NOT return it to a later
+  query.
+- **Size.** MUST accept an `EVENT` message of 40,000 bytes whose `content` is 39,000 characters, and SHOULD
+  advertise `max_message_length` of at least 65,536. The largest event on this channel is a gift wrap carrying a
+  16,000-byte part with eight 256-byte `relay` tags. Wrapped twice with NIP-44 v2 padding and base64, its `EVENT`
+  message is 38,775 bytes and its `content` 38,320 characters. Relays limited to 16 KiB cannot carry this
+  channel.
+- **Filters and tags.** MUST support `kinds`, `#t`, `#f`, `#d`, `#p`, `since` and `limit`. MUST allow at least
+  4 subscriptions per connection and 32 tags per event.
+- **Open writes.** MUST accept these kinds from any key, without payment, an allowlist, NIP-05 or AUTH: every key
+  here is ephemeral, and AUTH on publish would tie a wrap to its sender. MAY rate-limit. MAY require NIP-13
+  proof of work only at a difficulty this specification fixes; none is fixed yet.
+- **Gift-wrap reads.** MAY require NIP-42 AUTH by the `p`-tagged key to deliver kind 1059 events, and SHOULD NOT
+  deliver them to anyone else.
+- **Bursts and Tor.** SHOULD accept at least 60 events in 10 seconds from one connection. A taker's `!tx` to ten makers,
+  each split into up to four parts, is 40 events at once. SHOULD NOT limit connections or events per source address in a way
+  that blocks Tor exits, where many nicks share one address. SHOULD offer an onion service.
+- **Clock.** SHOULD accept `created_at` up to 60 seconds in the future and 600 seconds in the past.
+
+A conforming relay's NIP-11 document includes at least:
+
+```json
+{
+  "supported_nips": [1, 9, 11, 40, 42],
+  "limitation": {
+    "max_message_length": 65536,
+    "max_content_length": 65536,
+    "max_subscriptions": 4,
+    "max_event_tags": 32,
+    "auth_required": false,
+    "payment_required": false,
+    "restricted_writes": false
+  }
+}
+```
+
+(42 only where the relay uses AUTH. Larger limits are fine.)
+
+Clients SHOULD read a relay's NIP-11 document before using it. They SHOULD NOT send events with `expiration` to a
+relay whose `supported_nips` lacks 40 (NIP-40), and SHOULD skip relays whose limits are below the ones above.
+Clients SHOULD use at least three relays run by different operators.
+
+### Relay conformance check
+
+An operator or client checks a relay by doing the following from fresh keys over Tor, each step on its own
+connection:
+
+1. Fetch NIP-11 and compare it with the profile above.
+2. Publish a kind 31402 offer event with `expiration` 120 seconds ahead. Read it back by `#t`, `#f` and `#d`.
+   Publish a newer one with the same `d` and confirm it replaces the first. Delete it with kind 5 by `a`
+   coordinate and confirm it is gone. Confirm that another key's kind 5 does not delete it.
+3. Publish a kind 21402 event while a second connection is subscribed. Confirm the subscriber receives it, and
+   that a later query does not return it.
+4. Publish a worst-case kind 1059 wrap (the size above) with `expiration` 120 seconds ahead. Read it by `#p` and
+   `since`. Note whether reading requires AUTH, and whether another key can read it.
+5. After the expirations pass, confirm that neither event is served.
+6. Publish 60 events within 10 seconds on one connection and confirm all are accepted. Open several
+   connections from one address and confirm none is refused.
 
 ### Sessions and timeouts
 
@@ -200,6 +323,10 @@ event and its answers.
 Peers that do not implement this channel are unaffected: the channel is additive, uses its own `hostid`, and
 changes nothing in the CoinJoin protocol. A peer MAY run this channel beside onion channels with the same nick,
 as JoinMarket's message channel collection allows; a session stays on the channel it started on.
+
+This is how JoinMarket moved from IRC to onion directories: for a while both ran side by side, and reference
+JoinMarket's default configuration still runs both. The same path works here. During the transition, makers
+SHOULD run this channel beside their onion channel, so takers on either channel see the same liquidity.
 
 The offer event keeps the joinmarket-ng proof of concept's kind 31402 and its `t=joinmarket-offer` tag, but
 `content` is the JoinMarket offer line rather than an implementation's JSON model, `d` is per pit rather than
@@ -216,11 +343,20 @@ per offer, and the `c` and `v` tags are dropped (a fidelity-bond value is only v
   `!orderbook`, so a maker's authoritative answer and bond are private.
 - **Ephemeral public messages** match the directory model (seen by online peers) and leave nothing stored.
 - **The nick key as the Nostr key** makes every event attributable to a nick without new key material.
+- **Expiry instead of presence.** IRC and directories know when a nick leaves; Nostr relays don't. An offer event's
+  expiry, and the maker's republishing, do what leaving the channel did, so relays only ever hold events that
+  expire within an hour.
 
 ## Security Considerations
 
-- Relays learn which nick keys receive private messages and when, and can censor. Use several relays and Tor;
-  takers use fresh nicks.
+- Relays learn which nick keys receive private messages, when, and how large they are, and they can censor.
+  This is less than an IRC server or directory learns: those see sender, recipient and every plaintext command.
+  Use several relays run by different operators, use Tor, and use fresh nicks.
+- A relay can link a gift wrap to its sender through the connection that published it. Publishing wraps over a
+  separate connection and circuit, without AUTH (Network privacy), removes that link. Timing correlation by a
+  relay that sees both sides remains.
+- A relay that keeps expired gift wraps builds a long-term record of who received messages and when. Conforming
+  relays delete them, but clients cannot verify deletion, so the fresh nicks are what limit the damage.
 - A maker's 31402 event can differ from its private answer. Takers act only on private answers.
 - Replay across channels is prevented by the `hostid`; replay within a session by NaCl's nonces and event-id
   deduplication.
