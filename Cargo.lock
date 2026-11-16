@@ -5714,6 +5714,7 @@ dependencies = [
  "tokio",
  "vortex-ng-chain",
  "vortex-ng-core",
+ "vortex-ng-joinstr",
  "vortex-ng-maker",
  "vortex-ng-nostr",
  "vortex-ng-taker",

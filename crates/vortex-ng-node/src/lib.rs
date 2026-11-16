@@ -7,6 +7,8 @@
 //!
 //! Chain lookups are synchronous (`ChainLookup`); a production daemon runs them on a blocking thread.
 
+pub mod joinstr;
+
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -93,6 +95,8 @@ pub enum NodeError {
     Timeout,
     /// The maker could not start (its bond, its chain).
     Maker(String),
+    /// A joinstr pool round failed.
+    Pool(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -102,11 +106,18 @@ impl std::fmt::Display for NodeError {
             NodeError::Taker(e) => write!(f, "{e}"),
             NodeError::Timeout => f.write_str("deadline passed"),
             NodeError::Maker(e) => write!(f, "maker: {e}"),
+            NodeError::Pool(e) => write!(f, "pool: {e}"),
         }
     }
 }
 
 impl std::error::Error for NodeError {}
+
+impl From<vortex_ng_joinstr::session::SessionError> for NodeError {
+    fn from(e: vortex_ng_joinstr::session::SessionError) -> Self {
+        NodeError::Pool(e.to_string())
+    }
+}
 
 impl From<ChannelError> for NodeError {
     fn from(e: ChannelError) -> Self {

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the regtest CoinJoin test (crates/vortex-ng-node/tests/regtest.rs) against a pinned Bitcoin Core.
+# Run the regtest tests (crates/vortex-ng-node/tests/regtest.rs for JoinMarket rounds, regtest_joinstr.rs
+# for joinstr pools) against a pinned Bitcoin Core.
 #
 #   kata-run --net --cwd ~/Projects/vortex-ng -- bash tools/itest/run.sh
 #
@@ -40,4 +41,4 @@ for _ in $(seq 1 60); do [ -s "$cookie" ] && break; sleep 1; done
 
 cd "$repo"
 VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
-  cargo test --locked -p vortex-ng-node --test regtest -- --nocapture
+  cargo test --locked -p vortex-ng-node --test regtest --test regtest_joinstr -- --nocapture

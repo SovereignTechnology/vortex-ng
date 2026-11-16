@@ -25,6 +25,7 @@ publish = false
 
 [workspace.dependencies]
 vortex-ng-core = { path = "crates/vortex-ng-core" }
+vortex-ng-joinstr = { path = "crates/vortex-ng-joinstr" }
 vortex-ng-nostr = { path = "crates/vortex-ng-nostr" }
 vortex-ng-wallet = { path = "crates/vortex-ng-wallet" }
 vortex-ng-chain = { path = "crates/vortex-ng-chain" }

@@ -16,4 +16,5 @@ pub mod pool;
 pub mod pyjson;
 pub mod recovery;
 pub mod rules;
+pub mod session;
 pub mod tx;
