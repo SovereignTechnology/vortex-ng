@@ -1,0 +1,16 @@
+[package]
+name = "vortex-ng-joinstr"
+description = "The joinstr v1 coinjoin protocol with no I/O: pool announcements, credentials, pool messages and the wire rules every joinstr client is fixed to"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+serde_json = { workspace = true }

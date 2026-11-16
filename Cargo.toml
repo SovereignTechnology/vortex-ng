@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/vortex-ng-core",
+    "crates/vortex-ng-joinstr",
     "crates/vortex-ng-nostr",
     "crates/vortex-ng-wallet",
     "crates/vortex-ng-chain",

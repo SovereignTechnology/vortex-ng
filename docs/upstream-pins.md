@@ -13,6 +13,15 @@ references and test vectors, and record the reason below.
 | `joinmarket-ng/joinmarket-ng` branch `nostr` (offer PoC) | `f9a99b342e6011b594c7a6c152ea1cf05fd6bc0d` | 2025-12-06 | kind 31402 offer events |
 | `JoinMarket-Org/joinmarket-clientserver` release | `v0.9.12` | 2026-04-21 | the reference implementation's behaviour |
 
+## joinstr (ADR 0006)
+
+| what | revision | date | why it is pinned |
+|---|---|---|---|
+| `invincible-privacy/joinstr` main (`NIP.md`, Electrum plugin, CLI, web) | `d1290d6c3dedc64766aa123ec97ba638915db035` | 2026-11-02 | the protocol and its reference client |
+| `invincible-privacy/joinstr-difffuzz` main (`findings/RULES.md`, `driver/PROTOCOL.md`, corpus) | `e44b7647f823fbf5e40f18461f0ecf464720d782` | 2026-11-02 | the wire rules every client is fixed to, and the conformance harness |
+| `1440000bytes/rust-joinstr` master (mirror of github `rust-joinstr/joinstr`) | `b3a41fca9dafba52ed11c1c8f963d9ba75702355` | 2026-11-02 | a second reference in Rust; not linked |
+| `AdamISZ/autct-api` master | `e118c404c511b48da72436e043076048c8696b2f` | 2024-08-01 | the aut-ct daemon's RPC |
+
 ## Lightning implementations (external-funding behaviour checked 2026-11-09)
 
 | implementation | version | notes |
@@ -26,3 +35,4 @@ references and test vectors, and record the reason below.
 ## History
 
 - 2026-11-09: initial pins (M0).
+- 2026-11-15: joinstr pins (ADR 0006).

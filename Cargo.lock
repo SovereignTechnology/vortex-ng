@@ -5660,6 +5660,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-ng-joinstr"
+version = "0.0.1"
+dependencies = [
+ "bitcoin",
+ "serde_json",
+]
+
+[[package]]
 name = "vortex-ng-ln"
 version = "0.0.1"
 dependencies = [
