@@ -286,6 +286,10 @@ pub trait ChainLookup {
     fn tip_height(&self) -> Result<u32, String>;
     /// The timestamp of the block at `height`.
     fn block_time(&self, height: u32) -> Result<u32, String>;
+    /// Broadcast `tx`. Backends that only look things up keep the default, which refuses.
+    fn broadcast(&self, _tx: &Transaction) -> Result<(), String> {
+        Err("this chain backend cannot broadcast".into())
+    }
 }
 
 impl ChainLookup for CoreRpc {
@@ -297,6 +301,11 @@ impl ChainLookup for CoreRpc {
     }
     fn block_time(&self, height: u32) -> Result<u32, String> {
         CoreRpc::block_time(self, height).map_err(|e| e.to_string())
+    }
+    fn broadcast(&self, tx: &Transaction) -> Result<(), String> {
+        CoreRpc::broadcast(self, tx)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 

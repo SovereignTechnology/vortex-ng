@@ -137,7 +137,9 @@ fn new_taker() -> (Taker, FakeChain) {
 fn private(out: &Outgoing) -> (&str, &str) {
     match out {
         Outgoing::Private { command, body, .. } => (command, body),
-        Outgoing::PublicEphemeral(_) => panic!("expected a private message"),
+        Outgoing::PublicEphemeral(_) | Outgoing::Broadcast(_) => {
+            panic!("expected a private message")
+        }
     }
 }
 
@@ -274,6 +276,55 @@ fn full_session_signs_a_valid_coinjoin() {
     ];
     verify_sig(&secp, Pit::Sw0, &payload, &tx, 0, &prevouts).unwrap();
     assert!(maker.push_allowed("J5taker", &tx));
+
+    // !push: only the transaction we signed, only from the taker we signed it for, only once.
+    let push = |tx: &Transaction| Command::Push(STANDARD.encode(serialize(tx)));
+    let mut other = tx.clone();
+    other.output[0].value = Amount::from_sat(1);
+    assert!(
+        maker
+            .handle("J5taker", push(&other), &chain, NOW)
+            .is_empty()
+    );
+    assert!(maker.handle("J5other", push(&tx), &chain, NOW).is_empty());
+    assert!(
+        maker
+            .handle("J5taker", Command::Push("not base64!".into()), &chain, NOW)
+            .is_empty()
+    );
+    assert_eq!(
+        maker.handle("J5taker", push(&tx), &chain, NOW),
+        vec![Outgoing::Broadcast(tx.clone())]
+    );
+    assert!(maker.handle("J5taker", push(&tx), &chain, NOW).is_empty());
+}
+
+#[test]
+fn sessions_expire_and_never_block_new_takers() {
+    let mut maker = funded_maker();
+    let (_, chain) = new_taker();
+    let fill = |i: usize| Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: NaclKeypair::generate().public_hex(),
+        commitment: [i as u8 + 1; 32],
+    };
+    // The table fills with takers that never continue.
+    for i in 0..MAX_SESSIONS {
+        let out = maker.handle(&format!("J5quiet{i}"), fill(i), &chain, NOW);
+        assert_eq!(private(&out[0]).0, "pubkey", "fill {i}");
+    }
+    let out = maker.handle("J5late", fill(200), &chain, NOW + SESSION_TTL);
+    assert_eq!(
+        private(&out[0]).0,
+        "error",
+        "the table is full while they are in time"
+    );
+    // Once they are out of time they are forgotten, and a new taker is served.
+    let out = maker.handle("J5late", fill(201), &chain, NOW + SESSION_TTL + 1);
+    assert_eq!(private(&out[0]).0, "pubkey");
+    assert_eq!(maker.sessions.len(), 1);
+    assert_eq!(maker.started.len(), 1);
 }
 
 #[test]

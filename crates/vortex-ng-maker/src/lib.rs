@@ -108,6 +108,8 @@ pub struct Maker {
     config: MakerConfig,
     wallet: PitWallet,
     sessions: HashMap<String, Stage>,
+    /// When each session's `!fill` arrived.
+    started: HashMap<String, u64>,
     used_commitments: HashSet<[u8; 32]>,
     bond: Option<BondTemplate>,
 }
@@ -123,6 +125,10 @@ impl std::fmt::Debug for Maker {
 
 /// Most sessions a maker keeps open at once; further fills are refused until some end.
 pub const MAX_SESSIONS: usize = 64;
+/// Seconds a session may take from `!fill` to the end, signed rounds waiting for a `!push` included
+/// (joinmarket-ng's `session_timeout_sec` default). Older sessions are forgotten, so quiet takers and
+/// finished rounds cannot fill the table.
+pub const SESSION_TTL: u64 = 300;
 
 /// The fixed error text a refused taker sees.
 pub const ERROR_TEXT: &str = "coinjoin refused";
@@ -141,6 +147,7 @@ impl Maker {
             config,
             wallet,
             sessions: HashMap::new(),
+            started: HashMap::new(),
             used_commitments: HashSet::new(),
             bond: None,
         })
@@ -247,9 +254,18 @@ impl Maker {
         chain: &impl Chain,
         now: u64,
     ) -> Vec<Outgoing> {
+        // Forget sessions past their time before anything else, so they never count against the cap.
+        let (sessions, started) = (&mut self.sessions, &mut self.started);
+        sessions.retain(|nick, _| {
+            started
+                .get(nick)
+                .is_some_and(|at| now.saturating_sub(*at) <= SESSION_TTL)
+        });
+        started.retain(|nick, _| sessions.contains_key(nick));
         let result = match command {
             // `!orderbook` is a public command (JMP-0001); the transport answers it with `on_orderbook`.
             Command::Orderbook => return Vec::new(),
+            Command::Push(tx) => return self.on_push(from, &tx),
             Command::Hp2(c) => {
                 self.on_hp2(c);
                 return Vec::new();
@@ -268,8 +284,12 @@ impl Maker {
             }
             _ => Err(MakerError::State("unexpected command")),
         };
+        if self.sessions.contains_key(from) {
+            self.started.entry(from.to_string()).or_insert(now);
+        }
         result.unwrap_or_else(|_| {
             self.sessions.remove(from);
+            self.started.remove(from);
             vec![Outgoing::Private {
                 to: from.to_string(),
                 command: "error".into(),
@@ -555,6 +575,24 @@ impl Maker {
         self.sessions
             .insert(from.to_string(), Stage::Signed(tx.compute_txid()));
         Ok(out)
+    }
+
+    /// `!push <base64 tx>` from `from`: broadcast it if, and only if, it is the transaction we signed for
+    /// that taker in a session still open (joinmarket-ng's rule; the reference broadcasts anything).
+    /// Anything else is ignored without an answer, as on other implementations.
+    fn on_push(&mut self, from: &str, tx_base64: &str) -> Vec<Outgoing> {
+        let Ok(bytes) = STANDARD.decode(tx_base64) else {
+            return Vec::new();
+        };
+        let Ok(tx) = deserialize::<Transaction>(&bytes) else {
+            return Vec::new();
+        };
+        if !self.push_allowed(from, &tx) {
+            return Vec::new();
+        }
+        self.sessions.remove(from);
+        self.started.remove(from);
+        vec![Outgoing::Broadcast(tx)]
     }
 
     /// Whether `tx` is the transaction we signed for `from` (a `!push` request may be honoured).

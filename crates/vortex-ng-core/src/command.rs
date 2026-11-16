@@ -169,6 +169,9 @@ pub enum Outgoing {
     },
     /// A public message from a throwaway nick (the `!hp2` commitment broadcast).
     PublicEphemeral(String),
+    /// A transaction to hand to the chain backend: a taker asked us with `!push` to broadcast the
+    /// CoinJoin we signed for it.
+    Broadcast(bitcoin::Transaction),
 }
 
 /// The decrypted `!ioauth` plaintext: `<utxo,utxo,…> <auth_pubkey> <cj_address> <change_address>

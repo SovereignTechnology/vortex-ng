@@ -182,12 +182,18 @@ async fn deliver(
     client: &NickClient,
     network: &str,
     peers: &HashMap<String, Peer>,
+    chain: &impl ChainLookup,
     outgoing: Vec<Outgoing>,
 ) -> Result<(), NodeError> {
     for out in outgoing {
         match out {
             Outgoing::Private { to, command, body } => {
                 send(client, peers, &to, &command, &body).await?
+            }
+            // A taker asked us to broadcast the round we signed for it (`!push`). A failure is its
+            // problem to notice (it watches for the transaction and has other makers to ask).
+            Outgoing::Broadcast(tx) => {
+                let _ = blocking(|| chain.broadcast(&tx));
             }
             Outgoing::PublicEphemeral(content) => {
                 // A fresh nick on its own connection, closed afterwards (the draft's !hp2 rule).
@@ -335,7 +341,7 @@ pub async fn run_maker(
             Incoming::Offers(..) => Vec::new(),
         };
         // A failed send to one taker must not stop the maker.
-        let _ = deliver(client, network, &peers, outgoing).await;
+        let _ = deliver(client, network, &peers, chain, outgoing).await;
     }
     Ok(())
 }
@@ -412,7 +418,7 @@ pub async fn run_taker(
     let chosen = select_makers(&offers, &bonds, cfg);
     let in_round: HashSet<String> = chosen.iter().map(|(nick, _)| nick.clone()).collect();
     let outgoing = taker.start(chosen).map_err(NodeError::Taker)?;
-    deliver(client, network, &peers, outgoing).await?;
+    deliver(client, network, &peers, chain, outgoing).await?;
     while let Some(left) = until.checked_duration_since(Instant::now()) {
         let Some(Incoming::Private(msg, reply_relays)) = client.next(left).await else {
             continue;
@@ -426,7 +432,7 @@ pub async fn run_taker(
         for cmd in commands(&msg) {
             let (outgoing, progress) =
                 blocking(|| taker.handle(&msg.from, cmd, chain)).map_err(NodeError::Taker)?;
-            deliver(client, network, &peers, outgoing).await?;
+            deliver(client, network, &peers, chain, outgoing).await?;
             if progress == Progress::MakersSigned {
                 return taker.finish(wallet).map_err(NodeError::Taker);
             }

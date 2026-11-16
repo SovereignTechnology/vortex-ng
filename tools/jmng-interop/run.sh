@@ -13,7 +13,8 @@
 #   A. joinmarket-ng's two test makers (`jm-maker start`, Core's wallet backend, the relay as their only
 #      message channel) and a vortex-ng taker, which does a sw0 round with them and checks it on the node;
 #   B. two vortex-ng makers and joinmarket-ng's taker (jmng_taker.py, through joinmarket-ng's own API),
-#      which does a sw0 round with them; vortex-ng then checks the transaction and its makers' wallets.
+#      which does a sw0 round with them and asks them to broadcast it (`!push`, never itself); vortex-ng
+#      then checks the transaction and its makers' wallets.
 set -euo pipefail
 
 VORTEX_NG_REPO=https://github.com/SovereignTechnology/vortex-ng.git
@@ -152,6 +153,9 @@ if [ "$rc_b" -eq 0 ]; then
     "$work/taker/.joinmarket-ng" >"$logs/jmng-taker.log" 2>&1 || rc_b=$?
   txid=$(sed -n 's/^JMNG_TXID=//p' "$logs/jmng-taker.log" | tail -1)
   if [ "$rc_b" -eq 0 ] && [ -n "$txid" ] && [ "$txid" != None ]; then
+    # The makers broadcast it: it must be in the node's mempool before a block can take it.
+    for _ in $(seq 1 60); do cli getmempoolentry "$txid" >/dev/null 2>&1 && break; sleep 1; done
+    cli getmempoolentry "$txid" >/dev/null 2>&1 || echo "WARNING: $txid is not in the mempool"
     cli generatetoaddress 1 "$funder" >/dev/null
     printf '%s' "$txid" >"$work/b/jmng.txid.tmp" && mv "$work/b/jmng.txid.tmp" "$work/b/jmng.txid"
     wait "$vortex_pid" || rc_b=$?

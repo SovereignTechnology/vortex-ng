@@ -6,7 +6,8 @@ Run by run.sh inside the VM, with joinmarket-ng installed:
 
 It uses joinmarket-ng's own regtest test wallet for the taker, Bitcoin Core's wallet backend, and the
 relay as the only message channel. Like joinmarket-ng's own end-to-end tests it lets makers without a
-fidelity bond charge a fee. It broadcasts the transaction itself. Prints `JMNG_TXID=<txid>`.
+fidelity bond charge a fee. It never broadcasts the transaction itself (`not-self`): it sends `!push` to
+the makers, so the round reaches the node only if one of them broadcasts it. Prints `JMNG_TXID=<txid>`.
 """
 
 import asyncio
@@ -51,7 +52,7 @@ async def main() -> int:
         order_wait_time=20.0,
         bondless_makers_allowance_require_zero_fee=False,
         max_cj_fee=MaxCjFee(abs_fee=10_000, rel_fee="0.01"),
-        tx_broadcast=BroadcastPolicy.SELF,
+        tx_broadcast=BroadcastPolicy.NOT_SELF,
         data_dir=data_dir,
     )
     taker = Taker(wallet, backend, config)
