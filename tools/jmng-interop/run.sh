@@ -140,6 +140,11 @@ if [ "$rc_a" -ne 0 ]; then
   for n in 1 2; do show "$logs/maker$n.log" 60; done
 else
   echo "txid $(cat "$work/a/taker.txid") at height $(cli getblockcount)"
+  # joinmarket-ng's makers publish the taker's PoDLE commitment (!hp2) from a throwaway nick after !ioauth.
+  for n in 1 2; do
+    echo "maker$n !hp2: $(grep -c 'CoinJoin message sent: command=!hp2' "$logs/maker$n.log") sent," \
+      "$(grep -c 'Could not connect to any directory for ephemeral hp2 broadcast' "$logs/maker$n.log") could not connect"
+  done
 fi
 for p in "${maker_pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
 
