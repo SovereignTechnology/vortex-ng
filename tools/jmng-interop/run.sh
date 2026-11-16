@@ -8,10 +8,12 @@
 #   VORTEX_NG_COMMIT=<sha> kata-run --net --cwd <joinmarket-ng checkout> -- bash .interop/run.sh
 #
 # What happens: Bitcoin Core 32.1 (tarball checked against the pinned SHA256) on regtest with a wallet;
-# joinmarket-ng's two test makers are funded at the addresses its own scripts/fund-test-wallets.sh uses and
-# started as `jm-maker start` on Core's wallet backend, with the Nostr relay as their only message channel;
-# vortex-ng's test crates/vortex-ng-node/tests/jmng_interop.rs runs the relay and a vortex-ng taker, which
-# does a sw0 round with those makers and checks the transaction on the node.
+# joinmarket-ng's test wallets are funded at the addresses its own scripts/fund-test-wallets.sh uses. Then two
+# rounds, each on a relay run by vortex-ng's test crates/vortex-ng-node/tests/jmng_interop.rs:
+#   A. joinmarket-ng's two test makers (`jm-maker start`, Core's wallet backend, the relay as their only
+#      message channel) and a vortex-ng taker, which does a sw0 round with them and checks it on the node;
+#   B. two vortex-ng makers and joinmarket-ng's taker (jmng_taker.py, through joinmarket-ng's own API),
+#      which does a sw0 round with them; vortex-ng then checks the transaction and its makers' wallets.
 set -euo pipefail
 
 VORTEX_NG_REPO=https://github.com/SovereignTechnology/vortex-ng.git
@@ -28,16 +30,22 @@ MAKER_ADDRESSES=(
   bcrt1q6x4xurtda3szpc54knp6qpuh0jxgcjajmnmy89
   bcrt1qfuzpvnf2lgg8z54p3xcjp8xf8x5ydla63tgud2
 )
+TAKER_ADDRESS=bcrt1q84l5vscg3pvjn6se8jp4ruymtyh393ed5v2d9e
 
 jmng=$(pwd)
+here=$(cd "$(dirname "$0")" && pwd)
 [ -d "$jmng/jmcore/src/jmcore/nostr" ] || { echo "run from a joinmarket-ng checkout with jmcore.nostr" >&2; exit 97; }
 work=$(mktemp -d)
 logs=$work/logs
-mkdir -p "$logs" "$work/interop" "$work/core"
+mkdir -p "$logs" "$work/a" "$work/b" "$work/core"
 pids=()
+bin=
 cleanup() {
+  # Stop the node before its directory goes: a bitcoind that is still flushing keeps writing into it.
+  if [ -n "$bin" ]; then "$bin/bitcoin-cli" -regtest -datadir="$work/core" -rpcport="$PORT" stop >/dev/null 2>&1 || true; fi
   for p in "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
-  rm -rf "$work"
+  wait 2>/dev/null || true
+  rm -rf "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
 show() { echo "-- $1 (last $2 lines)"; tail -n "$2" "$1" 2>/dev/null | cut -c1-400 || true; }
@@ -81,51 +89,85 @@ cli getblockcount >/dev/null || { echo "bitcoind did not start" >&2; exit 21; }
 cli createwallet funder >/dev/null
 funder=$(cli -rpcwallet=funder getnewaddress "" bech32)
 cli generatetoaddress 110 "$funder" >/dev/null
-for address in "${MAKER_ADDRESSES[@]}"; do
+for address in "${MAKER_ADDRESSES[@]}" "$TAKER_ADDRESS"; do
   for _ in 1 2 3; do cli -rpcwallet=funder sendtoaddress "$address" 1.0 >/dev/null; done
 done
 cli generatetoaddress 6 "$funder" >/dev/null
-echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcount); makers funded"
+echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcount); joinmarket-ng wallets funded"
 
-# vortex-ng: the relay and the taker. It waits for the makers' offers.
-(cd "$work/vortex-ng" && VORTEX_NG_INTEROP_DIR="$work/interop" VORTEX_NG_INTEROP_MAKERS=${#MAKER_ADDRESSES[@]} \
-  VORTEX_NG_REGTEST_RPC="http://127.0.0.1:$PORT" VORTEX_NG_REGTEST_COOKIE="$cookie" \
-  cargo test --locked -p vortex-ng-node --test jmng_interop -- --nocapture >"$logs/vortex.log" 2>&1) &
-vortex=$!
-pids+=("$vortex")
-for _ in $(seq 1 300); do [ -s "$work/interop/relay.url" ] && break; kill -0 "$vortex" 2>/dev/null || break; sleep 1; done
-[ -s "$work/interop/relay.url" ] || { echo "vortex-ng did not start its relay"; show "$logs/vortex.log" 40; exit 22; }
-relay=$(cat "$work/interop/relay.url")
-echo "relay $relay"
+# The vortex-ng side of a round: the relay plus the taker or the makers. Prints the relay URL once it is up.
+vortex_pid=
+start_vortex() {  # $1 = role, $2 = its directory
+  (cd "$work/vortex-ng" && VORTEX_NG_INTEROP_ROLE="$1" VORTEX_NG_INTEROP_DIR="$2" \
+    VORTEX_NG_INTEROP_MAKERS=${#MAKER_ADDRESSES[@]} VORTEX_NG_REGTEST_RPC="http://127.0.0.1:$PORT" \
+    VORTEX_NG_REGTEST_COOKIE="$cookie" \
+    cargo test --locked -p vortex-ng-node --test jmng_interop -- --nocapture >"$logs/vortex-$1.log" 2>&1) &
+  vortex_pid=$!
+  pids+=("$vortex_pid")
+  for _ in $(seq 1 300); do [ -s "$2/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
+  [ -s "$2/relay.url" ] || { echo "vortex-ng ($1) did not start its relay"; show "$logs/vortex-$1.log" 40; return 1; }
+}
+report() { grep -E 'relay at|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
 
-# joinmarket-ng's makers: Core wallet backend, the relay as their only message channel.
-i=0
-for mnemonic in "${MAKER_MNEMONICS[@]}"; do
-  i=$((i + 1))
-  home=$work/maker$i
-  mkdir -p "$home"
-  HOME="$home" JOINMARKET_DATA_DIR="$home/.joinmarket-ng" MNEMONIC="$mnemonic" \
-    NETWORK_CONFIG__NETWORK=regtest NETWORK_CONFIG__BITCOIN_NETWORK=regtest \
-    NETWORK_CONFIG__ALLOW_CLEARNET_CONNECTIONS=true DIRECTORY_SERVERS="nostr:$relay" \
-    BITCOIN__BACKEND_TYPE=descriptor_wallet BITCOIN__RPC_URL="http://127.0.0.1:$PORT" \
-    BITCOIN__RPC_COOKIE_FILE="$cookie" TOR__CONTROL_ENABLED=false LOGGING__LEVEL=DEBUG \
-    MAKER__MIN_SIZE=10000 MAKER__TX_FEE_CONTRIBUTION=500 MAKER__CJ_FEE_RELATIVE=0.001 \
-    jm-maker start >"$logs/maker$i.log" 2>&1 &
-  pids+=($!)
-done
-
-rc=0
-wait "$vortex" || rc=$?
-echo "== vortex-ng taker (exit $rc)"
-grep -E 'relay at|maker .* announced|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$logs/vortex.log" | cut -c1-400 || true
-if [ "$rc" -ne 0 ]; then
-  show "$logs/vortex.log" 40
-  for n in $(seq 1 "$i"); do show "$logs/maker$n.log" 60; done
-else
-  echo "txid $(cat "$work/interop/taker.txid") at height $(cli getblockcount)"
-  for n in $(seq 1 "$i"); do
-    echo "-- maker$n: $(grep -c -i 'nostr' "$logs/maker$n.log") log lines mention nostr"
-    grep -E -i 'fill|ioauth|!tx|signed|coinjoin' "$logs/maker$n.log" | tail -6 | cut -c1-300 || true
+# ---- A: joinmarket-ng makers, vortex-ng taker ------------------------------------------------------------
+rc_a=0
+start_vortex taker "$work/a" || rc_a=22
+maker_pids=()
+if [ "$rc_a" -eq 0 ]; then
+  relay=$(cat "$work/a/relay.url")
+  i=0
+  for mnemonic in "${MAKER_MNEMONICS[@]}"; do
+    i=$((i + 1))
+    home=$work/maker$i
+    mkdir -p "$home"
+    HOME="$home" JOINMARKET_DATA_DIR="$home/.joinmarket-ng" MNEMONIC="$mnemonic" \
+      NETWORK_CONFIG__NETWORK=regtest NETWORK_CONFIG__BITCOIN_NETWORK=regtest \
+      NETWORK_CONFIG__ALLOW_CLEARNET_CONNECTIONS=true DIRECTORY_SERVERS="nostr:$relay" \
+      BITCOIN__BACKEND_TYPE=descriptor_wallet BITCOIN__RPC_URL="http://127.0.0.1:$PORT" \
+      BITCOIN__RPC_COOKIE_FILE="$cookie" TOR__CONTROL_ENABLED=false LOGGING__LEVEL=DEBUG \
+      MAKER__MIN_SIZE=10000 MAKER__TX_FEE_CONTRIBUTION=500 MAKER__CJ_FEE_RELATIVE=0.001 \
+      jm-maker start >"$logs/maker$i.log" 2>&1 &
+    maker_pids+=($!)
+    pids+=($!)
   done
+  wait "$vortex_pid" || rc_a=$?
 fi
-exit "$rc"
+echo "== A: vortex-ng taker with joinmarket-ng makers (exit $rc_a)"
+report "$logs/vortex-taker.log"
+if [ "$rc_a" -ne 0 ]; then
+  show "$logs/vortex-taker.log" 40
+  for n in 1 2; do show "$logs/maker$n.log" 60; done
+else
+  echo "txid $(cat "$work/a/taker.txid") at height $(cli getblockcount)"
+fi
+for p in "${maker_pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+
+# ---- B: vortex-ng makers, joinmarket-ng taker ------------------------------------------------------------
+rc_b=0
+start_vortex makers "$work/b" || rc_b=22
+if [ "$rc_b" -eq 0 ]; then
+  relay=$(cat "$work/b/relay.url")
+  sleep 5  # the makers publish their offers right after the relay URL is written
+  HOME="$work/taker" python3 "$here/jmng_taker.py" "$relay" "http://127.0.0.1:$PORT" "$cookie" \
+    "$work/taker/.joinmarket-ng" >"$logs/jmng-taker.log" 2>&1 || rc_b=$?
+  txid=$(sed -n 's/^JMNG_TXID=//p' "$logs/jmng-taker.log" | tail -1)
+  if [ "$rc_b" -eq 0 ] && [ -n "$txid" ] && [ "$txid" != None ]; then
+    cli generatetoaddress 1 "$funder" >/dev/null
+    printf '%s' "$txid" >"$work/b/jmng.txid.tmp" && mv "$work/b/jmng.txid.tmp" "$work/b/jmng.txid"
+    wait "$vortex_pid" || rc_b=$?
+  else
+    [ "$rc_b" -ne 0 ] || rc_b=23
+    kill "$vortex_pid" 2>/dev/null || true
+  fi
+fi
+echo "== B: joinmarket-ng taker with vortex-ng makers (exit $rc_b)"
+report "$logs/vortex-makers.log"
+if [ "$rc_b" -ne 0 ]; then
+  grep -v -E 'utxo_metadata|wallet\.sync|history_reconstruction' "$logs/jmng-taker.log" | tail -n 70 | cut -c1-400 || true
+  show "$logs/vortex-makers.log" 30
+else
+  echo "txid $txid at height $(cli getblockcount)"
+fi
+
+[ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] && { echo "== both directions passed"; exit 0; }
+exit 1
