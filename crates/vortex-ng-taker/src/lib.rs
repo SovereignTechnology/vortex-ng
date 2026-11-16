@@ -331,6 +331,8 @@ struct MakerSlot {
     offer: Offer,
     cjfee: u64,
     session: Option<Session>,
+    /// The maker's NaCl public key from `!pubkey`, lowercase hex: what its `!ioauth` signature covers.
+    maker_nacl: String,
     io: Option<MakerIo>,
 }
 
@@ -426,6 +428,7 @@ impl Taker {
                     offer,
                     cjfee,
                     session: None,
+                    maker_nacl: String::new(),
                     io: None,
                 },
             );
@@ -496,6 +499,7 @@ impl Taker {
             .encrypt(&revelation)
             .map_err(|e| err(from, e.to_string()))?;
         slot.session = Some(session);
+        slot.maker_nacl = maker_nacl.to_ascii_lowercase();
         Ok((
             vec![Outgoing::Private {
                 to: from.to_string(),
@@ -527,8 +531,7 @@ impl Taker {
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
         let secp = Secp256k1::new();
         let pit = self.cfg.pit;
-        let our_nacl = self.nacl.public_hex();
-        let (plaintext, already) = {
+        let (plaintext, already, maker_nacl) = {
             let slot = self.makers.get(from).ok_or_else(|| err(from, "unknown"))?;
             let session = slot
                 .session
@@ -539,6 +542,7 @@ impl Taker {
                     .decrypt(ciphertext)
                     .map_err(|e| err(from, e.to_string()))?,
                 slot.io.is_some(),
+                slot.maker_nacl.clone(),
             )
         };
         if already {
@@ -548,9 +552,11 @@ impl Taker {
         if io.utxos.len() > self.cfg.max_maker_utxos {
             return Err(err(from, "too many inputs"));
         }
+        // The maker's auth key must have signed the maker's own NaCl key, as hex (reference JoinMarket
+        // `auth_counterparty`): the key we encrypt to belongs to whoever controls the declared UTXO.
         if !sigmsg::verify(
             &secp,
-            our_nacl.as_bytes(),
+            maker_nacl.as_bytes(),
             &io.btc_signature,
             &io.auth_pubkey,
         ) {

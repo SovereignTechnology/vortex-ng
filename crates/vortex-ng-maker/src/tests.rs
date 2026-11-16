@@ -174,10 +174,17 @@ fn full_session_signs_a_valid_coinjoin() {
         Outgoing::PublicEphemeral(format!("!hp2 {}", podle.commitment().to_lower_hex_string()))
     );
     let ioauth = Ioauth::parse(&session.decrypt(ciphertext).unwrap()).unwrap();
-    // The taker's checks: the auth key signed our NaCl key and controls a declared UTXO.
-    assert!(sigmsg::verify(
+    // The taker's checks: the auth key signed the maker's own NaCl key (not the taker's) and controls
+    // a declared UTXO.
+    assert!(!sigmsg::verify(
         &secp,
         taker.nacl.public_hex().as_bytes(),
+        &ioauth.btc_signature,
+        &ioauth.auth_pubkey
+    ));
+    assert!(sigmsg::verify(
+        &secp,
+        maker_nacl.as_bytes(),
         &ioauth.btc_signature,
         &ioauth.auth_pubkey
     ));

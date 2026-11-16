@@ -83,7 +83,8 @@ struct Filled {
     offer: Offer,
     amount: u64,
     commitment: [u8; 32],
-    taker_nacl: String,
+    /// Our NaCl public key for this session, hex, as sent in `!pubkey`.
+    our_nacl: String,
     session: Session,
 }
 
@@ -323,7 +324,7 @@ impl Maker {
                 offer,
                 amount,
                 commitment,
-                taker_nacl: taker_nacl.to_string(),
+                our_nacl: ours.public_hex(),
                 session,
             }),
         );
@@ -396,7 +397,10 @@ impl Maker {
             Some(c) => format!("{auth_public}{}", c.serialize().to_lower_hex_string()),
             None => auth_public,
         };
-        let btc_sig = sigmsg::sign(&secp, filled.taker_nacl.as_bytes(), keys.auth());
+        // The maker signs its OWN NaCl key (the hex it sent in `!pubkey`) with the key of one of the
+        // UTXOs it declares, tying its coins to its encryption identity (reference JoinMarket
+        // `on_auth_received`, joinmarket-ng `handle_auth`).
+        let btc_sig = sigmsg::sign(&secp, filled.our_nacl.as_bytes(), keys.auth());
         let utxo_list: Vec<String> = selected.iter().map(|u| u.outpoint.to_string()).collect();
         let plaintext = format!("{} {auth} {cj} {change} {btc_sig}", utxo_list.join(","));
         let ciphertext = filled
