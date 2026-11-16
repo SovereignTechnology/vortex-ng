@@ -10,7 +10,7 @@ use bitcoin::{Network, OutPoint, PrivateKey, ScriptBuf, Transaction};
 use serde_json::{Value, json};
 use vortex_ng_joinstr::message::{PoolMessage, admit_join};
 use vortex_ng_joinstr::pool::{Pool, Transport, accept_credentials, public_key_hex};
-use vortex_ng_joinstr::{pyjson, rules, tx};
+use vortex_ng_joinstr::{pyjson, recovery, rules, tx};
 
 /// The harness runs every implementation on regtest.
 const NET: Network = Network::Regtest;
@@ -313,6 +313,52 @@ fn recovery_amount(args: &Value) -> Reply {
     Ok(json!({"output_sats": sats}))
 }
 
+/// The ring the harness passes: compressed public keys, hex, in any order.
+fn ring(args: &Value) -> Result<Vec<bitcoin::secp256k1::PublicKey>, Reject> {
+    strings(&args["ring"])
+        .into_iter()
+        .map(|k| bitcoin::secp256k1::PublicKey::from_str(k).map_err(|e| rej("ring", e)))
+        .collect()
+}
+
+fn build_reregister(args: &Value) -> Reply {
+    let key = secret(text(args, "private_key"))?;
+    let msg = recovery::build_reregister(
+        text(args, "address"),
+        text(args, "pool_id"),
+        &ring(args)?,
+        &key,
+    )
+    .map_err(|e| rej("reregister", e))?;
+    Ok(json!({"plaintext": msg.to_plaintext()}))
+}
+
+fn accept_reregister(args: &Value) -> Reply {
+    let accepted = recovery::accept_reregister(
+        text(args, "plaintext"),
+        text(args, "pool_id"),
+        &ring(args)?,
+        NET,
+        &[],
+    )
+    .ok_or_else(|| rej("reregister", ""))?;
+    Ok(json!({"address": accepted.sent, "key_image": accepted.key_image}))
+}
+
+fn build_resign(args: &Value) -> Reply {
+    let msg = PoolMessage::Resign {
+        psbt: text(args, "psbt").to_string(),
+    };
+    Ok(json!({"plaintext": msg.to_plaintext()}))
+}
+
+fn accept_resign(args: &Value) -> Reply {
+    match PoolMessage::parse(text(args, "plaintext")) {
+        Some(PoolMessage::Resign { psbt }) => Ok(json!({"psbt": psbt})),
+        _ => Err(rej("not_resign", "")),
+    }
+}
+
 fn nip04_encrypt(args: &Value) -> Reply {
     let sk =
         nostr::key::SecretKey::from_hex(text(args, "private_key")).map_err(|e| rej("key", e))?;
@@ -348,6 +394,10 @@ const OPS: &[(&str, Op)] = &[
     ("registration", registration),
     ("combine", combine),
     ("recovery_amount", recovery_amount),
+    ("build_reregister", build_reregister),
+    ("accept_reregister", accept_reregister),
+    ("build_resign", build_resign),
+    ("accept_resign", accept_resign),
     ("nip04_encrypt", nip04_encrypt),
     ("nip04_decrypt", nip04_decrypt),
 ];
@@ -434,6 +484,52 @@ mod tests {
     }
 
     #[test]
+    fn a_reregister_we_build_is_one_we_accept() {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let keys: Vec<SecretKey> = (1..=3u8)
+            .map(|b| SecretKey::from_slice(&[b; 32]).unwrap())
+            .collect();
+        let ring: Vec<String> = keys
+            .iter()
+            .map(|k| k.public_key(&secp).to_string())
+            .collect();
+        let address = bitcoin::Address::p2wpkh(
+            &bitcoin::CompressedPublicKey(keys[0].public_key(&secp)),
+            NET,
+        )
+        .to_string();
+        let built = call(
+            "build_reregister",
+            json!({"address": address, "pool_id": "pool7", "ring": ring, "private_key": "02".repeat(32), "index": 1}),
+        );
+        let text = built["ok"]["plaintext"].clone();
+        let accepted = call(
+            "accept_reregister",
+            json!({"plaintext": text, "ring": ring, "pool_id": "pool7"}),
+        );
+        assert_eq!(accepted["ok"]["address"], address);
+        let refused = call(
+            "accept_reregister",
+            json!({"plaintext": text, "ring": ring, "pool_id": "pool8"}),
+        );
+        assert_eq!(refused["reject"], "reregister");
+        let resign = call(
+            "build_resign",
+            json!({"psbt": "cHNidP8BAAoCAAAAAAAAAAAAAAA="}),
+        );
+        assert_eq!(
+            resign["ok"]["plaintext"],
+            r#"{"type": "resign", "psbt": "cHNidP8BAAoCAAAAAAAAAAAAAAA="}"#
+        );
+        let read = call(
+            "accept_resign",
+            json!({"plaintext": resign["ok"]["plaintext"]}),
+        );
+        assert_eq!(read["ok"]["psbt"], "cHNidP8BAAoCAAAAAAAAAAAAAAA=");
+    }
+
+    #[test]
     fn refusals_unknown_ops_and_bad_requests() {
         let mut event = announce();
         event["kind"] = json!(1);
@@ -441,7 +537,7 @@ mod tests {
             call("parse_announcement", json!({"event": event}))["reject"],
             "kind"
         );
-        assert_eq!(call("build_reregister", json!({}))["unsupported"], true);
+        assert_eq!(call("no_such_op", json!({}))["unsupported"], true);
         assert_eq!(answer("not json")["reject"], "request");
         let join = call("build_join_request", json!({}));
         assert_eq!(join["ok"]["plaintext"], r#"{"type": "join_pool"}"#);

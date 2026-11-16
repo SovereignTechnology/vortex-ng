@@ -10,8 +10,10 @@
 //! The reference clients are Python, and the numbers must come out the same, so [`pyjson`] reproduces what
 //! Python's `json`, `==`, `round` and `repr` do.
 
+pub mod lsag;
 pub mod message;
 pub mod pool;
 pub mod pyjson;
+pub mod recovery;
 pub mod rules;
 pub mod tx;

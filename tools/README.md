@@ -19,3 +19,8 @@
   Run: `kata-run --net --cwd ~/Projects/vortex-ng -- bash tools/itest/run.sh`.
   **Run 2026-11-15** (Kata, agentrun, Bitcoin Core v32.1.0): all three pits confirmed on the first run, and the
   node refused each flipped-signature copy.
+- `ref-vectors/joinstr_lsag.py`: an independent, stdlib-only Python implementation of joinstr's linkable ring
+  signature (the recovery round, ADR 0006), written from the algorithm and reading nothing from joinstr. It
+  produces the vectors pinned in `vortex-ng-joinstr::lsag`; with vortex-ng's derived nonces the two give the
+  same bytes. Run: `python3 -I tools/ref-vectors/joinstr_lsag.py`.
+- `joinstr-difffuzz-adapter/`: vortex-ng as an implementation in joinstr's differential fuzzer (its README).

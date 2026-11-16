@@ -6,9 +6,8 @@ binary makes vortex-ng one of them. It speaks the harness's adapter protocol (`d
 revision in `docs/upstream-pins.md`): one JSON request per line on stdin, one JSON reply per line on stdout,
 after a first line `{"ready": [ops]}`.
 
-Every op calls `vortex-ng-joinstr` directly; nothing is re-implemented here, and no network is used. The
-recovery ops (`build_reregister`, `accept_reregister`, `build_resign`, `accept_resign`) are not advertised
-until the recovery round is implemented, so the harness leaves vortex-ng out of those comparisons.
+Every op of the protocol (20) calls `vortex-ng-joinstr` directly; nothing is re-implemented here, and no
+network is used.
 
 To add it to a checkout of the harness, build this binary and register it in `driver/run.py` beside the
 others, with the command `path/to/vortex-ng-joinstr-difffuzz`:
