@@ -24,3 +24,17 @@
   produces the vectors pinned in `vortex-ng-joinstr::lsag`; with vortex-ng's derived nonces the two give the
   same bytes. Run: `python3 -I tools/ref-vectors/joinstr_lsag.py`.
 - `joinstr-difffuzz-adapter/`: vortex-ng as an implementation in joinstr's differential fuzzer (its README).
+- `joinstr-difffuzz/run.sh`: runs joinstr-difffuzz, the joinstr v1 differential fuzzer, with vortex-ng as one
+  more implementation, in a throwaway VM (it installs packages and runs upstream code: py-joinstr, the joinstr
+  web GUI and rust-joinstr at the revisions the harness pins, and a regtest Bitcoin Core 32.1). The harness is
+  checked out at the commit in `docs/upstream-pins.md` and is not patched: `drive.py` adds vortex-ng's adapter
+  (`joinstr-difffuzz-adapter/`) to its implementation table in memory, replays `corpus/regress` and prints every
+  group's result where vortex-ng stands alone or crashes. `CASES=300 SEED=1` adds a fresh campaign. The Electrum
+  plugin, joinstr-kmp, Sparrow and floresta are not installed, so cases that need them are skipped.
+  Run: `kata-run --net --cwd ~/Projects/vortex-ng -- bash tools/joinstr-difffuzz/run.sh`.
+  **Run 2026-11-16** (Kata, agentrun; harness `e44b7647`, joinstr `d1290d6c`, rust-joinstr `b3a41fca`; pycli,
+  pyweb, rust, vortex): of the 200 recorded cases 149 apply; 88 agree, 61 diverge (the reference clients'
+  documented differences), no crash. vortex-ng stood alone in 5: three refuse the old `"type": "create"`
+  announcement (as joinstr-kmp and floresta do), one accepts a nine-decimal denomination with the Python
+  clients' value (it differs only in printing the fee rate as `1.0`), and one refused `"vpn_gateway": null`,
+  which vortex-ng now reads as unused, as the reference clients do.

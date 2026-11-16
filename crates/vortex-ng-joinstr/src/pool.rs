@@ -228,8 +228,11 @@ impl Pool {
             Some(Value::String(t)) if t == "vpn" => Transport::Vpn,
             Some(_) => return Err(PoolError::Field("transport")),
         };
+        // Absent or `null` is "unused": the reference clients read a null gateway that way, and
+        // refusing it would hide an otherwise valid pool (joinstr-difffuzz, mutation
+        // `vpn_gateway_null`).
         let vpn_gateway = match raw.get("vpn_gateway") {
-            None => String::new(),
+            None | Some(Value::Null) => String::new(),
             Some(Value::String(g)) => g.clone(),
             Some(_) => return Err(PoolError::Field("vpn_gateway")),
         };
@@ -495,6 +498,20 @@ mod tests {
         });
         let pool = Pool::from_announcement(&author, &content).unwrap();
         assert_eq!(pool.denom_sats(), 100_000_000);
+        // A null gateway is an unused one; a gateway of any other non-string type is refused.
+        let (author, content) = announcement(|c| {
+            c.insert("vpn_gateway".into(), Value::Null);
+        });
+        assert_eq!(
+            Pool::from_announcement(&author, &content)
+                .unwrap()
+                .vpn_gateway,
+            ""
+        );
+        let (author, content) = announcement(|c| {
+            c.insert("vpn_gateway".into(), json!(7));
+        });
+        assert!(Pool::from_announcement(&author, &content).is_err());
     }
 
     #[test]
