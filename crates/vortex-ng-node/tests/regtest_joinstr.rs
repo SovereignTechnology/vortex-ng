@@ -24,7 +24,7 @@ use vortex_ng_joinstr::message::PoolMessage;
 use vortex_ng_joinstr::pool::Pool;
 use vortex_ng_joinstr::rules;
 use vortex_ng_joinstr::session::Peer;
-use vortex_ng_node::joinstr::{join_pool, list_pools, pool_client, run_pool};
+use vortex_ng_node::joinstr::{Hosting, join_pool, list_pools, pool_client, run_pool};
 use vortex_ng_nostr::client::unix_now;
 use vortex_ng_wallet::{PitWallet, Seed};
 
@@ -162,14 +162,14 @@ async fn pool_round(node: &Node, label: &str, pits: &[Pit], ghost: bool) {
             let (pool, pool_key) = if creator {
                 (pool, pool_key)
             } else {
-                let listed = list_pools(&url, None, since, Duration::from_secs(3))
+                let listed = list_pools(&url, None, since, Duration::from_secs(3), false)
                     .await
                     .unwrap();
                 let found = listed
                     .into_iter()
                     .find(|p| p.public_key == pool.public_key)
                     .expect("pool listed");
-                let key = join_pool(&found, None, Duration::from_secs(30))
+                let key = join_pool(&found, None, Duration::from_secs(30), None)
                     .await
                     .unwrap();
                 (found, key)
@@ -187,7 +187,11 @@ async fn pool_round(node: &Node, label: &str, pits: &[Pit], ghost: bool) {
                 key,
             )
             .unwrap();
-            let hosting = creator.then_some((&pool, &pool_key));
+            let hosting = creator.then_some(Hosting {
+                pool: &pool,
+                key: &pool_key,
+                autct: None,
+            });
             run_pool(
                 &mut peer,
                 &mut client,
@@ -202,7 +206,7 @@ async fn pool_round(node: &Node, label: &str, pits: &[Pit], ghost: bool) {
     }
     if ghost {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let key = join_pool(&pool, None, Duration::from_secs(30))
+        let key = join_pool(&pool, None, Duration::from_secs(30), None)
             .await
             .unwrap();
         let client = pool_client(&key, &url, None).await.unwrap();

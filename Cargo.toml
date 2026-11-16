@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/vortex-ng-autct",
     "crates/vortex-ng-core",
     "crates/vortex-ng-joinstr",
     "crates/vortex-ng-nostr",
@@ -25,6 +26,7 @@ publish = false
 
 [workspace.dependencies]
 vortex-ng-core = { path = "crates/vortex-ng-core" }
+vortex-ng-autct = { path = "crates/vortex-ng-autct" }
 vortex-ng-joinstr = { path = "crates/vortex-ng-joinstr" }
 vortex-ng-nostr = { path = "crates/vortex-ng-nostr" }
 vortex-ng-wallet = { path = "crates/vortex-ng-wallet" }
@@ -49,6 +51,14 @@ serde_json = { version = "1", features = ["raw_value"] }
 nostr-sdk = { version = "=0.45.6" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
 futures = "0.3"
+# The aut-ct client (vortex-ng-autct). tokio-tungstenite is the version nostr-sdk already brings in, so there
+# is one copy. argon2 and aes-gcm-siv are held one generation back on purpose: 0.6.0 and 0.12.1 are on
+# RustCrypto's next generation (aead 0.6, cipher 0.5, digest 0.11) while crypto_box and nostr are on the
+# current one, and taking them would put two copies of nine crypto crates in the tree. Move them together
+# with crypto_box and nostr.
+tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["connect", "handshake"] }
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
+aes-gcm-siv = { version = "=0.11.1", default-features = false, features = ["aes", "alloc"] }
 # Tor in-process (feature `tor` of vortex-ng-nostr). 0.47.0 (2026-10-01): newest release at least 7 days old.
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
 tor-rtcompat = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }

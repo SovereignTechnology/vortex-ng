@@ -20,7 +20,8 @@ references and test vectors, and record the reason below.
 | `invincible-privacy/joinstr` main (`NIP.md`, Electrum plugin, CLI, web) | `d1290d6c3dedc64766aa123ec97ba638915db035` | 2026-11-02 | the protocol and its reference client |
 | `invincible-privacy/joinstr-difffuzz` main (`findings/RULES.md`, `driver/PROTOCOL.md`, corpus) | `e44b7647f823fbf5e40f18461f0ecf464720d782` | 2026-11-02 | the wire rules every client is fixed to, and the conformance harness |
 | `1440000bytes/rust-joinstr` master (mirror of github `rust-joinstr/joinstr`) | `b3a41fca9dafba52ed11c1c8f963d9ba75702355` | 2026-11-02 | a second reference in Rust; not linked |
-| `AdamISZ/autct-api` master | `e118c404c511b48da72436e043076048c8696b2f` | 2024-08-01 | the aut-ct daemon's RPC |
+| `AdamISZ/aut-ct` master (`src/lib.rs` RPC types, `src/encryption.rs` key-file format) | `17f40f7c179504070edc85f77193da8a9c609de7` | 2026-10-07 | the aut-ct server `vortex-ng-autct` talks to |
+| `AdamISZ/autct-api` master | `e118c404c511b48da72436e043076048c8696b2f` | 2024-08-01 | the RPC's WebSocket framing only; its request fields are older than the server's (no `encryption_password`) |
 
 ## Lightning implementations (external-funding behaviour checked 2026-11-09)
 
@@ -36,3 +37,4 @@ references and test vectors, and record the reason below.
 
 - 2026-11-09: initial pins (M0).
 - 2026-11-15: joinstr pins (ADR 0006).
+- 2026-11-16: aut-ct pinned beside autct-api: the server's own types are the reference, the Python client library lags them.

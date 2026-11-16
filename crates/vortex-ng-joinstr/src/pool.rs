@@ -96,6 +96,42 @@ pub struct Autct {
     pub terms: Map<String, Value>,
 }
 
+impl Autct {
+    /// Whether a UTXO may be the proving UTXO this pool asks for: at least `min_amount` sats, at least
+    /// `min_confirmations` confirmations (1 when the pool names none), and of `script_type` when the pool
+    /// names one (`p2wpkh`, `p2tr`, `p2pkh`). The proving UTXO is never the coin that enters the coinjoin.
+    pub fn accepts(
+        &self,
+        value_sats: u64,
+        confirmations: u32,
+        script_pubkey: &bitcoin::Script,
+    ) -> bool {
+        let number = |name: &str, default: u64| {
+            self.terms
+                .get(name)
+                .map_or(Some(default), |v| if is_int(v) { v.as_u64() } else { None })
+        };
+        let (Some(min_amount), Some(min_confirmations)) =
+            (number("min_amount", 0), number("min_confirmations", 1))
+        else {
+            return false;
+        };
+        let type_ok = match self
+            .terms
+            .get("script_type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+        {
+            "" => true,
+            "p2wpkh" => script_pubkey.is_p2wpkh(),
+            "p2tr" => script_pubkey.is_p2tr(),
+            "p2pkh" => script_pubkey.is_p2pkh(),
+            _ => false,
+        };
+        value_sats >= min_amount && u64::from(confirmations) >= min_confirmations && type_ok
+    }
+}
+
 /// Whether `name` is a canonical keyset file name. It reaches file paths and a daemon's arguments, and it
 /// comes from a stranger's event, so nothing else is accepted.
 pub fn is_keyset_name(name: &str) -> bool {
@@ -236,6 +272,26 @@ impl Pool {
             ("vpn_gateway", json!("")),
         ]);
         Pool::from_announcement(&public_key_hex(pool_key), &content)
+    }
+
+    /// This pool with an aut-ct requirement: joiners must prove they own a UTXO in `keyset` worth at least
+    /// `min_amount` sats with `min_confirmations` confirmations, of `script_type` (`""` for any).
+    pub fn require_autct(
+        &self,
+        keyset: &str,
+        min_amount: u64,
+        min_confirmations: u32,
+        script_type: &str,
+    ) -> Result<Pool, PoolError> {
+        let mut content = self.raw.clone();
+        content.insert(
+            "autct".into(),
+            json!({
+                "keyset": keyset, "min_amount": min_amount,
+                "min_confirmations": min_confirmations, "script_type": script_type,
+            }),
+        );
+        Pool::from_announcement(&self.public_key, &Value::Object(content).to_string())
     }
 
     /// The denomination in satoshis (R5.1).
@@ -645,6 +701,42 @@ mod tests {
             accept_credentials("[]", &pool),
             Err(CredentialsError::NotAnObject)
         );
+    }
+
+    #[test]
+    fn an_autct_pool_is_announced_with_its_requirement_and_picks_proving_coins() {
+        let plain = Pool::create(
+            &key(9),
+            "abc123",
+            0.001,
+            3,
+            2_000_000_000,
+            "wss://relay.example",
+            2.5,
+        )
+        .unwrap();
+        let pool = plain
+            .require_autct("autct-830000-100000-0-2-1024.aks", 100_000, 6, "p2wpkh")
+            .unwrap();
+        let listed = Pool::from_announcement(&pool.public_key, &pool.announcement()).unwrap();
+        let autct = listed.autct.expect("the requirement is announced");
+        assert_eq!(autct.keyset, "autct-830000-100000-0-2-1024.aks");
+        assert!(plain.require_autct("../evil.aks", 0, 1, "").is_err());
+        let secp = Secp256k1::new();
+        let public = bitcoin::CompressedPublicKey(key(3).public_key(&secp));
+        let wpkh = bitcoin::Address::p2wpkh(&public, bitcoin::Network::Regtest).script_pubkey();
+        let pkh = bitcoin::Address::p2pkh(public, bitcoin::Network::Regtest).script_pubkey();
+        assert!(autct.accepts(100_000, 6, &wpkh));
+        assert!(!autct.accepts(99_999, 6, &wpkh), "too small");
+        assert!(!autct.accepts(100_000, 5, &wpkh), "too young");
+        assert!(!autct.accepts(100_000, 6, &pkh), "wrong script type");
+        // No script type named: any type; no confirmations named: one.
+        let any = plain
+            .require_autct("autct-1-2-3-4-5.aks", 0, 1, "")
+            .unwrap()
+            .autct
+            .unwrap();
+        assert!(any.accepts(1, 1, &pkh) && !any.accepts(1, 0, &pkh));
     }
 
     #[test]

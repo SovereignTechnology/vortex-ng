@@ -1,0 +1,22 @@
+[package]
+name = "vortex-ng-autct"
+description = "A client for a local aut-ct server: anonymous usage tokens (proofs of owning a UTXO from a keyset) for joinstr pools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vortex-ng-core = { workspace = true }
+vortex-ng-joinstr = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+argon2 = { workspace = true }
+aes-gcm-siv = { workspace = true }
