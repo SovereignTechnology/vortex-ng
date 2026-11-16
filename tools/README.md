@@ -38,3 +38,16 @@
   announcement (as joinstr-kmp and floresta do), one accepts a nine-decimal denomination with the Python
   clients' value (it differs only in printing the fee rate as `1.0`), and one refused `"vpn_gateway": null`,
   which vortex-ng now reads as unused, as the reference clients do.
+  A fresh campaign the same day (`CASES=200 SEED=20261116`): 16 distinct divergences, no crash. vortex-ng stood
+  alone in two, both documented differences: the old `"type": "create"` again, and a join request sent from the
+  pool's own key, which the harness's rules say a creator does not answer (joinstr-kmp and floresta refuse it too).
+  In the other 14 it sides with rust-joinstr (10) or the Python clients (4).
+- `jmng-interop/run.sh`: a CoinJoin between a vortex-ng taker and joinmarket-ng's makers over the Nostr message
+  channel, on regtest, run from a joinmarket-ng checkout that has the channel (its header says how). It starts
+  Bitcoin Core 32.1 with a wallet, funds and starts joinmarket-ng's two test makers with the relay as their only
+  message channel, and runs `crates/vortex-ng-node/tests/jmng_interop.rs` (the relay and the taker) at a pinned
+  vortex-ng commit.
+  **Run 2026-11-16, first attempt** (vortex-ng `ac2064b`): offers, the private orderbook answers, `!fill`,
+  `!pubkey`, `!auth` (joinmarket-ng verified vortex-ng's PoDLE) and `!ioauth` crossed the relay; vortex-ng then
+  refused the makers' `!ioauth` signature. That was a vortex-ng bug (it expected the signature over the taker's
+  NaCl key; JoinMarket signs the maker's own), fixed in the commit that added this note.
