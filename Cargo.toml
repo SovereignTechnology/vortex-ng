@@ -12,6 +12,7 @@ members = [
     "crates/vortex-ng-node",
     "crates/vortex-ngd",
     "crates/vortex-ng-cli",
+    "tools/joinstr-difffuzz-adapter",
 ]
 
 [workspace.package]
@@ -38,7 +39,7 @@ bitcoin = { version = "=0.32.102", default-features = false, features = ["std", 
 crypto_box = "0.9.1"
 # rust-nostr 0.45.6 (2026-10-30): constant-time NIP-44 v2 HMAC check (security fix over 0.45.5). 0.45.7 only
 # fixes a nip49 build we do not use.
-nostr = { version = "=0.45.6", default-features = false, features = ["std", "os-rng", "nip44", "nip59"] }
+nostr = { version = "=0.45.6", default-features = false, features = ["std", "os-rng", "nip04", "nip44", "nip59"] }
 # rust-bitcoin's minimal JSON-RPC client (HTTP over TCP, basic auth) for Core-compatible nodes.
 jsonrpc = "0.21.0"
 serde_json = { version = "1", features = ["raw_value"] }

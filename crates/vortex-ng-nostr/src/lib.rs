@@ -9,6 +9,7 @@
 pub mod client;
 pub mod event;
 pub mod keys;
+pub mod pool;
 pub mod private;
 pub mod socks;
 #[cfg(feature = "tor")]

@@ -20,6 +20,17 @@ dependencies = [
 
 [[package]]
 name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher 0.4.4",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "aes"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fc36d7440d015b45468ba08a21e80e056ebbd014c611c6298bb7503e04bd1"
@@ -2530,6 +2541,7 @@ version = "0.45.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc2c39c8b16afa971a835ebe7374835dab31997fcc68c1a2d8714d3dfdd325cc"
 dependencies = [
+ "aes 0.8.4",
  "base64 0.22.1",
  "bech32 0.12.0",
  "bip39",
@@ -4978,7 +4990,7 @@ version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95f921a609ff73736e8e21d11dbee6617cd7568841790f2e3327295627a51b75"
 dependencies = [
- "aes",
+ "aes 0.9.4",
  "base64ct",
  "ctr",
  "curve25519-dalek",
@@ -5188,7 +5200,7 @@ version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fceb9d4017849440584e541054b6a26517655a3ae48942b6e67476c5376262c3"
 dependencies = [
- "aes",
+ "aes 0.9.4",
  "amplify",
  "async-trait",
  "asynchronous-codec",
@@ -5665,6 +5677,16 @@ version = "0.0.1"
 dependencies = [
  "bitcoin",
  "serde_json",
+]
+
+[[package]]
+name = "vortex-ng-joinstr-difffuzz"
+version = "0.0.1"
+dependencies = [
+ "bitcoin",
+ "nostr",
+ "serde_json",
+ "vortex-ng-joinstr",
 ]
 
 [[package]]

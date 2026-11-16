@@ -1,0 +1,22 @@
+[package]
+name = "vortex-ng-joinstr-difffuzz"
+description = "vortex-ng's adapter for joinstr-difffuzz, the differential fuzzer of the joinstr v1 protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "vortex-ng-joinstr-difffuzz"
+path = "src/main.rs"
+
+[dependencies]
+vortex-ng-joinstr = { path = "../../crates/vortex-ng-joinstr" }
+bitcoin = { workspace = true }
+nostr = { workspace = true }
+serde_json = { workspace = true }
