@@ -51,3 +51,10 @@
   `!pubkey`, `!auth` (joinmarket-ng verified vortex-ng's PoDLE) and `!ioauth` crossed the relay; vortex-ng then
   refused the makers' `!ioauth` signature. That was a vortex-ng bug (it expected the signature over the taker's
   NaCl key; JoinMarket signs the maker's own), fixed in the commit that added this note.
+  **Run 2026-11-16, both directions** (vortex-ng `78fc73b`, joinmarket-ng with its Nostr channel at `39a2abd4`,
+  Bitcoin Core v32.1.0, Kata): A, a vortex-ng taker with joinmarket-ng's two makers, and B, joinmarket-ng's taker
+  (`jmng_taker.py`, its own API) with two vortex-ng makers, each completed a `sw0` round over the relay; both
+  transactions confirmed (3 inputs, 6 outputs each), and in B each vortex-ng maker's wallet, restored from its
+  seed, held its fee less its mining-fee share. Not covered: `tr0` and `wsh0` (joinmarket-ng main has only `sw0`),
+  fidelity bonds across implementations, `!push` (joinmarket-ng's taker broadcast the transaction itself; vortex-ng's
+  makers do not broadcast for a taker yet), joinmarket-ng's `!hp2` over the relay, Tor, and more than one relay.
