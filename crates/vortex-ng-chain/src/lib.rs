@@ -234,6 +234,24 @@ impl CoreRpc {
         Ok(Some(FeeRate::from_sat_per_kwu(sat_per_kvb / 4)))
     }
 
+    /// Mine `blocks` blocks paying `address` (`generatetoaddress`). Regtest only: test harnesses use it.
+    pub fn generate_to_address(
+        &self,
+        blocks: u32,
+        address: &vortex_ng_core::bitcoin::Address,
+    ) -> Result<Vec<BlockHash>, ChainError> {
+        let v = self.call("generatetoaddress", json!([blocks, address.to_string()]))?;
+        v.as_array()
+            .ok_or(ChainError::Parse("block hashes"))?
+            .iter()
+            .map(|h| {
+                h.as_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or(ChainError::Parse("block hash"))
+            })
+            .collect()
+    }
+
     /// The hash of the block at `height`.
     pub fn block_hash(&self, height: u32) -> Result<BlockHash, ChainError> {
         let v = self.call("getblockhash", json!([height]))?;
@@ -474,6 +492,24 @@ mod tests {
             Ok(r#"{"errors":["Insufficient data or no feerate found"],"blocks":0}"#),
         )]);
         assert_eq!(none.estimate_fee_rate(2).unwrap(), None);
+    }
+
+    #[test]
+    fn generate_to_address_returns_the_block_hashes() {
+        let node = rpc(&[(
+            "generatetoaddress",
+            Ok(r#"["0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"]"#),
+        )]);
+        let address = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+            .parse::<vortex_ng_core::bitcoin::Address<_>>()
+            .unwrap()
+            .assume_checked();
+        let hashes = node.generate_to_address(1, &address).unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(
+            hashes[0].to_string(),
+            "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+        );
     }
 
     #[test]
