@@ -2,11 +2,13 @@
 //!
 //! The wallet commands create or restore a wallet file (a seed encrypted at rest, see
 //! `vortex_ng_wallet::file`) and read addresses out of it; `orderbook` asks the makers on a set of relays
-//! what they offer; `maker` offers the wallet's coins until stopped. Exit status 0 on success, 1 when the command
+//! what they offer; `maker` offers the wallet's coins until stopped; `coinjoin` does one CoinJoin as the
+//! taker; `balance` shows what the wallet holds. Exit status 0 on success, 1 when the command
 //! failed, 2 when it was not understood.
 
 mod args;
 mod market;
+mod podle_log;
 mod secret;
 mod wallet;
 
@@ -35,6 +37,11 @@ Usage:
   vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fraction> | --fee-abs <sats>)
                       [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
                       [--upkeep <seconds>]
+  vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
+                      [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
+                      [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
+                      [--allow-bondless-fees] [--yes]
+  vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
   vortex-ng --version
 
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
@@ -60,6 +67,8 @@ fn run(args: &[String]) -> Result<(), Failure> {
         [group, command, rest @ ..] if group == "wallet" => wallet::run(command, rest),
         [command, rest @ ..] if command == "orderbook" => market::orderbook(rest),
         [command, rest @ ..] if command == "maker" => market::maker(rest),
+        [command, rest @ ..] if command == "coinjoin" => market::coinjoin(rest),
+        [command, rest @ ..] if command == "balance" => market::balance(rest),
         [group] if group == "wallet" => Err(Failure::Usage("wallet: which command?".into())),
         [other, ..] => Err(Failure::Usage(format!("unknown command `{other}`"))),
     }

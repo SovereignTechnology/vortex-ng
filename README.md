@@ -48,7 +48,7 @@ rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Ecl
 
 ## Command line
 
-`vortex-ng` has the wallet commands, `orderbook` and `maker`; the taker's `coinjoin` comes next.
+`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin` and `balance`.
 
 ```
 vortex-ng wallet new          --wallet <file> --network <network> [--words 12|24] [--birthday <height>]
@@ -61,6 +61,11 @@ vortex-ng orderbook --network <network> --relays <url[,url...]> [--pit sw0|tr0|w
 vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fraction> | --fee-abs <sats>)
                     [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
                     [--upkeep <seconds>]
+vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
+                    [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
+                    [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
+                    [--allow-bondless-fees] [--yes]
+vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
 ```
 
 `node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
@@ -76,8 +81,15 @@ vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fra
   tip and sizes its one offer to what the wallet can put into a round; it renews its announcement before it
   expires and withdraws it when there is too little to offer. Coins the node already shows as spent are
   never put into a round.
+- `coinjoin` does one CoinJoin as the taker, from one mixdepth to the next mixdepth of the same wallet or to
+  `--destination`. It merges no more coins than the round needs, bounds each maker's fee (0.1 % of the amount
+  and at least 2,000 sat unless `--max-maker-fee` says otherwise), takes makers without a fidelity bond only
+  at a zero fee unless `--allow-bondless-fees`, shows what it is about to do and asks before sending anything
+  (`--yes` skips the question). The transaction is checked with the node before it is broadcast.
+- Every PoDLE commitment sent is first written to `<wallet>.podle` (the public value makers broadcast, one
+  per line): a commitment is spent even by a round that fails, and each coin has three.
 - `orderbook` lists what the makers on the relays answer, and verifies their fidelity bonds when given a node.
-- **No Tor yet in these two commands**: they connect to the relays directly, so the relays see the machine's
+- **No Tor yet in `orderbook`, `maker` and `coinjoin`**: they connect to the relays directly, so the relays see the machine's
   address, and they say so when they start. The Tor transport exists in `vortex-ng-nostr` and is wired in next.
 
 ## Building

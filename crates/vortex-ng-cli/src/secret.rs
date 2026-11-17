@@ -74,6 +74,24 @@ pub(crate) fn prompt(label: &str) -> Result<Zeroizing<String>, String> {
     Ok(without_newline(line))
 }
 
+/// Ask a yes-or-no question on the terminal; anything but `y` or `yes` is no. An error when standard input
+/// is not a terminal.
+pub(crate) fn confirm(question: &str) -> Result<bool, String> {
+    let stdin = std::io::stdin();
+    if !isatty(&stdin) {
+        return Err("no terminal to confirm on: pass `--yes`".into());
+    }
+    eprint!("{question} [y/N] ");
+    let fail = |e: std::io::Error| format!("terminal: {e}");
+    std::io::stderr().flush().map_err(fail)?;
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line).map_err(fail)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 /// The secret called `label`: from `file` when given, else asked on the terminal (twice when `confirm`, and
 /// the two must match).
 pub(crate) fn obtain(

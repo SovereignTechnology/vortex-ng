@@ -1,22 +1,28 @@
 //! `vortex-ng orderbook` and `vortex-ng maker`: the commands that talk to relays and to a node.
 
-use std::time::Duration;
+use std::path::Path;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use vortex_ng_chain::{Auth, CoreRpc};
-use vortex_ng_core::bitcoin::Network;
+use vortex_ng_core::bitcoin::{Address, Network, OutPoint, TxOut};
 use vortex_ng_core::bond::BondValueParams;
 use vortex_ng_core::offer::{CjFee, Offer, RelativeFee};
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{
-    CONNECT_TIMEOUT, MAX_BOND_LOOKUPS, MakerReport, MakerService, OfferFee, OfferPolicy,
-    channel_network, fetch_orderbook, serve_maker,
+    CONNECT_TIMEOUT, MAX_BOND_LOOKUPS, MakerReport, MakerService, NodeError, OfferFee, OfferPolicy,
+    channel_network, fetch_orderbook, run_taker, serve_maker,
 };
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
-use vortex_ng_taker::verify_bond;
-use vortex_ng_wallet::PitWallet;
+use vortex_ng_taker::{
+    Coin, DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, TakerError, choose_coins, podle_for,
+    verify_bond,
+};
+use vortex_ng_wallet::{MIXDEPTHS, PitWallet};
 
 use crate::args::Args;
+use crate::podle_log::PodleLog;
 use crate::wallet::{failed, network_name, parse};
 use crate::{Failure, secret, wallet};
 
@@ -328,4 +334,265 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         .await
         .map_err(failed)
     })
+}
+
+/// A taker's failure in plain words.
+fn taker_failed(error: TakerError) -> Failure {
+    match error {
+        TakerError::Funds(why) => failed(why),
+        TakerError::Maker(nick, why) => failed(format!("maker {nick}: {why}")),
+        TakerError::Internal(why) => failed(why),
+    }
+}
+
+/// The wallet's confirmed coins in `mixdepth`, with their depth at `height`.
+fn confirmed_coins(wallet: &PitWallet, mixdepth: u32, height: u32) -> Result<Vec<Coin>, Failure> {
+    Ok(wallet
+        .utxos(mixdepth)
+        .map_err(failed)?
+        .into_iter()
+        .filter_map(|utxo| {
+            let at = utxo.chain_position.confirmation_height_upper_bound()?;
+            (at <= height).then(|| Coin {
+                confirmations: height - at + 1,
+                utxo,
+            })
+        })
+        .collect())
+}
+
+/// `vortex-ng balance`: what the wallet holds, confirmed, by mixdepth.
+pub(crate) fn balance(rest: &[String]) -> Result<(), Failure> {
+    let mut valued = vec!["wallet", "password-file", "pit"];
+    valued.extend(RPC_OPTIONS);
+    let args = parse(rest, &valued, &[])?;
+    let (pit, pit_name) = wallet::pit(&args)?;
+    if args.get("rpc-url").is_none() {
+        return Err(usage("`--rpc-url` is required: balances come from a node"));
+    }
+    let file = wallet::open(&args)?;
+    let chain = node(&args, file.network())?;
+    let mut pit_wallet = PitWallet::new(&file.seed().map_err(failed)?, pit).map_err(failed)?;
+    let height = pit_wallet.sync(&chain, file.birthday()).map_err(failed)?;
+    println!(
+        "{pit_name} wallet at height {height} ({})",
+        network_name(file.network())
+    );
+    let mut total = 0u64;
+    for mixdepth in 0..MIXDEPTHS {
+        let coins = confirmed_coins(&pit_wallet, mixdepth, height)?;
+        let sum: u64 = coins.iter().map(|c| c.utxo.txout.value.to_sat()).sum();
+        total += sum;
+        println!(
+            "mixdepth {mixdepth}: {sum:>16} sat in {} coin(s)",
+            coins.len()
+        );
+    }
+    println!("total:      {total:>16} sat confirmed");
+    Ok(())
+}
+
+/// `vortex-ng coinjoin`: one CoinJoin as the taker.
+pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
+    let mut valued = vec![
+        "wallet",
+        "password-file",
+        "relays",
+        "pit",
+        "amount",
+        "makers",
+        "mixdepth",
+        "destination",
+        "fee-rate",
+        "max-maker-fee",
+        "wait",
+    ];
+    valued.extend(RPC_OPTIONS);
+    let args = parse(rest, &valued, &["yes", "allow-bondless-fees"])?;
+    let relays = relays(&args)?;
+    let (pit, pit_name) = wallet::pit(&args)?;
+    let amount = match args.sats("amount").map_err(Failure::Usage)? {
+        Some(amount) if amount > 0 => amount,
+        _ => return Err(usage("`--amount <sats>` is required")),
+    };
+    let makers = args.number("makers", 3, 1..=20).map_err(Failure::Usage)? as usize;
+    let mixdepth = args
+        .number("mixdepth", 0, 0..=MIXDEPTHS - 1)
+        .map_err(Failure::Usage)?;
+    let wait = args.number("wait", 15, 1..=600).map_err(Failure::Usage)?;
+    let fee_rate = match args.get("fee-rate") {
+        Some(_) => Some(
+            args.number("fee-rate", 1, 1..=10_000)
+                .map_err(Failure::Usage)?,
+        ),
+        None => None,
+    };
+    // Each maker's fee is bounded: 0.1 % of the amount, and no less than 2,000 sat, unless told otherwise.
+    let max_maker_fee = args
+        .sats("max-maker-fee")
+        .map_err(Failure::Usage)?
+        .unwrap_or_else(|| (amount / 1000).max(2_000));
+    if args.get("rpc-url").is_none() {
+        return Err(usage("`--rpc-url` is required: a taker needs a node"));
+    }
+
+    let wallet_path = Path::new(args.required("wallet").map_err(Failure::Usage)?);
+    let file = wallet::open(&args)?;
+    let network = file.network();
+    let chain = node(&args, network)?;
+    let mut pit_wallet = PitWallet::new(&file.seed().map_err(failed)?, pit).map_err(failed)?;
+    let height = pit_wallet.sync(&chain, file.birthday()).map_err(failed)?;
+    let fee_rate_sat_per_kwu = match fee_rate {
+        Some(sat_per_vb) => u64::from(sat_per_vb) * 250,
+        None => match chain.estimate_fee_rate(3).map_err(failed)? {
+            Some(rate) => rate.to_sat_per_kwu().max(250),
+            None => {
+                return Err(failed(
+                    "the node has no fee estimate: give `--fee-rate <sat/vB>`",
+                ));
+            }
+        },
+    };
+    let cfg = TakerConfig {
+        pit,
+        network,
+        amount,
+        makers,
+        max_cjfee: max_maker_fee,
+        fee_rate_sat_per_kwu,
+        max_maker_utxos: 20,
+        bondless_makers_allowance: DEFAULT_BONDLESS_ALLOWANCE,
+        // joinmarket-ng's default: a maker without a fidelity bond is taken only at a zero fee.
+        bondless_require_zero_fee: !args.flag("allow-bondless-fees"),
+        bond_params: BondValueParams::default(),
+    };
+
+    let chosen = choose_coins(&cfg, confirmed_coins(&pit_wallet, mixdepth, height)?)
+        .map_err(taker_failed)?;
+    // The first commitment of the chosen coins that was never sent: three per coin (NUMS indices 0-2).
+    let mut log = PodleLog::open(wallet_path).map_err(failed)?;
+    let mut podle = None;
+    'coins: for coin in chosen.iter().filter(|coin| coin.fit_to_commit(amount)) {
+        for index in 0..3u8 {
+            let candidate =
+                podle_for(&pit_wallet, mixdepth, &coin.utxo, index).map_err(taker_failed)?;
+            if !log.contains(&candidate.commitment()) {
+                podle = Some(candidate);
+                break 'coins;
+            }
+        }
+    }
+    let Some(podle) = podle else {
+        return Err(failed(
+            "every commitment of the chosen coins has been used (three per coin, spent even by a round \
+             that failed): use another mixdepth, or wait for other coins to reach 5 confirmations",
+        ));
+    };
+
+    let (cj_script, to) = match args.get("destination") {
+        Some(text) => {
+            let address = Address::from_str(text)
+                .map_err(|_| usage("`--destination` is not an address"))?
+                .require_network(network)
+                .map_err(|_| {
+                    failed(format!("{text} is not a {} address", network_name(network)))
+                })?;
+            (address.script_pubkey(), text.to_string())
+        }
+        None => {
+            let next = (mixdepth + 1) % MIXDEPTHS;
+            let address = pit_wallet.next_receive_address(next).map_err(failed)?;
+            (
+                address.script_pubkey(),
+                format!("mixdepth {next} of this wallet"),
+            )
+        }
+    };
+    let change = pit_wallet
+        .next_change_address(mixdepth)
+        .map_err(failed)?
+        .script_pubkey();
+    let inputs: Vec<(OutPoint, TxOut)> = chosen
+        .iter()
+        .map(|coin| (coin.utxo.outpoint, coin.utxo.txout.clone()))
+        .collect();
+    let total: u64 = inputs.iter().map(|(_, out)| out.value.to_sat()).sum();
+    println!(
+        "CoinJoin of {amount} sat in the {pit_name} pit with {makers} makers, from mixdepth {mixdepth} \
+         ({} coin(s), {total} sat), to {to}.",
+        inputs.len()
+    );
+    println!(
+        "Each maker's fee is at most {max_maker_fee} sat; mining fee rate {} sat/vB; makers without a \
+         fidelity bond {}.",
+        fee_rate_sat_per_kwu.div_ceil(250),
+        if cfg.bondless_require_zero_fee {
+            "only at a zero fee"
+        } else {
+            "may charge a fee"
+        }
+    );
+    if !args.flag("yes") && !secret::confirm("Proceed?").map_err(failed)? {
+        return Err(failed("not confirmed: nothing was sent"));
+    }
+
+    // From here the commitment counts as used, whatever becomes of the round.
+    log.record(&podle.commitment()).map_err(failed)?;
+    let mut taker = Taker::new(
+        cfg.clone(),
+        mixdepth,
+        inputs,
+        podle,
+        cj_script,
+        change.clone(),
+    )
+    .map_err(taker_failed)?;
+    warn_direct();
+    let channel = channel_network(network);
+    let tx = runtime()?.block_on(async {
+        let mut client = NickClient::connect(
+            NickKeys::generate(),
+            channel,
+            &relays,
+            None,
+            CONNECT_TIMEOUT,
+        )
+        .await
+        .map_err(failed)?;
+        let gather = Duration::from_secs(wait.into());
+        let round = run_taker(
+            &mut taker,
+            &pit_wallet,
+            &mut client,
+            &chain,
+            &cfg,
+            gather,
+            Instant::now() + gather + Duration::from_secs(300),
+        )
+        .await;
+        client.shutdown().await;
+        round.map_err(|e| match e {
+            NodeError::Taker(e) => taker_failed(e),
+            NodeError::Timeout => failed("the makers did not finish the round in time"),
+            other => failed(other),
+        })
+    })?;
+    if let Err(why) = chain.test_accept(&tx).map_err(failed)? {
+        return Err(failed(format!(
+            "the node refuses the transaction ({why}): nothing was broadcast"
+        )));
+    }
+    let txid = chain.broadcast(&tx).map_err(failed)?;
+    let kept: u64 = tx
+        .output
+        .iter()
+        .filter(|out| out.script_pubkey == change)
+        .map(|out| out.value.to_sat())
+        .sum();
+    println!("Broadcast {txid}");
+    println!(
+        "{amount} sat to {to}; {} sat in maker and mining fees; {kept} sat change.",
+        total.saturating_sub(amount).saturating_sub(kept)
+    );
+    Ok(())
 }

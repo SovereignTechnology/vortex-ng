@@ -268,6 +268,87 @@ pub fn select_makers_with(
     take(chosen)
 }
 
+/// Confirmations makers ask of the coin a taker commits to (their `taker_utxo_age` default).
+pub const PODLE_MIN_CONFIRMATIONS: u32 = 5;
+/// The least a committed coin may be worth, percent of the amount (makers' `taker_utxo_amtpercent`
+/// default).
+pub const PODLE_MIN_PERCENT: u64 = 20;
+/// Inputs each maker is assumed to bring when a round's cost is estimated before any maker is known.
+pub const ASSUMED_MAKER_INPUTS: usize = 3;
+
+/// A confirmed coin of ours and how deep it is.
+#[derive(Clone, Debug)]
+pub struct Coin {
+    /// The output.
+    pub utxo: LocalOutput,
+    /// Its confirmations.
+    pub confirmations: u32,
+}
+
+impl Coin {
+    fn value(&self) -> u64 {
+        self.utxo.txout.value.to_sat()
+    }
+
+    /// Whether makers with default settings accept a commitment to this coin for `amount`.
+    pub fn fit_to_commit(&self, amount: u64) -> bool {
+        self.confirmations >= PODLE_MIN_CONFIRMATIONS
+            && u128::from(self.value()) * 100 >= u128::from(amount) * u128::from(PODLE_MIN_PERCENT)
+    }
+}
+
+/// What a round is estimated to cost the taker beyond its amount, for choosing coins before any maker is
+/// known: the highest fee each maker may charge, plus the mining fee of a transaction with `taker_inputs`
+/// of ours and `maker_inputs` from each maker, every party with a coinjoin output and a change output, the
+/// makers contributing nothing to the mining fee.
+pub fn estimated_cost(cfg: &TakerConfig, taker_inputs: usize, maker_inputs: usize) -> u64 {
+    let parties = (cfg.makers as u64).saturating_add(1);
+    let inputs = (cfg.makers as u64)
+        .saturating_mul(maker_inputs as u64)
+        .saturating_add(taker_inputs as u64);
+    let weight = OVERHEAD_WU
+        .saturating_add(inputs.saturating_mul(input_weight(cfg.pit)))
+        .saturating_add(parties.saturating_mul(2 * output_weight(cfg.pit)));
+    let mining = weight
+        .saturating_mul(cfg.fee_rate_sat_per_kwu)
+        .div_ceil(1000);
+    (cfg.makers as u64)
+        .saturating_mul(cfg.max_cjfee)
+        .saturating_add(mining)
+}
+
+/// Choose the coins of one mixdepth for a round: the largest coin makers will accept a commitment to
+/// first, then the largest of the rest until they cover the amount and [`estimated_cost`] (with
+/// [`ASSUMED_MAKER_INPUTS`] per maker). No more coins are merged than that needs.
+pub fn choose_coins(cfg: &TakerConfig, mut coins: Vec<Coin>) -> Result<Vec<Coin>, TakerError> {
+    coins.sort_by_key(|coin| std::cmp::Reverse(coin.value()));
+    let Some(first) = coins.iter().position(|coin| coin.fit_to_commit(cfg.amount)) else {
+        return Err(TakerError::Funds(format!(
+            "no coin to commit to: makers ask for one with {PODLE_MIN_CONFIRMATIONS} confirmations worth \
+             {PODLE_MIN_PERCENT} % of the amount"
+        )));
+    };
+    let mut chosen = vec![coins.remove(first)];
+    let mut rest = coins.into_iter();
+    loop {
+        let have: u64 = chosen.iter().map(Coin::value).sum();
+        let need =
+            cfg.amount
+                .saturating_add(estimated_cost(cfg, chosen.len(), ASSUMED_MAKER_INPUTS));
+        if have >= need {
+            return Ok(chosen);
+        }
+        match rest.next() {
+            Some(coin) => chosen.push(coin),
+            None => {
+                return Err(TakerError::Funds(format!(
+                    "the mixdepth's confirmed coins hold {have} sat; the round needs about {need}"
+                )));
+            }
+        }
+    }
+}
+
 /// The PoDLE for one of our UTXOs (`tr0` uses the BIP86 output secret, `wsh0` adds the cosigner).
 pub fn podle_for(
     wallet: &PitWallet,

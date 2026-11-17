@@ -512,3 +512,132 @@ fn candidate_nicks_are_the_makers_selection_would_consider() {
         HashSet::from(["A".to_string()])
     );
 }
+
+fn coin(byte: u8, value: u64, confirmations: u32) -> Coin {
+    use vortex_ng_wallet::bdk_wallet::KeychainKind;
+    use vortex_ng_wallet::bdk_wallet::chain::ChainPosition;
+
+    Coin {
+        utxo: LocalOutput {
+            outpoint: OutPoint {
+                txid: Txid::from_byte_array([byte; 32]),
+                vout: 0,
+            },
+            txout: TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
+            },
+            keychain: KeychainKind::External,
+            is_spent: false,
+            derivation_index: u32::from(byte),
+            chain_position: ChainPosition::Unconfirmed {
+                first_seen: None,
+                last_seen: None,
+            },
+        },
+        confirmations,
+    }
+}
+
+fn choice_cfg(amount: u64) -> TakerConfig {
+    TakerConfig {
+        pit: Pit::Sw0,
+        network: Network::Regtest,
+        amount,
+        makers: 2,
+        max_cjfee: 1_000,
+        fee_rate_sat_per_kwu: 2_500,
+        max_maker_utxos: 20,
+        bondless_makers_allowance: DEFAULT_BONDLESS_ALLOWANCE,
+        bondless_require_zero_fee: true,
+        bond_params: BondValueParams::default(),
+    }
+}
+
+#[test]
+fn the_cost_estimate_counts_maker_fees_and_the_whole_mining_fee() {
+    let cfg = choice_cfg(1_000_000);
+    // Two makers at 1,000 each; 1 + 2 * 3 inputs and 3 * 2 outputs of sw0 at 2.5 sat per weight unit.
+    let weight = 42 + 7 * 272 + 6 * 124;
+    assert_eq!(
+        estimated_cost(&cfg, 1, ASSUMED_MAKER_INPUTS),
+        2_000 + (weight * 2_500u64).div_ceil(1000)
+    );
+    // One more input of ours costs its weight.
+    assert_eq!(
+        estimated_cost(&cfg, 2, ASSUMED_MAKER_INPUTS)
+            - estimated_cost(&cfg, 1, ASSUMED_MAKER_INPUTS),
+        680
+    );
+    // Absurd settings saturate instead of wrapping.
+    let absurd = TakerConfig {
+        max_cjfee: u64::MAX,
+        fee_rate_sat_per_kwu: u64::MAX,
+        ..cfg
+    };
+    assert_eq!(estimated_cost(&absurd, usize::MAX, usize::MAX), u64::MAX);
+}
+
+#[test]
+fn coins_are_chosen_for_the_commitment_first_and_no_more_than_needed() {
+    let ids = |coins: &[Coin]| -> Vec<u8> {
+        coins
+            .iter()
+            .map(|c| c.utxo.outpoint.txid.to_byte_array()[0])
+            .collect()
+    };
+    let cfg = choice_cfg(1_000_000);
+
+    // One coin covers it: only that coin, though others are there.
+    let chosen = choose_coins(
+        &cfg,
+        vec![
+            coin(1, 300_000, 10),
+            coin(2, 5_000_000, 10),
+            coin(3, 900_000, 10),
+        ],
+    )
+    .unwrap();
+    assert_eq!(ids(&chosen), [2]);
+
+    // The largest coin is too young to commit to: the largest that is fit comes first, then the
+    // largest of the rest until the round is covered.
+    let chosen = choose_coins(
+        &cfg,
+        vec![
+            coin(1, 300_000, 10),
+            coin(2, 600_000, 4),
+            coin(3, 250_000, 5),
+            coin(4, 200_000, 100),
+        ],
+    )
+    .unwrap();
+    assert_eq!(ids(&chosen), [1, 2, 3]);
+
+    // A coin worth less than a fifth of the amount cannot carry the commitment, however old.
+    assert!(!coin(1, 199_999, 100).fit_to_commit(1_000_000));
+    assert!(coin(1, 200_000, 5).fit_to_commit(1_000_000));
+    let none = choose_coins(&cfg, vec![coin(1, 5_000_000, 4), coin(2, 199_999, 100)]);
+    assert!(matches!(none, Err(TakerError::Funds(why)) if why.contains("no coin to commit to")));
+    assert!(matches!(
+        choose_coins(&cfg, Vec::new()),
+        Err(TakerError::Funds(_))
+    ));
+
+    // Not enough in all: said with both numbers. Exactly enough is enough.
+    let need = 1_000_000 + estimated_cost(&cfg, 2, ASSUMED_MAKER_INPUTS);
+    let short = choose_coins(
+        &cfg,
+        vec![coin(1, 600_000, 10), coin(2, need - 600_001, 10)],
+    );
+    assert!(
+        matches!(&short, Err(TakerError::Funds(why)) if why.contains(&format!("needs about {need}"))),
+        "{short:?}"
+    );
+    let exact = choose_coins(
+        &cfg,
+        vec![coin(1, 600_000, 10), coin(2, need - 600_000, 10)],
+    )
+    .unwrap();
+    assert_eq!(exact.len(), 2);
+}

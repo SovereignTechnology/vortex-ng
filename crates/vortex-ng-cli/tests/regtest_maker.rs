@@ -5,6 +5,9 @@
 //! had just spent, or never noticed the ones it had just received, could not do it: here each maker has a
 //! single coin, so round two can only be funded with what round one paid it.
 //!
+//! A third round is then taken by `vortex-ng coinjoin` itself, from a wallet file of its own, and
+//! `vortex-ng balance` shows where the coins went.
+//!
 //! Skipped unless `VORTEX_NG_REGTEST_RPC` and `VORTEX_NG_REGTEST_COOKIE` are set (`tools/itest/run.sh`
 //! sets them). The taker is the library's, in this process; the relay is nostr-sdk's in-process relay.
 
@@ -145,7 +148,7 @@ async fn round(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn maker_processes_stay_up_through_two_rounds() {
+async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     let (Ok(url), Ok(cookie)) = (
         std::env::var("VORTEX_NG_REGTEST_RPC"),
         std::env::var("VORTEX_NG_REGTEST_COOKIE"),
@@ -211,6 +214,37 @@ async fn maker_processes_stay_up_through_two_rounds() {
             .unwrap();
         rpc.generate_to_address(1, &address(first)).unwrap();
     }
+    // The command line's own taker wallet, for the third round: one coinbase.
+    let cli_taker = file("taker.json");
+    vortex(&[
+        "wallet",
+        "new",
+        "--wallet",
+        &cli_taker,
+        "--network",
+        "regtest",
+        "--password-file",
+        &password,
+    ]);
+    let listing = vortex(&[
+        "wallet",
+        "addresses",
+        "--wallet",
+        &cli_taker,
+        "--count",
+        "1",
+        "--password-file",
+        &password,
+    ]);
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    let first = listing
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    rpc.generate_to_address(1, &address(first)).unwrap();
     // The taker: two coinbases, one per round.
     let seed = Seed::from_mnemonic(WORDS, "cli-maker-taker", Network::Regtest).unwrap();
     let mut taker_wallet = PitWallet::new(&seed, Pit::Sw0).unwrap();
@@ -360,6 +394,123 @@ async fn maker_processes_stay_up_through_two_rounds() {
         .expect("round two's first output, unspent");
     assert_eq!(confirmed.confirmations, 1);
     println!("round two confirmed: {}", second.compute_txid());
+
+    // Round three, by the command line: `vortex-ng coinjoin` from its own wallet file.
+    wait_for(
+        "both makers' offers after round two",
+        Duration::from_secs(120),
+        || logs.iter().all(|log| announcements(log) >= 3),
+    )
+    .await;
+    let node = [
+        "--rpc-url",
+        url.as_str(),
+        "--rpc-cookie-file",
+        cookie.as_str(),
+    ];
+    let coinjoin = |extra: &[&str]| {
+        let mut args = vec![
+            "coinjoin",
+            "--wallet",
+            &cli_taker,
+            "--password-file",
+            &password,
+            "--relays",
+            &relay_url,
+            "--amount",
+            "500000",
+            "--makers",
+            "2",
+            "--fee-rate",
+            "2",
+            "--wait",
+            "8",
+        ];
+        args.extend(node);
+        args.extend(extra);
+        Command::new(env!("CARGO_BIN_EXE_vortex-ng"))
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    // Without a terminal it will not spend unless told to; and with joinmarket-ng's default policy it
+    // finds no maker, for these have no fidelity bond and charge a fee.
+    let unconfirmed = coinjoin(&["--allow-bondless-fees"]);
+    assert_eq!(unconfirmed.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains("pass `--yes`"));
+    assert!(!Path::new(&format!("{cli_taker}.podle")).exists());
+    let strict = coinjoin(&["--yes"]);
+    assert_eq!(
+        strict.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&strict.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&strict.stderr).contains("not enough suitable offers"),
+        "{}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+    // That attempt spent a commitment: the next one must use another.
+    let log = format!("{cli_taker}.podle");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+
+    let third = coinjoin(&["--yes", "--allow-bondless-fees"]);
+    assert!(
+        third.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&third.stderr),
+        show(&logs)
+    );
+    let said = String::from_utf8(third.stdout).unwrap();
+    let txid = said
+        .lines()
+        .find_map(|line| line.strip_prefix("Broadcast "))
+        .expect("the broadcast txid");
+    let txid = vortex_ng_core::bitcoin::Txid::from_str(txid).unwrap();
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+    rpc.generate_to_address(1, &sink).unwrap();
+    let confirmed = rpc
+        .utxo(&OutPoint { txid, vout: 0 })
+        .unwrap()
+        .expect("round three's first output, unspent");
+    assert_eq!(confirmed.confirmations, 1);
+    println!("round three, by `vortex-ng coinjoin`, confirmed: {txid}");
+
+    // The wallet's view: the amount in mixdepth 1, the change in mixdepth 0.
+    let mut args = vec![
+        "balance",
+        "--wallet",
+        &cli_taker,
+        "--password-file",
+        &password,
+    ];
+    args.extend(node);
+    let balance = String::from_utf8(vortex(&args).stdout).unwrap();
+    let line = |start: &str| {
+        balance
+            .lines()
+            .find(|line| line.starts_with(start))
+            .unwrap_or_else(|| panic!("{start} in\n{balance}"))
+            .to_string()
+    };
+    assert!(
+        line("mixdepth 1:").contains(" 500000 sat in 1 coin(s)"),
+        "{balance}"
+    );
+    assert!(
+        line("mixdepth 0:").contains(" sat in 1 coin(s)"),
+        "{balance}"
+    );
+    // A round right away has no coin to commit to: the change is one block old.
+    let young = coinjoin(&["--yes", "--allow-bondless-fees"]);
+    assert_eq!(young.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&young.stderr).contains("no coin to commit to"),
+        "{}",
+        String::from_utf8_lossy(&young.stderr)
+    );
 
     // Nobody fell over.
     for child in &mut makers.0 {
