@@ -1,10 +1,12 @@
 //! `vortex-ng`: the command line of vortex-ng.
 //!
-//! So far the wallet commands: create or restore a wallet file (a seed encrypted at rest, see
-//! `vortex_ng_wallet::file`) and read addresses out of it. Exit status 0 on success, 1 when the command
+//! The wallet commands create or restore a wallet file (a seed encrypted at rest, see
+//! `vortex_ng_wallet::file`) and read addresses out of it; `orderbook` asks the makers on a set of relays
+//! what they offer; `maker` offers the wallet's coins until stopped. Exit status 0 on success, 1 when the command
 //! failed, 2 when it was not understood.
 
 mod args;
+mod market;
 mod secret;
 mod wallet;
 
@@ -28,7 +30,15 @@ Usage:
   vortex-ng wallet info         --wallet <file>
   vortex-ng wallet addresses    --wallet <file> [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--count <n>] [--change]
   vortex-ng wallet bond-address --wallet <file> --locktime <YYYY-MM>
+  vortex-ng orderbook --network <network> --relays <url[,url...]> [--pit sw0|tr0|wsh0] [--wait <seconds>]
+                      [node]
+  vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fraction> | --fee-abs <sats>)
+                      [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
+                      [--upkeep <seconds>]
   vortex-ng --version
+
+node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
+A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
 
 Networks: regtest, signet, testnet4, testnet. Mainnet wallets are disabled in this pre-release.
 
@@ -48,6 +58,8 @@ fn run(args: &[String]) -> Result<(), Failure> {
             Ok(())
         }
         [group, command, rest @ ..] if group == "wallet" => wallet::run(command, rest),
+        [command, rest @ ..] if command == "orderbook" => market::orderbook(rest),
+        [command, rest @ ..] if command == "maker" => market::maker(rest),
         [group] if group == "wallet" => Err(Failure::Usage("wallet: which command?".into())),
         [other, ..] => Err(Failure::Usage(format!("unknown command `{other}`"))),
     }

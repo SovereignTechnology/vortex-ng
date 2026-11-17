@@ -57,16 +57,19 @@ fn spend(txid_byte: u8) -> TxIn {
     }
 }
 
-/// A maker whose mixdepth 0 holds 500,000 and 300,000 sats, confirmed.
-fn funded_maker() -> Maker {
-    let mut wallet = PitWallet::new(
+fn maker_wallet() -> PitWallet {
+    PitWallet::new(
         &Seed::from_mnemonic(WORDS, "", Network::Regtest).unwrap(),
         Pit::Sw0,
     )
-    .unwrap();
+    .unwrap()
+}
+
+/// The transaction that pays the maker its two coins.
+fn maker_funding(wallet: &mut PitWallet) -> Transaction {
     let a = wallet.next_receive_address(0).unwrap().script_pubkey();
     let b = wallet.next_receive_address(0).unwrap().script_pubkey();
-    let funding = Transaction {
+    Transaction {
         version: Version::TWO,
         lock_time: absolute::LockTime::ZERO,
         input: vec![spend(1)],
@@ -80,7 +83,38 @@ fn funded_maker() -> Maker {
                 script_pubkey: b,
             },
         ],
-    };
+    }
+}
+
+/// The maker's two coins as the node has them: unspent, 10 confirmations.
+fn maker_coins() -> Vec<(OutPoint, Utxo)> {
+    let funding = maker_funding(&mut maker_wallet());
+    let txid = funding.compute_txid();
+    funding
+        .output
+        .iter()
+        .enumerate()
+        .map(|(vout, out)| {
+            (
+                OutPoint {
+                    txid,
+                    vout: vout as u32,
+                },
+                Utxo {
+                    value: out.value,
+                    script_pubkey: out.script_pubkey.clone(),
+                    confirmations: 10,
+                    coinbase: false,
+                },
+            )
+        })
+        .collect()
+}
+
+/// A maker whose mixdepth 0 holds 500,000 and 300,000 sats, confirmed.
+fn funded_maker() -> Maker {
+    let mut wallet = maker_wallet();
+    let funding = maker_funding(&mut wallet);
     let genesis = genesis_block(Network::Regtest);
     let block = Block {
         header: Header {
@@ -112,7 +146,7 @@ fn new_taker() -> (Taker, FakeChain) {
         vout: 0,
     };
     let spk = ScriptBuf::new_p2wpkh(&CompressedPublicKey(public).wpubkey_hash());
-    let chain = FakeChain {
+    let mut chain = FakeChain {
         utxos: HashMap::from([(
             utxo,
             Utxo {
@@ -124,6 +158,8 @@ fn new_taker() -> (Taker, FakeChain) {
         )]),
         tip: 200,
     };
+    // The node also has the maker's own coins: a maker offers only coins the node shows unspent.
+    chain.utxos.extend(maker_coins());
     (
         Taker {
             key,
@@ -325,6 +361,73 @@ fn sessions_expire_and_never_block_new_takers() {
     assert_eq!(private(&out[0]).0, "pubkey");
     assert_eq!(maker.sessions.len(), 1);
     assert_eq!(maker.started.len(), 1);
+}
+
+/// Run `!fill` and `!auth` for `amount`: the maker's `!ioauth`, or `None` when it refused.
+fn auth_round(maker: &mut Maker, taker: &Taker, chain: &FakeChain, amount: u64) -> Option<Ioauth> {
+    let secp = Secp256k1::new();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    let fill = Command::Fill {
+        oid: 0,
+        amount,
+        nacl_pubkey: taker.nacl.public_hex(),
+        commitment: podle.commitment(),
+    };
+    let out = maker.handle("J5taker", fill, chain, NOW);
+    let (cmd, maker_nacl) = private(&out[0]);
+    if cmd != "pubkey" {
+        return None;
+    }
+    let session = taker.nacl.session(maker_nacl).unwrap();
+    let auth = Command::Encrypted {
+        name: "auth".into(),
+        ciphertext: session.encrypt(&podle.revelation()).unwrap(),
+    };
+    let out = maker.handle("J5taker", auth, chain, NOW);
+    let (cmd, ciphertext) = private(&out[0]);
+    (cmd == "ioauth").then(|| Ioauth::parse(&session.decrypt(ciphertext).unwrap()).unwrap())
+}
+
+#[test]
+fn coins_the_node_shows_spent_are_passed_over() {
+    let coins: Vec<OutPoint> = maker_coins().into_iter().map(|(coin, _)| coin).collect();
+    // Both of the maker's coins are unspent: the 500,000 covers a 200,000 round alone.
+    let (taker, chain) = new_taker();
+    let ioauth = auth_round(&mut funded_maker(), &taker, &chain, 200_000).unwrap();
+    assert_eq!(ioauth.utxos, vec![coins[0]]);
+
+    // The node shows the 500,000 spent (say, in a round this maker signed a moment ago, not yet in a
+    // block, so the wallet still lists it): the 300,000 is used instead.
+    let (taker, mut chain) = new_taker();
+    chain.utxos.remove(&coins[0]);
+    let ioauth = auth_round(&mut funded_maker(), &taker, &chain, 200_000).unwrap();
+    assert_eq!(ioauth.utxos, vec![coins[1]]);
+
+    // What is left cannot cover a 400,000 round: refused, rather than offering a spent coin.
+    assert!(auth_round(&mut funded_maker(), &taker, &chain, 400_000).is_none());
+    // With both unspent the same round takes both coins.
+    let (taker, chain) = new_taker();
+    let ioauth = auth_round(&mut funded_maker(), &taker, &chain, 500_000).unwrap();
+    assert_eq!(ioauth.utxos.len(), 2);
+}
+
+#[test]
+fn liquidity_and_offers_follow_the_wallet() {
+    let mut maker = funded_maker();
+    // One round spends from one mixdepth; both coins are in mixdepth 0.
+    assert_eq!(maker.liquidity().unwrap(), 800_000);
+    assert_eq!(maker.offers().len(), 1);
+
+    let offer = Offer::parse("sw0absoffer", "0 20000 700000 0 250").unwrap();
+    maker.set_offers(vec![offer.clone()]).unwrap();
+    assert_eq!(maker.offers(), [offer]);
+    // Another pit's offer is refused and changes nothing.
+    let other = Offer::parse("tr0absoffer", "0 20000 700000 0 250").unwrap();
+    assert!(maker.set_offers(vec![other]).is_err());
+    assert_eq!(maker.offers().len(), 1);
+    // No offers: nothing is said to a taker that asks.
+    maker.set_offers(Vec::new()).unwrap();
+    assert!(maker.on_orderbook("J5taker", "J5maker").is_empty());
 }
 
 #[test]

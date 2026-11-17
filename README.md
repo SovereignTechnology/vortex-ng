@@ -48,7 +48,7 @@ rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Ecl
 
 ## Command line
 
-`vortex-ng` so far has the wallet commands; the maker, taker and orderbook commands come with the daemon.
+`vortex-ng` has the wallet commands, `orderbook` and `maker`; the taker's `coinjoin` comes next.
 
 ```
 vortex-ng wallet new          --wallet <file> --network <network> [--words 12|24] [--birthday <height>]
@@ -57,7 +57,14 @@ vortex-ng wallet restore      --wallet <file> --network <network> [--mnemonic-fi
 vortex-ng wallet info         --wallet <file>
 vortex-ng wallet addresses    --wallet <file> [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--count <n>] [--change]
 vortex-ng wallet bond-address --wallet <file> --locktime <YYYY-MM>
+vortex-ng orderbook --network <network> --relays <url[,url...]> [--pit sw0|tr0|wsh0] [--wait <seconds>] [node]
+vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fraction> | --fee-abs <sats>)
+                    [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
+                    [--upkeep <seconds>]
 ```
+
+`node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
+`--rpc-password-file <file>`): a Bitcoin Core compatible node on the wallet's network.
 
 - The wallet file holds the seed words encrypted under a password (Argon2id, AES-256-GCM-SIV; the format is
   in `crates/vortex-ng-wallet/src/file.rs`). It is created with mode 0600 and never overwritten.
@@ -65,6 +72,13 @@ vortex-ng wallet bond-address --wallet <file> --locktime <YYYY-MM>
   read (`--password-file`, `--mnemonic-file`). They are never taken from the command line or the environment.
 - Networks: `regtest`, `signet`, `testnet4`, `testnet`. Mainnet wallets are refused in this pre-release.
 - The words restore in joinmarket-ng too: same derivation paths (see `vortex-ng-wallet`).
+- `maker` runs until stopped. Every `--upkeep` seconds (30 by default) it brings the wallet up to the chain's
+  tip and sizes its one offer to what the wallet can put into a round; it renews its announcement before it
+  expires and withdraws it when there is too little to offer. Coins the node already shows as spent are
+  never put into a round.
+- `orderbook` lists what the makers on the relays answer, and verifies their fidelity bonds when given a node.
+- **No Tor yet in these two commands**: they connect to the relays directly, so the relays see the machine's
+  address, and they say so when they start. The Tor transport exists in `vortex-ng-nostr` and is wired in next.
 
 ## Building
 

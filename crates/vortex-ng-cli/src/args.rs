@@ -90,6 +90,23 @@ impl Args {
             .ok_or_else(wrong)
     }
 
+    /// The value of `--name` as an amount in satoshis (at most 21 million coins), if given.
+    pub(crate) fn sats(&self, name: &str) -> Result<Option<u64>, String> {
+        const MAX: u64 = 21_000_000 * 100_000_000;
+        let Some(text) = self.get(name) else {
+            return Ok(None);
+        };
+        let wrong = || format!("`--{name}` is an amount in satoshis");
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(wrong());
+        }
+        text.parse()
+            .ok()
+            .filter(|sats| *sats <= MAX)
+            .map(Some)
+            .ok_or_else(wrong)
+    }
+
     /// Whether `--name` was given.
     pub(crate) fn flag(&self, name: &str) -> bool {
         self.flags.contains(&name)
@@ -140,6 +157,14 @@ mod tests {
         for count in ["0", "101", "+3", "3.0", "", "99999999999"] {
             let args = parse(&["--count", count]).unwrap();
             assert!(args.number("count", 10, 1..=100).is_err(), "{count}");
+        }
+        // Amounts go beyond 32 bits, and no further than there are coins.
+        let args = parse(&["--count", "2100000000000000"]).unwrap();
+        assert_eq!(args.sats("count"), Ok(Some(2_100_000_000_000_000)));
+        assert_eq!(args.sats("wallet"), Ok(None));
+        for sats in ["2100000000000001", "-1", "1.5", "1e8", ""] {
+            let args = parse(&["--count", sats]).unwrap();
+            assert!(args.sats("count").is_err(), "{sats}");
         }
     }
 }

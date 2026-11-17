@@ -17,18 +17,19 @@ use vortex_ng_core::bitcoin::Transaction;
 use vortex_ng_core::bitcoin::secp256k1::Secp256k1;
 use vortex_ng_core::command::{Command, ENCRYPTED, Outgoing, parse_plaintext};
 use vortex_ng_core::line::{PrivMsg, sign_line};
-use vortex_ng_core::offer::Offer;
-use vortex_ng_core::protocol::NOSTR_HOSTID;
+use vortex_ng_core::offer::{Offer, Pit};
+use vortex_ng_core::protocol::{MAKER_CHANGE_THRESHOLD_SAT, NOSTR_HOSTID};
 use vortex_ng_maker::Maker;
 use vortex_ng_nostr::ChannelError;
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
-use vortex_ng_nostr::event::{offer_event, public_event};
+use vortex_ng_nostr::event::{offer_deletion, offer_event, public_event};
 use vortex_ng_nostr::keys::{NickKeys, nostr_public};
 use vortex_ng_taker::{
     Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, select_makers,
     verify_bond,
 };
 use vortex_ng_wallet::PitWallet;
+use vortex_ng_wallet::sync::BlockSource;
 
 /// Lifetime of a maker's offer event, seconds.
 pub const OFFER_TTL: u64 = 1800;
@@ -313,69 +314,274 @@ pub async fn run_maker(
         let Some(incoming) = client.next(left).await else {
             break;
         };
-        let outgoing = match incoming {
-            Incoming::Public(author, cmds) => {
-                remember(&mut peers, &author.nick, &author.key, &author.relays);
-                let mut out = Vec::new();
-                for cmd in cmds {
-                    match cmd {
-                        Command::Orderbook if limiter.allow(&author.nick, Instant::now()) => {
-                            // A failed refresh keeps the current certificate while it lasts.
-                            let _ = blocking(|| maker.refresh_bond(chain, unix_now()));
-                            out.extend(maker.on_orderbook(&author.nick, &me));
-                        }
-                        Command::Hp2(c) => maker.on_hp2(c),
-                        _ => {}
-                    }
-                }
-                out
-            }
-            Incoming::Private(msg, reply_relays) => {
-                remember(&mut peers, &msg.from, &msg.key, &reply_relays);
-                let mut out = Vec::new();
-                for cmd in commands(&msg) {
-                    out.extend(blocking(|| maker.handle(&msg.from, cmd, chain, unix_now())));
-                }
-                out
-            }
-            Incoming::Offers(..) => Vec::new(),
-        };
+        let outgoing = maker_step(maker, chain, &mut peers, &mut limiter, &me, incoming);
         // A failed send to one taker must not stop the maker.
         let _ = deliver(client, network, &peers, chain, outgoing).await;
     }
     Ok(())
 }
 
-/// Run one CoinJoin as the taker: ask for the orderbook, gather the makers' private answers (offers and
-/// `!tbond` proofs; offer events serve only to discover makers that missed the request) for `gather`,
-/// verify the bonds, pick makers, run the round, and return the fully signed transaction (signed last,
-/// after every maker; channel funding hooks in before `Taker::finish`).
-pub async fn run_taker(
-    taker: &mut Taker,
-    wallet: &PitWallet,
-    client: &mut NickClient,
+/// What a maker does with one message from the channel: the answers to send.
+fn maker_step(
+    maker: &mut Maker,
     chain: &impl ChainLookup,
-    cfg: &TakerConfig,
-    gather: Duration,
-    until: Instant,
-) -> Result<Transaction, NodeError> {
-    let network = channel_network(cfg.network);
+    peers: &mut HashMap<String, Peer>,
+    limiter: &mut OrderbookLimiter,
+    me: &str,
+    incoming: Incoming,
+) -> Vec<Outgoing> {
+    match incoming {
+        Incoming::Public(author, cmds) => {
+            remember(peers, &author.nick, &author.key, &author.relays);
+            let mut out = Vec::new();
+            for cmd in cmds {
+                match cmd {
+                    Command::Orderbook if limiter.allow(&author.nick, Instant::now()) => {
+                        // A failed refresh keeps the current certificate while it lasts.
+                        let _ = blocking(|| maker.refresh_bond(chain, unix_now()));
+                        out.extend(maker.on_orderbook(&author.nick, me));
+                    }
+                    Command::Hp2(c) => maker.on_hp2(c),
+                    _ => {}
+                }
+            }
+            out
+        }
+        Incoming::Private(msg, reply_relays) => {
+            remember(peers, &msg.from, &msg.key, &reply_relays);
+            let mut out = Vec::new();
+            for cmd in commands(&msg) {
+                out.extend(blocking(|| maker.handle(&msg.from, cmd, chain, unix_now())));
+            }
+            out
+        }
+        Incoming::Offers(..) => Vec::new(),
+    }
+}
+
+/// What a maker charges for a round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OfferFee {
+    /// A fraction of the amount, as a decimal (`0.001`).
+    Relative(String),
+    /// Satoshis.
+    Absolute(u64),
+}
+
+/// How a long-running maker offers its coins: one offer, sized to the wallet at every upkeep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfferPolicy {
+    /// The coinjoin fee asked.
+    pub fee: OfferFee,
+    /// Our contribution to each round's mining fee, satoshis.
+    pub txfee: u64,
+    /// The smallest round we join, satoshis.
+    pub min_size: u64,
+    /// The largest round we join, satoshis; none: whatever the wallet allows.
+    pub max_size: Option<u64>,
+}
+
+impl OfferPolicy {
+    /// The offer of a `pit` maker whose wallet can put `liquidity` into one round, or `None` when that is
+    /// too little for the smallest round the policy allows (or the fee text is not a fee).
+    ///
+    /// Beyond the amount, a round takes our mining-fee share and must leave a change output no smaller
+    /// than the threshold makers keep; the fee we earn is not counted on. So the largest amount offered is
+    /// `liquidity - txfee - threshold`, capped by `max_size`.
+    pub fn offer(&self, pit: Pit, liquidity: u64) -> Option<Offer> {
+        let reserve = self.txfee.checked_add(MAKER_CHANGE_THRESHOLD_SAT)?;
+        let available = liquidity.checked_sub(reserve)?;
+        let max = self.max_size.map_or(available, |cap| cap.min(available));
+        if max == 0 || max < self.min_size {
+            return None;
+        }
+        let (kind, fee) = match &self.fee {
+            OfferFee::Relative(text) => ("reloffer", text.clone()),
+            OfferFee::Absolute(sats) => ("absoffer", sats.to_string()),
+        };
+        Offer::parse(
+            &format!("{}{kind}", pit.prefix()),
+            &format!("0 {} {max} {} {fee}", self.min_size, self.txfee),
+        )
+    }
+}
+
+/// The upkeep of a long-running maker.
+#[derive(Clone, Debug)]
+pub struct MakerService {
+    /// How it offers its coins.
+    pub policy: OfferPolicy,
+    /// The wallet's birthday: blocks below it are not scanned.
+    pub birthday: u32,
+    /// How often the wallet is brought up to the chain's tip and the offer sized to it.
+    pub upkeep: Duration,
+}
+
+/// What a long-running maker tells its operator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MakerReport {
+    /// The wallet is at `height` and `offer` is what is announced now (none: too little to offer).
+    Offering {
+        /// The height the wallet is synced to.
+        height: u32,
+        /// The most one round can draw on, satoshis.
+        liquidity: u64,
+        /// The announced offer.
+        offer: Option<Offer>,
+    },
+    /// An upkeep step failed; the maker carries on with what it had and tries again.
+    Trouble(String),
+}
+
+/// Run `maker` as a service until `until` (forever when `None`).
+///
+/// Unlike [`run_maker`], which serves fixed offers for one sitting, this keeps a maker fit to stay up:
+/// every `service.upkeep` it brings the wallet up to the chain's tip (so coins received in a round are
+/// offered once confirmed, and a round's spent coins are forgotten), refreshes the bond certificate, sizes
+/// its one offer to the wallet (`service.policy`), and publishes the offer event when the offer changed or
+/// half its lifetime has passed. When there is nothing to offer, the announced event is withdrawn with a
+/// deletion. Upkeep failures (the node is away, a relay refused) are reported and retried; they do not
+/// stop the maker.
+pub async fn serve_maker<C: ChainLookup + BlockSource>(
+    maker: &mut Maker,
+    client: &mut NickClient,
+    chain: &C,
+    network: &str,
+    service: &MakerService,
+    until: Option<Instant>,
+    report: &mut dyn FnMut(MakerReport),
+) -> Result<(), NodeError> {
     let me = client.keys().nick().to_string();
+    let pit = maker.pit();
+    let mut limiter = OrderbookLimiter::new();
+    client
+        .subscribe(unix_now().saturating_sub(60), false, true)
+        .await?;
+    let relays: Vec<String> = client.relays().to_vec();
+    let mut peers: HashMap<String, Peer> = HashMap::new();
+    // What is announced now, and when it was last published.
+    let mut announced: Option<(Option<Offer>, Instant)> = None;
+    let mut next_upkeep = Instant::now();
+    loop {
+        let now = Instant::now();
+        if until.is_some_and(|until| now >= until) {
+            return Ok(());
+        }
+        if now >= next_upkeep {
+            next_upkeep = now + service.upkeep;
+            let synced = blocking(|| {
+                let height = maker
+                    .wallet_mut()
+                    .sync(chain, service.birthday)
+                    .map_err(|e| e.to_string())?;
+                // A failed refresh keeps the current certificate while it lasts.
+                let _ = maker.refresh_bond(chain, unix_now());
+                let liquidity = maker.liquidity().map_err(|e| e.to_string())?;
+                Ok::<_, String>((height, liquidity))
+            });
+            match synced {
+                Err(why) => report(MakerReport::Trouble(why)),
+                Ok((height, liquidity)) => {
+                    let offer = service.policy.offer(pit, liquidity);
+                    let due = match &announced {
+                        None => true,
+                        Some((old, at)) => {
+                            *old != offer
+                                || (offer.is_some()
+                                    && at.elapsed() >= Duration::from_secs(OFFER_TTL / 2))
+                        }
+                    };
+                    if due {
+                        maker
+                            .set_offers(offer.iter().cloned().collect())
+                            .map_err(|e| NodeError::Maker(e.to_string()))?;
+                        let relay_refs: Vec<&str> = relays.iter().map(String::as_str).collect();
+                        let event = match (&offer, &announced) {
+                            (Some(_), _) => Some(offer_event(
+                                client.keys(),
+                                network,
+                                pit,
+                                maker.offers(),
+                                &[],
+                                &relay_refs,
+                                unix_now(),
+                                OFFER_TTL,
+                            )?),
+                            // Nothing to offer any more: withdraw what was announced.
+                            (None, Some((Some(_), _))) => {
+                                Some(offer_deletion(client.keys(), network, pit, unix_now())?)
+                            }
+                            (None, _) => None,
+                        };
+                        let published = match &event {
+                            Some(event) => client.publish(event).await,
+                            None => Ok(()),
+                        };
+                        match published {
+                            Ok(()) => {
+                                announced = Some((offer.clone(), Instant::now()));
+                                report(MakerReport::Offering {
+                                    height,
+                                    liquidity,
+                                    offer,
+                                });
+                            }
+                            // Not announced: the next upkeep tries again.
+                            Err(e) => report(MakerReport::Trouble(e.to_string())),
+                        }
+                    }
+                }
+            }
+        }
+        let mut wait = next_upkeep.saturating_duration_since(Instant::now());
+        if let Some(until) = until {
+            wait = wait.min(until.saturating_duration_since(Instant::now()));
+        }
+        let asked = Instant::now();
+        let Some(incoming) = client.next(wait).await else {
+            // A timeout is the next upkeep's turn. Anything sooner means the client has no live stream:
+            // pause rather than spin.
+            if asked.elapsed() < wait.min(Duration::from_millis(50)) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            continue;
+        };
+        let outgoing = maker_step(maker, chain, &mut peers, &mut limiter, &me, incoming);
+        // A failed send to one taker must not stop the maker.
+        let _ = deliver(client, network, &peers, chain, outgoing).await;
+    }
+}
+
+/// What makers answered to one `!orderbook` request.
+#[derive(Debug, Default)]
+pub struct Orderbook {
+    /// Every offer received, with its maker's nick, in arrival order.
+    pub offers: Vec<(String, Offer)>,
+    /// Each answering maker's `!tbond` proof, not yet verified (see [`verify_bond`]).
+    pub proofs: HashMap<String, String>,
+    peers: HashMap<String, Peer>,
+}
+
+/// Ask for the orderbook and gather the makers' private answers for `gather`: offers and `!tbond` proofs.
+/// Offer events serve only to discover makers that missed the request (it is then asked again).
+pub async fn fetch_orderbook(
+    client: &mut NickClient,
+    network: &str,
+    gather: Duration,
+) -> Result<Orderbook, NodeError> {
     client
         .subscribe(unix_now().saturating_sub(60), true, false)
         .await?;
     ask_orderbook(client, network).await?;
     let mut asked = Instant::now();
-    let mut offers: Vec<(String, Offer)> = Vec::new();
+    let mut book = Orderbook::default();
     let mut per_nick: HashMap<String, usize> = HashMap::new();
-    let mut proofs: HashMap<String, String> = HashMap::new();
-    let mut peers: HashMap<String, Peer> = HashMap::new();
     let gather_until = Instant::now() + gather;
     while let Some(left) = gather_until.checked_duration_since(Instant::now()) {
         match client.next(left).await {
             Some(Incoming::Offers(author, _)) => {
-                if peers.contains_key(&author.nick) || peers.len() < MAX_ANSWERING_NICKS {
-                    remember(&mut peers, &author.nick, &author.key, &author.relays);
+                if book.peers.contains_key(&author.nick) || book.peers.len() < MAX_ANSWERING_NICKS {
+                    remember(&mut book.peers, &author.nick, &author.key, &author.relays);
                 }
                 // The events are a discovery cache (the draft): a maker that has not answered may have
                 // subscribed after our request, so ask again.
@@ -396,23 +602,46 @@ pub async fn run_taker(
                             let count = per_nick.entry(msg.from.clone()).or_default();
                             if *count < MAX_OFFERS_PER_NICK {
                                 *count += 1;
-                                offers.push((msg.from.clone(), offer));
+                                book.offers.push((msg.from.clone(), offer));
                             }
                         }
                         Command::Tbond(proof) if per_nick.contains_key(&msg.from) => {
-                            proofs.entry(msg.from.clone()).or_insert(proof);
+                            book.proofs.entry(msg.from.clone()).or_insert(proof);
                         }
                         _ => {}
                     }
                 }
                 if per_nick.contains_key(&msg.from) {
-                    remember(&mut peers, &msg.from, &msg.key, &reply_relays);
+                    remember(&mut book.peers, &msg.from, &msg.key, &reply_relays);
                 }
             }
             Some(_) => {}
             None => break,
         }
     }
+    Ok(book)
+}
+
+/// Run one CoinJoin as the taker: ask for the orderbook, gather the makers' private answers (offers and
+/// `!tbond` proofs; offer events serve only to discover makers that missed the request) for `gather`,
+/// verify the bonds, pick makers, run the round, and return the fully signed transaction (signed last,
+/// after every maker; channel funding hooks in before `Taker::finish`).
+pub async fn run_taker(
+    taker: &mut Taker,
+    wallet: &PitWallet,
+    client: &mut NickClient,
+    chain: &impl ChainLookup,
+    cfg: &TakerConfig,
+    gather: Duration,
+    until: Instant,
+) -> Result<Transaction, NodeError> {
+    let network = channel_network(cfg.network);
+    let me = client.keys().nick().to_string();
+    let Orderbook {
+        offers,
+        proofs,
+        mut peers,
+    } = fetch_orderbook(client, network, gather).await?;
     let candidates = candidate_nicks(&offers, cfg);
     let bonds = blocking(|| verify_bonds(&proofs, &candidates, &me, chain, unix_now(), cfg));
     let chosen = select_makers(&offers, &bonds, cfg);

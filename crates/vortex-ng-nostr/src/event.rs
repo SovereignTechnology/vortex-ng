@@ -91,6 +91,28 @@ pub fn offer_event(
         .finalize(keys.nostr())?)
 }
 
+/// Withdraw a maker's offer event for one pit: a NIP-09 deletion naming the event's `a` coordinate
+/// (`31402:<author>:<network>:<pit>`), as the draft requires when the offers are cancelled.
+pub fn offer_deletion(
+    keys: &NickKeys,
+    network: &str,
+    pit: Pit,
+    now: u64,
+) -> Result<Event, ChannelError> {
+    let coordinate = format!(
+        "{KIND_OFFER}:{}:{network}:{}",
+        keys.nostr().public_key().to_hex(),
+        pit.prefix()
+    );
+    Ok(EventBuilder::new(Kind::EventDeletion, "")
+        .tags(vec![
+            tag(&["a", &coordinate])?,
+            tag(&["k", &KIND_OFFER.to_string()])?,
+        ])
+        .custom_created_at(Timestamp::from_secs(now))
+        .finalize(keys.nostr())?)
+}
+
 /// Build a public message (`!orderbook`, `!hp2 <c>`, `!cancel <oid>`).
 pub fn public_event(
     keys: &NickKeys,
@@ -253,6 +275,39 @@ mod tests {
             Offer::parse("sw0reloffer", "0 50000 10000000 0 0.00025").unwrap(),
             Offer::parse("sw0absoffer", "1 50000 10000000 0 250").unwrap(),
         ]
+    }
+
+    #[test]
+    fn an_offer_event_is_withdrawn_by_its_coordinate() {
+        let k = keys(1);
+        let event = offer_deletion(&k, "regtest", Pit::Tr0, NOW).unwrap();
+        event.verify().unwrap();
+        assert_eq!(event.kind, Kind::EventDeletion);
+        assert_eq!(event.pubkey, k.nostr().public_key());
+        assert_eq!(event.created_at.as_secs(), NOW);
+        assert_eq!(event.content, "");
+        // The coordinate of the offer event it deletes: kind, author, `d` tag.
+        let offer = offer_event(
+            &k,
+            "regtest",
+            Pit::Tr0,
+            &tr0_offers(),
+            &[],
+            &RELAYS,
+            NOW,
+            1800,
+        )
+        .unwrap();
+        assert_eq!(values(&offer, "d"), vec!["regtest:tr0"]);
+        assert_eq!(
+            values(&event, "a"),
+            vec![format!("31402:{}:regtest:tr0", offer.pubkey.to_hex())]
+        );
+        assert_eq!(values(&event, "k"), vec!["31402"]);
+    }
+
+    fn tr0_offers() -> Vec<Offer> {
+        vec![Offer::parse("tr0reloffer", "0 50000 10000000 0 0.00025").unwrap()]
     }
 
     #[test]

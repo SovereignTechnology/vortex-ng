@@ -285,6 +285,77 @@ fn pit_config() -> TakerConfig {
 }
 
 #[test]
+fn an_offer_is_sized_to_the_wallet() {
+    use vortex_ng_core::offer::{CjFee, RelativeFee};
+
+    let policy = OfferPolicy {
+        fee: OfferFee::Relative("0.001".into()),
+        txfee: 100,
+        min_size: 100_000,
+        max_size: None,
+    };
+    // What a round takes beyond its amount: our mining-fee share and the change we must keep.
+    let reserve = 100 + MAKER_CHANGE_THRESHOLD_SAT;
+    let offer = policy.offer(Pit::Sw0, 1_000_000).unwrap();
+    assert_eq!(offer.offer_type.command(), "sw0reloffer");
+    assert_eq!(
+        (offer.oid, offer.minsize, offer.maxsize, offer.txfee),
+        (0, 100_000, 1_000_000 - reserve, 100)
+    );
+    assert_eq!(
+        offer.cjfee,
+        CjFee::Relative(RelativeFee::parse("0.001").unwrap())
+    );
+
+    // Just enough for the smallest round, and one satoshi short of it.
+    let offer = policy.offer(Pit::Sw0, 100_000 + reserve).unwrap();
+    assert_eq!((offer.minsize, offer.maxsize), (100_000, 100_000));
+    assert_eq!(policy.offer(Pit::Sw0, 100_000 + reserve - 1), None);
+    assert_eq!(policy.offer(Pit::Sw0, 0), None);
+
+    // A cap holds the offer down but never above what the wallet has.
+    let capped = OfferPolicy {
+        max_size: Some(250_000),
+        ..policy.clone()
+    };
+    assert_eq!(capped.offer(Pit::Sw0, 1_000_000).unwrap().maxsize, 250_000);
+    assert_eq!(
+        capped.offer(Pit::Sw0, 200_000 + reserve).unwrap().maxsize,
+        200_000
+    );
+    let below_min = OfferPolicy {
+        max_size: Some(50_000),
+        ..policy.clone()
+    };
+    assert_eq!(below_min.offer(Pit::Sw0, 1_000_000), None);
+
+    // An absolute fee, in another pit.
+    let absolute = OfferPolicy {
+        fee: OfferFee::Absolute(500),
+        txfee: 0,
+        ..policy.clone()
+    };
+    let offer = absolute.offer(Pit::Tr0, 1_000_000).unwrap();
+    assert_eq!(offer.offer_type.command(), "tr0absoffer");
+    assert_eq!(offer.cjfee, CjFee::Absolute(500));
+    assert_eq!(offer.maxsize, 1_000_000 - MAKER_CHANGE_THRESHOLD_SAT);
+
+    // A fee that is not a fee, and a mining-fee share no wallet could cover, give no offer.
+    for fee in ["-0.001", "free", ""] {
+        let nonsense = OfferPolicy {
+            fee: OfferFee::Relative(fee.into()),
+            ..policy.clone()
+        };
+        assert_eq!(nonsense.offer(Pit::Sw0, 1_000_000), None, "{fee}");
+    }
+    let greedy = OfferPolicy {
+        txfee: u64::MAX,
+        ..policy
+    };
+    assert_eq!(greedy.offer(Pit::Sw0, u64::MAX), None);
+}
+
+#[test]
 fn bond_lookups_are_bounded_and_only_for_candidates() {
     use std::sync::atomic::Ordering::SeqCst;
     use vortex_ng_core::bitcoin::secp256k1::{Secp256k1, SecretKey};

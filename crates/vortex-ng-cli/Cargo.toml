@@ -14,9 +14,18 @@ workspace = true
 [dependencies]
 vortex-ng-core = { workspace = true }
 vortex-ng-wallet = { workspace = true }
+vortex-ng-chain = { workspace = true }
+vortex-ng-nostr = { workspace = true }
+vortex-ng-maker = { workspace = true }
+vortex-ng-taker = { workspace = true }
+vortex-ng-node = { workspace = true }
+tokio = { workspace = true }
 zeroize = { workspace = true }
 rustix = { workspace = true }
 
 [[bin]]
 name = "vortex-ng"
 path = "src/main.rs"
+
+[dev-dependencies]
+nostr-sdk = { workspace = true, features = ["local-relay"] }

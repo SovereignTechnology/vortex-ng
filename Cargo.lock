@@ -5742,8 +5742,15 @@ dependencies = [
 name = "vortex-ng-cli"
 version = "0.0.1"
 dependencies = [
+ "nostr-sdk",
  "rustix",
+ "tokio",
+ "vortex-ng-chain",
  "vortex-ng-core",
+ "vortex-ng-maker",
+ "vortex-ng-node",
+ "vortex-ng-nostr",
+ "vortex-ng-taker",
  "vortex-ng-wallet",
  "zeroize",
 ]

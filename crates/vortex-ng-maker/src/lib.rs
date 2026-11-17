@@ -130,6 +130,9 @@ pub const MAX_SESSIONS: usize = 64;
 /// finished rounds cannot fill the table.
 pub const SESSION_TTL: u64 = 300;
 
+/// Most of our UTXOs looked up on the node while picking coins for one fill.
+pub const MAX_SELECT_LOOKUPS: usize = 64;
+
 /// The fixed error text a refused taker sees.
 pub const ERROR_TEXT: &str = "coinjoin refused";
 
@@ -397,7 +400,7 @@ impl Maker {
             .ok_or(MakerError::Offer("amount out of range"))?;
         let needed =
             (filled.amount + filled.offer.txfee + MAKER_CHANGE_THRESHOLD_SAT).saturating_sub(cjfee);
-        let (mixdepth, selected) = self.select(needed)?;
+        let (mixdepth, selected) = self.select(needed, chain)?;
         let cj = self
             .wallet
             .next_receive_address((mixdepth + 1) % MIXDEPTHS)
@@ -452,13 +455,11 @@ impl Maker {
         ])
     }
 
-    /// Pick the mixdepth with the most confirmed value that covers `needed`, and its largest confirmed
-    /// UTXOs until they do.
-    fn select(
+    /// Confirmed UTXOs per mixdepth, largest first, with each mixdepth's total.
+    fn confirmed(
         &self,
-        needed: u64,
-    ) -> Result<(u32, Vec<vortex_ng_wallet::bdk_wallet::LocalOutput>), MakerError> {
-        let mut best: Option<(u64, u32, Vec<_>)> = None;
+    ) -> Result<Vec<(u64, u32, Vec<vortex_ng_wallet::bdk_wallet::LocalOutput>)>, MakerError> {
+        let mut all = Vec::new();
         for m in 0..MIXDEPTHS {
             let mut utxos: Vec<_> = self
                 .wallet
@@ -467,23 +468,72 @@ impl Maker {
                 .into_iter()
                 .filter(|u| u.chain_position.is_confirmed())
                 .collect();
-            let total: u64 = utxos.iter().map(|u| u.txout.value.to_sat()).sum();
-            if total >= needed && best.as_ref().is_none_or(|(t, _, _)| total > *t) {
-                utxos.sort_by_key(|u| std::cmp::Reverse(u.txout.value));
-                best = Some((total, m, utxos));
-            }
+            utxos.sort_by_key(|u| std::cmp::Reverse(u.txout.value));
+            let total = utxos.iter().map(|u| u.txout.value.to_sat()).sum();
+            all.push((total, m, utxos));
         }
-        let (_, m, utxos) = best.ok_or(MakerError::Liquidity)?;
-        let mut picked = Vec::new();
-        let mut sum = 0u64;
-        for u in utxos {
+        Ok(all)
+    }
+
+    /// The most one round can draw on: the largest confirmed total of any one mixdepth (a round spends
+    /// from a single mixdepth). What the wallet knows, without asking the node.
+    pub fn liquidity(&self) -> Result<u64, MakerError> {
+        Ok(self
+            .confirmed()?
+            .into_iter()
+            .map(|(total, _, _)| total)
+            .max()
+            .unwrap_or(0))
+    }
+
+    /// Replace our offers (all of the wallet's pit; none withdraws them). Sessions already filled keep the
+    /// offer they were filled on.
+    pub fn set_offers(&mut self, offers: Vec<Offer>) -> Result<(), MakerError> {
+        if offers.iter().any(|o| o.offer_type.pit != self.wallet.pit()) {
+            return Err(MakerError::Offer("offers must be of the wallet's pit"));
+        }
+        self.config.offers = offers;
+        Ok(())
+    }
+
+    /// Pick confirmed UTXOs that cover `needed` from one mixdepth: the mixdepth with the most confirmed
+    /// value first, its largest UTXOs first.
+    ///
+    /// A UTXO the node no longer has unspent (mempool included) is passed over. The wallet learns of a
+    /// spend only when its block arrives, so a maker that has just signed a round would otherwise put the
+    /// same coins into the next taker's round, which then cannot confirm. At most [`MAX_SELECT_LOOKUPS`]
+    /// UTXOs are looked up per fill.
+    fn select(
+        &self,
+        needed: u64,
+        chain: &impl Chain,
+    ) -> Result<(u32, Vec<vortex_ng_wallet::bdk_wallet::LocalOutput>), MakerError> {
+        let mut ranked: Vec<_> = self
+            .confirmed()?
+            .into_iter()
+            .filter(|(total, _, _)| *total >= needed)
+            .collect();
+        ranked.sort_by_key(|(total, _, _)| std::cmp::Reverse(*total));
+        let mut lookups = 0;
+        for (_, m, utxos) in ranked {
+            let mut picked = Vec::new();
+            let mut sum = 0u64;
+            for u in utxos {
+                if sum >= needed || lookups >= MAX_SELECT_LOOKUPS {
+                    break;
+                }
+                lookups += 1;
+                if !matches!(chain.utxo(&u.outpoint), Ok(Some(_))) {
+                    continue;
+                }
+                sum += u.txout.value.to_sat();
+                picked.push(u);
+            }
             if sum >= needed {
-                break;
+                return Ok((m, picked));
             }
-            sum += u.txout.value.to_sat();
-            picked.push(u);
         }
-        Ok((m, picked))
+        Err(MakerError::Liquidity)
     }
 
     fn on_tx(

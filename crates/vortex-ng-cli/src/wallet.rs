@@ -12,11 +12,11 @@ use zeroize::Zeroizing;
 use crate::args::Args;
 use crate::{Failure, secret};
 
-fn failed(why: impl std::fmt::Display) -> Failure {
+pub(crate) fn failed(why: impl std::fmt::Display) -> Failure {
     Failure::Failed(why.to_string())
 }
 
-fn parse(
+pub(crate) fn parse(
     rest: &[String],
     valued: &[&'static str],
     flags: &[&'static str],
@@ -37,7 +37,7 @@ pub(crate) fn run(command: &str, rest: &[String]) -> Result<(), Failure> {
 }
 
 /// The network as people name it.
-fn network_name(network: Network) -> &'static str {
+pub(crate) fn network_name(network: Network) -> &'static str {
     match network.to_core_arg() {
         "main" => "mainnet",
         "test" => "testnet",
@@ -46,7 +46,7 @@ fn network_name(network: Network) -> &'static str {
 }
 
 /// The network `--network` names. Mainnet is refused: this is a pre-release.
-fn network(args: &Args) -> Result<Network, Failure> {
+pub(crate) fn network(args: &Args) -> Result<Network, Failure> {
     let core = match args.required("network").map_err(Failure::Usage)? {
         "mainnet" | "bitcoin" => "main",
         "testnet" | "testnet3" => "test",
@@ -92,7 +92,7 @@ fn create(path: &Path, wallet: &WalletFile, password: &str) -> Result<(), Failur
 }
 
 /// Open the wallet `--wallet` names, asking for its password only once the file looks like a wallet.
-fn open(args: &Args) -> Result<WalletFile, Failure> {
+pub(crate) fn open(args: &Args) -> Result<WalletFile, Failure> {
     let path = args.required("wallet").map_err(Failure::Usage)?;
     let here = |e: &dyn std::fmt::Display| failed(format!("{path}: {e}"));
     let text = file::read(Path::new(path)).map_err(|e| here(&e))?;
@@ -199,18 +199,23 @@ fn info(rest: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The pit `--pit` names (`sw0` when not given), with its name.
+pub(crate) fn pit(args: &Args) -> Result<(Pit, &'static str), Failure> {
+    match args.get("pit").unwrap_or("sw0") {
+        "sw0" => Ok((Pit::Sw0, "sw0")),
+        "tr0" => Ok((Pit::Tr0, "tr0")),
+        "wsh0" => Ok((Pit::Wsh0, "wsh0")),
+        _ => Err(Failure::Usage("`--pit` is sw0, tr0 or wsh0".into())),
+    }
+}
+
 fn addresses(rest: &[String]) -> Result<(), Failure> {
     let args = parse(
         rest,
         &["wallet", "pit", "mixdepth", "count", "password-file"],
         &["change"],
     )?;
-    let (pit, pit_name) = match args.get("pit").unwrap_or("sw0") {
-        "sw0" => (Pit::Sw0, "sw0"),
-        "tr0" => (Pit::Tr0, "tr0"),
-        "wsh0" => (Pit::Wsh0, "wsh0"),
-        _ => return Err(Failure::Usage("`--pit` is sw0, tr0 or wsh0".into())),
-    };
+    let (pit, pit_name) = pit(&args)?;
     let mixdepth = args
         .number("mixdepth", 0, 0..=MIXDEPTHS - 1)
         .map_err(Failure::Usage)?;
