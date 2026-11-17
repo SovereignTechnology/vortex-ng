@@ -47,6 +47,18 @@ pub fn timenumber_locktime(n: u32) -> Option<u32> {
     u32::try_from(days_from_civil(year, month, 1) * 86_400).ok()
 }
 
+/// The timenumber of the month `year`-`month` (January 2020 is 0), if it is one of the 960.
+pub fn timenumber_of(year: u32, month: u32) -> Option<u32> {
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let n = year
+        .checked_sub(2020)?
+        .checked_mul(12)?
+        .checked_add(month - 1)?;
+    (n < TIMENUMBER_COUNT).then_some(n)
+}
+
 /// Interest rate and exponent of the bond value formula (joinmarket-ng defaults 0.015 and 1.3).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BondValueParams {
@@ -492,6 +504,13 @@ mod tests {
             assert_eq!(timenumber_locktime(n), Some(ts), "{n}");
         }
         assert_eq!(timenumber_locktime(TIMENUMBER_COUNT), None);
+        // And back, from a calendar month.
+        assert_eq!(timenumber_of(2020, 1), Some(0));
+        assert_eq!(timenumber_of(2026, 1), Some(72));
+        assert_eq!(timenumber_of(2099, 12), Some(TIMENUMBER_COUNT - 1));
+        for (year, month) in [(2019, 12), (2100, 1), (2030, 0), (2030, 13), (u32::MAX, 1)] {
+            assert_eq!(timenumber_of(year, month), None, "{year}-{month}");
+        }
     }
 
     #[test]

@@ -46,6 +46,26 @@ M0 bootstrap + specs · M1 core (all pits, PoDLE, bonds, codec, test vectors) ·
 with joinmarket-ng · M3 `tr0` · M4 Lightning backends, `wsh0`, channel-funding outputs · M5 tumbler, channel
 rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Eclair and ldk-node upstream.
 
+## Command line
+
+`vortex-ng` so far has the wallet commands; the maker, taker and orderbook commands come with the daemon.
+
+```
+vortex-ng wallet new          --wallet <file> --network <network> [--words 12|24] [--birthday <height>]
+vortex-ng wallet restore      --wallet <file> --network <network> [--mnemonic-file <file>]
+                              [--bip39-passphrase | --bip39-passphrase-file <file>] [--birthday <height>]
+vortex-ng wallet info         --wallet <file>
+vortex-ng wallet addresses    --wallet <file> [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--count <n>] [--change]
+vortex-ng wallet bond-address --wallet <file> --locktime <YYYY-MM>
+```
+
+- The wallet file holds the seed words encrypted under a password (Argon2id, AES-256-GCM-SIV; the format is
+  in `crates/vortex-ng-wallet/src/file.rs`). It is created with mode 0600 and never overwritten.
+- Passwords and seed words are asked on the terminal without echo, or read from a file only its owner can
+  read (`--password-file`, `--mnemonic-file`). They are never taken from the command line or the environment.
+- Networks: `regtest`, `signet`, `testnet4`, `testnet`. Mainnet wallets are refused in this pre-release.
+- The words restore in joinmarket-ng too: same derivation paths (see `vortex-ng-wallet`).
+
 ## Building
 
 Rust 1.98 (pinned in `rust-toolchain.toml`). `cargo test --workspace`.

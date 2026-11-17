@@ -21,6 +21,7 @@ use bdk_wallet::{KeychainKind, LocalOutput, Wallet};
 use vortex_ng_core::offer::Pit;
 
 pub mod bonds;
+pub mod file;
 pub mod keys;
 pub mod sign;
 pub mod sync;
@@ -41,6 +42,10 @@ pub enum WalletError {
     Mixdepth(u32),
     /// A block does not connect to the wallet's chain (reorg or gap).
     CannotConnect(String),
+    /// A wallet file is malformed, or cannot be written.
+    File(String),
+    /// The wallet file did not open: the password is wrong, or the file was changed.
+    Password,
 }
 
 impl std::fmt::Display for WalletError {
@@ -50,6 +55,8 @@ impl std::fmt::Display for WalletError {
             WalletError::Descriptor(e) => write!(f, "descriptor: {e}"),
             WalletError::Mixdepth(m) => write!(f, "no mixdepth {m}"),
             WalletError::CannotConnect(e) => write!(f, "block does not connect: {e}"),
+            WalletError::File(e) => write!(f, "wallet file: {e}"),
+            WalletError::Password => write!(f, "wrong password, or the wallet file was changed"),
         }
     }
 }

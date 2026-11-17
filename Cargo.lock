@@ -5742,7 +5742,10 @@ dependencies = [
 name = "vortex-ng-cli"
 version = "0.0.1"
 dependencies = [
+ "rustix",
  "vortex-ng-core",
+ "vortex-ng-wallet",
+ "zeroize",
 ]
 
 [[package]]
@@ -5834,9 +5837,13 @@ dependencies = [
 name = "vortex-ng-wallet"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm-siv",
+ "argon2",
  "bdk_wallet",
+ "serde_json",
  "vortex-ng-chain",
  "vortex-ng-core",
+ "zeroize",
 ]
 
 [[package]]

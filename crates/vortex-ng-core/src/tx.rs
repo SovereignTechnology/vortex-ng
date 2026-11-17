@@ -240,6 +240,14 @@ pub fn random_u64() -> u64 {
     crypto_box::aead::OsRng.next_u64()
 }
 
+/// `N` uniformly random bytes from the operating system.
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    use crypto_box::aead::rand_core::RngCore;
+    let mut out = [0u8; N];
+    crypto_box::aead::OsRng.fill_bytes(&mut out);
+    out
+}
+
 /// Shuffle in place with OS randomness (Fisher-Yates), for input and output order.
 pub fn shuffle<T>(items: &mut [T]) {
     use crypto_box::aead::rand_core::RngCore;

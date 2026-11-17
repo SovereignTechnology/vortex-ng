@@ -58,6 +58,12 @@ futures = "0.3"
 # with crypto_box and nostr.
 tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["connect", "handshake"] }
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
+# Wipes secrets (seed words, passwords, derived keys) from memory when dropped. Already in the tree through
+# the crypto crates.
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
+# Terminal modes without unsafe code, for a password prompt that does not echo. Already in the tree (tokio's
+# and arti's file handling); the `termios` feature adds no crate.
+rustix = { version = "1.1.6", default-features = false, features = ["std", "termios"] }
 aes-gcm-siv = { version = "=0.11.1", default-features = false, features = ["aes", "alloc"] }
 # Tor in-process (feature `tor` of vortex-ng-nostr). 0.47.0 (2026-10-01): newest release at least 7 days old.
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
@@ -79,5 +85,12 @@ expect_used = "warn"
 [profile.dev]
 debug = "line-tables-only"
 
+# Argon2 at the wallet file's cost (64 MiB, 3 passes) takes seconds unoptimized, and tests open several files.
+[profile.dev.package.argon2]
+opt-level = 3
+
 [profile.test]
 debug = "line-tables-only"
+
+[profile.test.package.argon2]
+opt-level = 3

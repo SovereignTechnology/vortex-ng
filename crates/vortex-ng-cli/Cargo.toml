@@ -13,6 +13,9 @@ workspace = true
 
 [dependencies]
 vortex-ng-core = { workspace = true }
+vortex-ng-wallet = { workspace = true }
+zeroize = { workspace = true }
+rustix = { workspace = true }
 
 [[bin]]
 name = "vortex-ng"
