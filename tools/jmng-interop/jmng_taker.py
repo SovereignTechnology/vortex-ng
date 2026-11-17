@@ -2,11 +2,13 @@
 
 Run by run.sh inside the VM, with joinmarket-ng installed:
 
-    python3 jmng_taker.py <relay url> <rpc url> <cookie file> <data dir>
+    python3 jmng_taker.py <relay url> <rpc url> <cookie file> <data dir> [bonds: 1|0]
 
 It uses joinmarket-ng's own regtest test wallet for the taker, Bitcoin Core's wallet backend, and the
-relay as the only message channel. Like joinmarket-ng's own end-to-end tests it lets makers without a
-fidelity bond charge a fee. It never broadcasts the transaction itself (`not-self`): it sends `!push` to
+relay as the only message channel. With bonds (1) it keeps joinmarket-ng's default policy: a maker that
+charges a fee is chosen only if its fidelity bond verifies, so the makers' `!tbond` proofs must pass
+joinmarket-ng's own checks. Without (0), like joinmarket-ng's own end-to-end tests, it lets makers without a
+bond charge a fee. It never broadcasts the transaction itself (`not-self`): it sends `!push` to
 the makers, so the round reaches the node only if one of them broadcasts it. Prints `JMNG_TXID=<txid>`.
 """
 
@@ -21,6 +23,7 @@ AMOUNT = 1_000_000
 
 async def main() -> int:
     relay, rpc_url, cookie_file, data = sys.argv[1:5]
+    bonds = len(sys.argv) > 5 and sys.argv[5] == "1"
     user, password = Path(cookie_file).read_text().strip().split(":", 1)
 
     from jmcore.models import NetworkType
@@ -50,7 +53,7 @@ async def main() -> int:
         minimum_makers=2,
         maker_timeout_sec=60,
         order_wait_time=20.0,
-        bondless_makers_allowance_require_zero_fee=False,
+        bondless_makers_allowance_require_zero_fee=bonds,
         max_cj_fee=MaxCjFee(abs_fee=10_000, rel_fee="0.01"),
         tx_broadcast=BroadcastPolicy.NOT_SELF,
         data_dir=data_dir,
@@ -62,6 +65,8 @@ async def main() -> int:
         txid = await asyncio.wait_for(
             taker.do_coinjoin(amount=AMOUNT, destination=destination, mixdepth=0), 600
         )
+        for offer in getattr(taker.orderbook_manager, "offers", []) or []:
+            print(f"offer from {offer.counterparty}: bond value {getattr(offer, 'fidelity_bond_value', 0)}")
     finally:
         await taker.stop()
         await wallet.close()

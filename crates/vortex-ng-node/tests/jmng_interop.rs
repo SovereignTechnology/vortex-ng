@@ -39,12 +39,20 @@ const AMOUNT: u64 = 1_000_000;
 /// What the vortex-ng makers charge and contribute to the mining fee.
 const CJFEE: u64 = 500;
 const TXFEE: u64 = 100;
+/// joinmarket-ng's test bonds are locked until 2099-12-01 (its `--fidelity-bond-locktime 4099766400`):
+/// timenumber 959.
+const JMNG_BOND_TIMENUMBER: u32 = 959;
+/// The vortex-ng makers' bonds are locked until January 2030.
+const BOND_TIMENUMBER: u32 = 120;
 
 struct Harness {
     dir: PathBuf,
     url: String,
     cookie: PathBuf,
     makers: usize,
+    /// `VORTEX_NG_INTEROP_BONDS=1`: every maker holds a fidelity bond, and takers accept a maker that
+    /// charges a fee only if its bond verifies.
+    bonds: bool,
 }
 
 impl Harness {
@@ -61,6 +69,7 @@ impl Harness {
                 .ok()
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(2),
+            bonds: std::env::var("VORTEX_NG_INTEROP_BONDS").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -121,16 +130,39 @@ async fn taker_with_joinmarket_ng_makers() {
     // The relay both sides meet on.
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
-    std::fs::write(harness.dir.join("relay.url"), &url).unwrap();
-    println!("relay at {url}");
 
-    // Our coin: a coinbase, matured.
+    // Our coin: a coinbase. With bonds, a coinbase to each joinmarket-ng maker's bond address too: derived
+    // here from its mnemonic (VORTEX_NG_INTEROP_BOND_MNEMONICS, `|`-separated), which also checks our
+    // derivation of joinmarket's bond path against the address joinmarket-ng's own funding script uses.
     let mut taker_wallet = wallet("interop-taker");
     let sink = wallet("interop-sink").next_receive_address(0).unwrap();
     rpc.generate_to_address(1, &taker_wallet.next_receive_address(0).unwrap())
         .unwrap();
+    if harness.bonds {
+        let mnemonics = std::env::var("VORTEX_NG_INTEROP_BOND_MNEMONICS").expect("bond mnemonics");
+        for (i, mnemonic) in mnemonics.split('|').enumerate() {
+            let seed = Seed::from_mnemonic(mnemonic.trim(), "", Network::Regtest).unwrap();
+            let bond = PitWallet::new(&seed, Pit::Sw0)
+                .unwrap()
+                .bond_address(JMNG_BOND_TIMENUMBER)
+                .unwrap();
+            if let Ok(expected) = std::env::var(format!("VORTEX_NG_INTEROP_BOND_ADDRESS_{i}")) {
+                assert_eq!(
+                    bond.to_string(),
+                    expected,
+                    "bond address of joinmarket-ng maker {i}"
+                );
+                println!("bond address of maker {i} matches joinmarket-ng's");
+            }
+            rpc.generate_to_address(1, &bond).unwrap();
+        }
+    }
     rpc.generate_to_address(100, &sink).unwrap();
     taker_wallet.sync(&rpc, 0).unwrap();
+
+    // Everything the makers need is on the chain: tell the harness where to send them.
+    std::fs::write(harness.dir.join("relay.url"), &url).unwrap();
+    println!("relay at {url}");
 
     wait_for_makers(&url, harness.makers, Duration::from_secs(900)).await;
 
@@ -145,8 +177,9 @@ async fn taker_with_joinmarket_ng_makers() {
         fee_rate_sat_per_kwu: 2_500,
         max_maker_utxos: 20,
         bondless_makers_allowance: DEFAULT_BONDLESS_ALLOWANCE,
-        // The harness's makers have no fidelity bond and charge a fee.
-        bondless_require_zero_fee: false,
+        // The makers charge a fee. With bonds they are chosen only if their `!tbond` proofs verify
+        // against the node (joinmarket-ng's default policy); without, the rule is off.
+        bondless_require_zero_fee: harness.bonds,
         bond_params: Default::default(),
     };
     let cj = taker_wallet
@@ -248,12 +281,17 @@ async fn makers_with_joinmarket_ng_taker() {
     for w in &mut wallets {
         rpc.generate_to_address(1, &w.next_receive_address(0).unwrap())
             .unwrap();
+        if harness.bonds {
+            rpc.generate_to_address(1, &w.bond_address(BOND_TIMENUMBER).unwrap())
+                .unwrap();
+        }
     }
     let sink = wallet("interop-sink").next_receive_address(0).unwrap();
     rpc.generate_to_address(100, &sink).unwrap();
     let mut before = Vec::new();
     for w in &mut wallets {
         w.sync(&rpc, 0).unwrap();
+        assert_eq!(w.bonds().len(), usize::from(harness.bonds));
         before.push(total(w));
     }
 

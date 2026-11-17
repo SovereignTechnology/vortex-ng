@@ -12,6 +12,9 @@
 # rounds, each on a relay run by vortex-ng's test crates/vortex-ng-node/tests/jmng_interop.rs:
 #   A. joinmarket-ng's two test makers (`jm-maker start`, Core's wallet backend, the relay as their only
 #      message channel) and a vortex-ng taker, which does a sw0 round with them and checks it on the node;
+# With BONDS=1 (the default) every maker holds a fidelity bond and each taker runs joinmarket-ng's default
+# policy (a maker that charges a fee is chosen only if its bond verifies), so each side must verify the other's
+# `!tbond` proofs; BONDS=0 turns bonds and that rule off.
 #   B. two vortex-ng makers and joinmarket-ng's taker (jmng_taker.py, through joinmarket-ng's own API),
 #      which does a sw0 round with them and asks them to broadcast it (`!push`, never itself); vortex-ng
 #      then checks the transaction and its makers' wallets.
@@ -22,6 +25,10 @@ VORTEX_NG_COMMIT=${VORTEX_NG_COMMIT:?set VORTEX_NG_COMMIT to the vortex-ng commi
 CORE_VERSION=32.1
 CORE_SHA256=61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963
 PORT=18443
+BONDS=${BONDS:-1}
+# joinmarket-ng's test bond: locked until 2099-12-01, at index 0; maker1's address as its funding script has it.
+BOND_LOCKTIME=4099766400
+MAKER1_BOND_ADDRESS=bcrt1q7yv9xfz7vt5nn3nmpnrh899sxs5s9jnlqe94e8xx4jxc55xhtxcq0dgjy6
 # joinmarket-ng's own regtest test wallets (docker-compose.yml maker1, maker2; scripts/fund-test-wallets.sh).
 MAKER_MNEMONICS=(
   "avoid whisper mesh corn already blur sudden fine planet chicken hover sniff"
@@ -99,16 +106,18 @@ echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcou
 # The vortex-ng side of a round: the relay plus the taker or the makers. Prints the relay URL once it is up.
 vortex_pid=
 start_vortex() {  # $1 = role, $2 = its directory
-  (cd "$work/vortex-ng" && VORTEX_NG_INTEROP_ROLE="$1" VORTEX_NG_INTEROP_DIR="$2" \
+  (cd "$work/vortex-ng" && VORTEX_NG_INTEROP_ROLE="$1" VORTEX_NG_INTEROP_DIR="$2" VORTEX_NG_INTEROP_BONDS="$BONDS" \
+    VORTEX_NG_INTEROP_BOND_MNEMONICS="${MAKER_MNEMONICS[0]}|${MAKER_MNEMONICS[1]}" \
+    VORTEX_NG_INTEROP_BOND_ADDRESS_0="$MAKER1_BOND_ADDRESS" \
     VORTEX_NG_INTEROP_MAKERS=${#MAKER_ADDRESSES[@]} VORTEX_NG_REGTEST_RPC="http://127.0.0.1:$PORT" \
     VORTEX_NG_REGTEST_COOKIE="$cookie" \
     cargo test --locked -p vortex-ng-node --test jmng_interop -- --nocapture >"$logs/vortex-$1.log" 2>&1) &
   vortex_pid=$!
   pids+=("$vortex_pid")
-  for _ in $(seq 1 300); do [ -s "$2/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
+  for _ in $(seq 1 600); do [ -s "$2/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
   [ -s "$2/relay.url" ] || { echo "vortex-ng ($1) did not start its relay"; show "$logs/vortex-$1.log" 40; return 1; }
 }
-report() { grep -E 'relay at|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
+report() { grep -E 'relay at|maker .* (announced|nick)|bond address|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
 
 # ---- A: joinmarket-ng makers, vortex-ng taker ------------------------------------------------------------
 rc_a=0
@@ -121,13 +130,20 @@ if [ "$rc_a" -eq 0 ]; then
     i=$((i + 1))
     home=$work/maker$i
     mkdir -p "$home"
+    bond_args=()
+    bond_env=()
+    if [ "$BONDS" = 1 ]; then  # as joinmarket-ng's compose runs its bonded maker: locktime given, no registry
+      bond_args=(--fidelity-bond-locktime "$BOND_LOCKTIME")
+      bond_env=("MAKER__FIDELITY_BOND_LOCKTIMES=$BOND_LOCKTIME" FIDELITY_BOND_INDEX=0)
+    fi
+    env "${bond_env[@]}" \
     HOME="$home" JOINMARKET_DATA_DIR="$home/.joinmarket-ng" MNEMONIC="$mnemonic" \
       NETWORK_CONFIG__NETWORK=regtest NETWORK_CONFIG__BITCOIN_NETWORK=regtest \
       NETWORK_CONFIG__ALLOW_CLEARNET_CONNECTIONS=true DIRECTORY_SERVERS="nostr:$relay" \
       BITCOIN__BACKEND_TYPE=descriptor_wallet BITCOIN__RPC_URL="http://127.0.0.1:$PORT" \
       BITCOIN__RPC_COOKIE_FILE="$cookie" TOR__CONTROL_ENABLED=false LOGGING__LEVEL=DEBUG \
       MAKER__MIN_SIZE=10000 MAKER__TX_FEE_CONTRIBUTION=500 MAKER__CJ_FEE_RELATIVE=0.001 \
-      jm-maker start >"$logs/maker$i.log" 2>&1 &
+      jm-maker start "${bond_args[@]}" >"$logs/maker$i.log" 2>&1 &
     maker_pids+=($!)
     pids+=($!)
   done
@@ -142,6 +158,7 @@ else
   echo "txid $(cat "$work/a/taker.txid") at height $(cli getblockcount)"
   # joinmarket-ng's makers publish the taker's PoDLE commitment (!hp2) from a throwaway nick after !ioauth.
   for n in 1 2; do
+    grep -E 'bond_value=|No fidelity bond found|fidelity bond.*(found|loaded)' "$logs/maker$n.log" | tail -2 | cut -c1-260 || true
     echo "maker$n !hp2: $(grep -c 'CoinJoin message sent: command=!hp2' "$logs/maker$n.log") sent," \
       "$(grep -c 'Could not connect to any directory for ephemeral hp2 broadcast' "$logs/maker$n.log") could not connect"
   done
@@ -155,7 +172,7 @@ if [ "$rc_b" -eq 0 ]; then
   relay=$(cat "$work/b/relay.url")
   sleep 5  # the makers publish their offers right after the relay URL is written
   HOME="$work/taker" python3 "$here/jmng_taker.py" "$relay" "http://127.0.0.1:$PORT" "$cookie" \
-    "$work/taker/.joinmarket-ng" >"$logs/jmng-taker.log" 2>&1 || rc_b=$?
+    "$work/taker/.joinmarket-ng" "$BONDS" >"$logs/jmng-taker.log" 2>&1 || rc_b=$?
   txid=$(sed -n 's/^JMNG_TXID=//p' "$logs/jmng-taker.log" | tail -1)
   if [ "$rc_b" -eq 0 ] && [ -n "$txid" ] && [ "$txid" != None ]; then
     # The makers broadcast it: it must be in the node's mempool before a block can take it.
@@ -176,6 +193,7 @@ if [ "$rc_b" -ne 0 ]; then
   show "$logs/vortex-makers.log" 30
 else
   echo "txid $txid at height $(cli getblockcount)"
+  grep -E -i 'bond' "$logs/jmng-taker.log" | grep -v -E 'utxo_metadata|registry' | tail -6 | cut -c1-260 || true
 fi
 
 [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] && { echo "== both directions passed"; exit 0; }
