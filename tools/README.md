@@ -69,3 +69,9 @@
   vortex-ng derived from their mnemonics (so both derive `m/84'/coin'/0'/2/timenumber` alike) and vortex-ng's taker
   verified their `!tbond` proofs; in B joinmarket-ng's taker verified both vortex-ng makers' proofs ("Updated 2
   offers with verified fidelity bond values"). Still not covered: `tr0` and `wsh0`, Tor, more than one relay.
+  **Run 2026-11-17, the Taproot pit** (`PIT=tr0`; vortex-ng `56e0a16`; joinmarket-ng's PR #643 at `606765ba`
+  with the Nostr channel's three commits on top): both directions pass, without bonds and with them. In A
+  joinmarket-ng's makers served `tr0reloffer` from BIP86 wallets to a vortex-ng taker; in B joinmarket-ng's taker
+  (a BIP86 wallet, preferring `tr0`) took two vortex-ng makers' `tr0absoffer` and had them broadcast. The first
+  attempt never reached a round, for harness reasons only (an uninstalled package of that branch). Still not
+  covered: `wsh0` (joinmarket-ng has no such pit), Tor, more than one relay, channel rings.

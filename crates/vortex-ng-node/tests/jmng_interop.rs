@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::MockRelay;
 use vortex_ng_chain::{Auth, CoreRpc};
-use vortex_ng_core::bitcoin::{Amount, Network, OutPoint, Txid};
+use vortex_ng_core::bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
 use vortex_ng_core::offer::{Offer, Pit};
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{CONNECT_TIMEOUT, run_maker, run_taker};
@@ -247,6 +247,7 @@ async fn taker_with_joinmarket_ng_makers() {
             .count(),
         harness.makers + 1
     );
+    assert_pit_outputs(&tx, harness.pit);
     taker_wallet.sync(&rpc, 0).unwrap();
     assert_eq!(
         taker_wallet.confirmed_balance(1).unwrap(),
@@ -259,6 +260,22 @@ async fn taker_with_joinmarket_ng_makers() {
         tx.input.len(),
         tx.output.len()
     );
+}
+
+/// Every equal-amount output is the pit's kind of output: the round really was in that pit.
+fn assert_pit_outputs(tx: &Transaction, pit: Pit) {
+    for out in tx.output.iter().filter(|o| o.value.to_sat() == AMOUNT) {
+        let script = &out.script_pubkey;
+        let ok = match pit {
+            Pit::Sw0 => script.is_p2wpkh(),
+            Pit::Tr0 => script.is_p2tr(),
+            Pit::Wsh0 => script.is_p2wsh(),
+        };
+        assert!(
+            ok,
+            "an equal-amount output is not a {pit:?} output: {script:?}"
+        );
+    }
 }
 
 fn total(wallet: &PitWallet) -> Amount {
@@ -363,6 +380,7 @@ async fn makers_with_joinmarket_ng_taker() {
             .count(),
         harness.makers + 1
     );
+    assert_pit_outputs(&tx, harness.pit);
     for (name, had) in names.iter().zip(before) {
         let mut restored = wallet(name, harness.pit);
         restored.sync(&rpc, 0).unwrap();
