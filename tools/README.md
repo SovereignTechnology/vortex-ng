@@ -63,3 +63,9 @@
   node only because a vortex-ng maker honoured `!push`; in A each joinmarket-ng maker sent its `!hp2` over the
   relay (1 sent, 0 failed to connect, from its log). Still not covered: `tr0` and `wsh0`, fidelity bonds across
   implementations, Tor, more than one relay.
+  **Run 2026-11-17, with fidelity bonds** (`BONDS=1`, now the default; vortex-ng `4e1620f`): every maker holds a
+  bond and each taker keeps joinmarket-ng's default policy, under which a maker that charges a fee is chosen only
+  if its bond verifies. Both directions pass: in A joinmarket-ng's makers found their bonds at the addresses
+  vortex-ng derived from their mnemonics (so both derive `m/84'/coin'/0'/2/timenumber` alike) and vortex-ng's taker
+  verified their `!tbond` proofs; in B joinmarket-ng's taker verified both vortex-ng makers' proofs ("Updated 2
+  offers with verified fidelity bond values"). Still not covered: `tr0` and `wsh0`, Tor, more than one relay.
