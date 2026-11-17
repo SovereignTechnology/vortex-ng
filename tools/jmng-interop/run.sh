@@ -26,9 +26,10 @@ CORE_VERSION=32.1
 CORE_SHA256=61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963
 PORT=18443
 BONDS=${BONDS:-1}
-# joinmarket-ng's test bond: locked until 2099-12-01, at index 0; maker1's address as its funding script has it.
+# joinmarket-ng's test bond locktime (2099-12-01, timenumber 959). The bond addresses are derived by the
+# vortex-ng test from the makers' mnemonics: the address in joinmarket-ng's scripts/fund-test-wallets.sh is
+# the pre-timenumber derivation (child index 0) and is not what its maker derives today.
 BOND_LOCKTIME=4099766400
-MAKER1_BOND_ADDRESS=bcrt1q7yv9xfz7vt5nn3nmpnrh899sxs5s9jnlqe94e8xx4jxc55xhtxcq0dgjy6
 # joinmarket-ng's own regtest test wallets (docker-compose.yml maker1, maker2; scripts/fund-test-wallets.sh).
 MAKER_MNEMONICS=(
   "avoid whisper mesh corn already blur sudden fine planet chicken hover sniff"
@@ -108,7 +109,6 @@ vortex_pid=
 start_vortex() {  # $1 = role, $2 = its directory
   (cd "$work/vortex-ng" && VORTEX_NG_INTEROP_ROLE="$1" VORTEX_NG_INTEROP_DIR="$2" VORTEX_NG_INTEROP_BONDS="$BONDS" \
     VORTEX_NG_INTEROP_BOND_MNEMONICS="${MAKER_MNEMONICS[0]}|${MAKER_MNEMONICS[1]}" \
-    VORTEX_NG_INTEROP_BOND_ADDRESS_0="$MAKER1_BOND_ADDRESS" \
     VORTEX_NG_INTEROP_MAKERS=${#MAKER_ADDRESSES[@]} VORTEX_NG_REGTEST_RPC="http://127.0.0.1:$PORT" \
     VORTEX_NG_REGTEST_COOKIE="$cookie" \
     cargo test --locked -p vortex-ng-node --test jmng_interop -- --nocapture >"$logs/vortex-$1.log" 2>&1) &
@@ -117,7 +117,7 @@ start_vortex() {  # $1 = role, $2 = its directory
   for _ in $(seq 1 600); do [ -s "$2/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
   [ -s "$2/relay.url" ] || { echo "vortex-ng ($1) did not start its relay"; show "$logs/vortex-$1.log" 40; return 1; }
 }
-report() { grep -E 'relay at|maker .* (announced|nick)|bond address|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
+report() { grep -E 'relay at|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
 
 # ---- A: joinmarket-ng makers, vortex-ng taker ------------------------------------------------------------
 rc_a=0

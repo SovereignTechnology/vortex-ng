@@ -131,29 +131,21 @@ async fn taker_with_joinmarket_ng_makers() {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
 
-    // Our coin: a coinbase. With bonds, a coinbase to each joinmarket-ng maker's bond address too: derived
-    // here from its mnemonic (VORTEX_NG_INTEROP_BOND_MNEMONICS, `|`-separated), which also checks our
-    // derivation of joinmarket's bond path against the address joinmarket-ng's own funding script uses.
+    // Our coin: a coinbase. With bonds, a coinbase to each joinmarket-ng maker's bond address too, derived
+    // here from its mnemonic (VORTEX_NG_INTEROP_BOND_MNEMONICS, `|`-separated) on joinmarket's bond path
+    // (m/84'/coin'/0'/2/timenumber). The maker only has a bond to prove if it derives the same address.
     let mut taker_wallet = wallet("interop-taker");
     let sink = wallet("interop-sink").next_receive_address(0).unwrap();
     rpc.generate_to_address(1, &taker_wallet.next_receive_address(0).unwrap())
         .unwrap();
     if harness.bonds {
         let mnemonics = std::env::var("VORTEX_NG_INTEROP_BOND_MNEMONICS").expect("bond mnemonics");
-        for (i, mnemonic) in mnemonics.split('|').enumerate() {
+        for mnemonic in mnemonics.split('|') {
             let seed = Seed::from_mnemonic(mnemonic.trim(), "", Network::Regtest).unwrap();
             let bond = PitWallet::new(&seed, Pit::Sw0)
                 .unwrap()
                 .bond_address(JMNG_BOND_TIMENUMBER)
                 .unwrap();
-            if let Ok(expected) = std::env::var(format!("VORTEX_NG_INTEROP_BOND_ADDRESS_{i}")) {
-                assert_eq!(
-                    bond.to_string(),
-                    expected,
-                    "bond address of joinmarket-ng maker {i}"
-                );
-                println!("bond address of maker {i} matches joinmarket-ng's");
-            }
             rpc.generate_to_address(1, &bond).unwrap();
         }
     }
