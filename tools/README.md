@@ -74,4 +74,7 @@
   joinmarket-ng's makers served `tr0reloffer` from BIP86 wallets to a vortex-ng taker; in B joinmarket-ng's taker
   (a BIP86 wallet, preferring `tr0`) took two vortex-ng makers' `tr0absoffer` and had them broadcast. The first
   attempt never reached a round, for harness reasons only (an uninstalled package of that branch). Still not
-  covered: `wsh0` (joinmarket-ng has no such pit), Tor, more than one relay, channel rings.
+  Rerun at `f5b6904` with the tests asserting the pit on the transaction (every equal-amount output P2TR in
+  `tr0`, P2WPKH in `sw0`): `tr0` on the PR #643 checkout and `sw0` on joinmarket-ng main's, bonds on, pass in
+  both directions. Still not covered: `wsh0` (joinmarket-ng has no such pit), Tor, more than one relay, channel
+  rings.
