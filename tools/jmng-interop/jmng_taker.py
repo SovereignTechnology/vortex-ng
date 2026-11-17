@@ -32,12 +32,16 @@ async def main() -> int:
     from jmwallet.backends.descriptor_wallet import DescriptorWalletBackend
     from jmwallet.wallet.service import WalletService
     from taker.config import BroadcastPolicy, MaxCjFee, TakerConfig
-    from taker.podle_manager import initialize_commitment_history
     from taker.taker import Taker
 
     data_dir = Path(data)
     data_dir.mkdir(parents=True, exist_ok=True)
-    initialize_commitment_history(data_dir)  # a brand-new taker: a new, unused history
+    try:  # a brand-new taker: a new, unused history (a step older checkouts do not have)
+        from taker.podle_manager import initialize_commitment_history
+
+        initialize_commitment_history(data_dir)
+    except ImportError:
+        pass
     backend = DescriptorWalletBackend(rpc_url=rpc_url, rpc_user=user, rpc_password=password)
     # The Taproot pit: a BIP86 wallet and tr0 offers (keywords a checkout without the pit does not have).
     wallet_pit, config_pit = {}, {}

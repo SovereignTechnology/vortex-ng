@@ -72,10 +72,14 @@ apt-get install -y -qq --no-install-recommends python3 python3-venv libsecp256k1
 python3 -m venv "$work/venv"
 # shellcheck disable=SC1091
 . "$work/venv/bin/activate"
-for c in jmcore jmwallet maker taker; do
+# jmswap exists only in a checkout with the Taproot pit; its maker and taker import it.
+editable=()
+for c in jmcore jmwallet jmswap maker taker; do
+  [ -d "$jmng/$c" ] || continue
   pip install -q --disable-pip-version-check --require-hashes -r "$jmng/$c/requirements.txt"
+  editable+=(-e "$jmng/$c")
 done
-pip install -q --disable-pip-version-check --no-deps -e "$jmng/jmcore" -e "$jmng/jmwallet" -e "$jmng/maker" -e "$jmng/taker"
+pip install -q --disable-pip-version-check --no-deps "${editable[@]}"
 echo "joinmarket-ng $(git -C "$jmng" rev-parse --short=12 HEAD 2>/dev/null || echo snapshot), $(python3 --version)"
 
 # vortex-ng at the given commit; the test is built before anything starts.
@@ -156,7 +160,19 @@ if [ "$rc_a" -eq 0 ]; then
     maker_pids+=($!)
     pids+=($!)
   done
-  wait "$vortex_pid" || rc_a=$?
+  # A maker that has died will never announce an offer: stop instead of waiting out the taker's patience.
+  while kill -0 "$vortex_pid" 2>/dev/null; do
+    for p in "${maker_pids[@]}"; do
+      if ! kill -0 "$p" 2>/dev/null; then
+        echo "a joinmarket-ng maker exited before the round"
+        kill "$vortex_pid" 2>/dev/null || true
+        rc_a=25
+      fi
+    done
+    [ "$rc_a" -eq 0 ] || break
+    sleep 2
+  done
+  wait "$vortex_pid" || { [ "$rc_a" -ne 0 ] || rc_a=$?; }
 fi
 echo "== A ($PIT, bonds $BONDS): vortex-ng taker with joinmarket-ng makers (exit $rc_a)"
 report "$logs/vortex-taker.log"
