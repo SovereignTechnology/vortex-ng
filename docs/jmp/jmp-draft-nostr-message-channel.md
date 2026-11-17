@@ -188,7 +188,9 @@ randomize timestamps into the past: these messages are consumed live by subscrip
 
 **Splitting.** A line longer than 16,000 bytes MUST be split into consecutive byte ranges of at most 16,000
 bytes, at most 4 parts, each sent in its own wrap with `["part", "<i>", "<n>", "<id>"]`, where `i` runs from 1
-to `n` and `id` is 16 random bytes in lowercase hex shared by all parts. The receiver concatenates the parts in
+to `n` and `id` is 16 random bytes in lowercase hex shared by all parts. A receiver MUST drop a wrap whose
+`part` tag has an `i` or `n` that is not ASCII decimal digits, or an `id` that is not 32 lowercase hex
+characters: receivers key reassembly on the `id` as sent. The receiver concatenates the parts in
 order once all `n` with the same sender and `id` have arrived, and drops parts it cannot complete within 60
 seconds. The sender is the seal's authenticated `pubkey`, so no one can inject parts into another sender's
 message. A receiver MUST bound the memory reassembly can take: at most 4 incomplete messages per sender and a

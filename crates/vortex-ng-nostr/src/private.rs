@@ -166,21 +166,7 @@ pub fn unwrap(recipient: &NickKeys, wrap: &Event) -> Result<Received, ChannelErr
         .collect();
     let part = match parts.as_slice() {
         [] => None,
-        [[_, index, total, id]] => {
-            let (index, total): (usize, usize) = (
-                index.parse().map_err(|_| ChannelError::Invalid("part"))?,
-                total.parse().map_err(|_| ChannelError::Invalid("part"))?,
-            );
-            let id_ok = id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
-            if !(2..=MAX_PARTS).contains(&total) || index == 0 || index > total || !id_ok {
-                return Err(ChannelError::Invalid("part"));
-            }
-            Some(Part {
-                index,
-                total,
-                id: id.clone(),
-            })
-        }
+        [[_, index, total, id]] => Some(parse_part(index, total, id)?),
         _ => return Err(ChannelError::Invalid("part")),
     };
     let relays: Vec<String> = rumor
@@ -300,6 +286,37 @@ pub fn open_line(
     Ok(msg)
 }
 
+/// The values of a `["part", "<i>", "<n>", "<id>"]` tag: `i` and `n` in decimal digits only (`str::parse`
+/// alone would also take a leading `+`), `id` 32 lowercase hex characters. Another implementation keys its
+/// reassembly on the id as sent, so an id we accepted in another case would not be the same message there.
+fn parse_part(index: &str, total: &str, id: &str) -> Result<Part, ChannelError> {
+    // Leading zeros are read as joinmarket-ng reads them (`int("02")`); a value too long to parse is out of
+    // range anyway.
+    let number = |text: &str| -> Option<usize> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let digits = text.trim_start_matches('0');
+        if digits.is_empty() {
+            Some(0)
+        } else {
+            digits.parse().ok()
+        }
+    };
+    let (Some(index), Some(total)) = (number(index), number(total)) else {
+        return Err(ChannelError::Invalid("part"));
+    };
+    let id_ok = id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !(2..=MAX_PARTS).contains(&total) || index == 0 || index > total || !id_ok {
+        return Err(ChannelError::Invalid("part"));
+    }
+    Ok(Part {
+        index,
+        total,
+        id: id.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use vortex_ng_core::bitcoin::secp256k1::SecretKey;
@@ -327,6 +344,38 @@ mod tests {
             NOSTR_HOSTID,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn part_tags_are_strict() {
+        let id = "0123456789abcdef".repeat(2);
+        let part = parse_part("2", "4", &id).unwrap();
+        assert_eq!(
+            (part.index, part.total, part.id.as_str()),
+            (2, 4, id.as_str())
+        );
+        // As joinmarket-ng reads them: decimal digits, leading zeros allowed.
+        assert_eq!(parse_part("02", "0004", &id).unwrap().total, 4);
+        for (index, total, id) in [
+            ("+2", "4", id.as_str()),
+            ("2", "+4", id.as_str()),
+            ("0", "4", id.as_str()),
+            ("5", "4", id.as_str()),
+            ("1", "1", id.as_str()),
+            ("1", "5", id.as_str()),
+            ("", "4", id.as_str()),
+            ("2", "99999999999999999999999999", id.as_str()),
+            ("2", " 4", id.as_str()),
+            ("٢", "4", id.as_str()),
+            ("2", "4", &id.to_uppercase()),
+            ("2", "4", &id[..30]),
+            ("2", "4", &format!("{}zz", &id[..30])),
+        ] {
+            assert!(
+                parse_part(index, total, id).is_err(),
+                "{index} {total} {id}"
+            );
+        }
     }
 
     #[test]
