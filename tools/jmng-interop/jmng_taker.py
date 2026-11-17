@@ -2,7 +2,7 @@
 
 Run by run.sh inside the VM, with joinmarket-ng installed:
 
-    python3 jmng_taker.py <relay url> <rpc url> <cookie file> <data dir> [bonds: 1|0]
+    python3 jmng_taker.py <relay url> <rpc url> <cookie file> <data dir> [bonds: 1|0] [pit: sw0|tr0]
 
 It uses joinmarket-ng's own regtest test wallet for the taker, Bitcoin Core's wallet backend, and the
 relay as the only message channel. With bonds (1) it keeps joinmarket-ng's default policy: a maker that
@@ -13,17 +13,19 @@ the makers, so the round reaches the node only if one of them broadcasts it. Pri
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
-# joinmarket-ng's own regtest taker wallet (tests/e2e; funded by run.sh at its first address).
-TAKER_MNEMONIC = "burden notable love elephant orbit couch message galaxy elevator exile drop toilet"
+# joinmarket-ng's own regtest taker wallet (tests/e2e), named and funded by run.sh at its first address.
+TAKER_MNEMONIC = os.environ["JMNG_TAKER_MNEMONIC"]
 AMOUNT = 1_000_000
 
 
 async def main() -> int:
     relay, rpc_url, cookie_file, data = sys.argv[1:5]
     bonds = len(sys.argv) > 5 and sys.argv[5] == "1"
+    taproot = len(sys.argv) > 6 and sys.argv[6] == "tr0"
     user, password = Path(cookie_file).read_text().strip().split(":", 1)
 
     from jmcore.models import NetworkType
@@ -37,8 +39,20 @@ async def main() -> int:
     data_dir.mkdir(parents=True, exist_ok=True)
     initialize_commitment_history(data_dir)  # a brand-new taker: a new, unused history
     backend = DescriptorWalletBackend(rpc_url=rpc_url, rpc_user=user, rpc_password=password)
+    # The Taproot pit: a BIP86 wallet and tr0 offers (keywords a checkout without the pit does not have).
+    wallet_pit, config_pit = {}, {}
+    if taproot:
+        from jmcore.models import OfferType
+
+        wallet_pit = {"address_type": "p2tr"}
+        config_pit = {"address_type": "p2tr", "preferred_offer_type": OfferType.TR0_RELATIVE}
     wallet = WalletService(
-        mnemonic=TAKER_MNEMONIC, backend=backend, network="regtest", mixdepth_count=5, data_dir=data_dir
+        mnemonic=TAKER_MNEMONIC,
+        backend=backend,
+        network="regtest",
+        mixdepth_count=5,
+        data_dir=data_dir,
+        **wallet_pit,
     )
     await wallet.sync_all()
     config = TakerConfig(
@@ -57,6 +71,7 @@ async def main() -> int:
         max_cj_fee=MaxCjFee(abs_fee=10_000, rel_fee="0.01"),
         tx_broadcast=BroadcastPolicy.NOT_SELF,
         data_dir=data_dir,
+        **config_pit,
     )
     taker = Taker(wallet, backend, config)
     await taker.start()

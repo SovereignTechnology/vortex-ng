@@ -6,8 +6,8 @@
 //! joinmarket-ng's makers, built with its Nostr channel, on that relay.
 //!
 //! `taker_with_joinmarket_ng_makers` (`VORTEX_NG_INTEROP_ROLE=taker`): a vortex-ng taker waits until the
-//! joinmarket-ng makers have announced their offers, asks them for the orderbook, and runs a `sw0` round with
-//! them. The transaction must pass `testmempoolaccept`, confirm, and pay the taker its coinjoin output. Its
+//! joinmarket-ng makers have announced their offers, asks them for the orderbook, and runs a round with them
+//! in the pit `VORTEX_NG_INTEROP_PIT` names (`sw0`, the default, or `tr0`). The transaction must pass `testmempoolaccept`, confirm, and pay the taker its coinjoin output. Its
 //! txid goes to `<dir>/taker.txid`.
 //!
 //! `makers_with_joinmarket_ng_taker` (`VORTEX_NG_INTEROP_ROLE=makers`): two vortex-ng makers serve offers on
@@ -53,6 +53,8 @@ struct Harness {
     /// `VORTEX_NG_INTEROP_BONDS=1`: every maker holds a fidelity bond, and takers accept a maker that
     /// charges a fee only if its bond verifies.
     bonds: bool,
+    /// `VORTEX_NG_INTEROP_PIT`: the pit both sides trade in.
+    pit: Pit,
 }
 
 impl Harness {
@@ -70,6 +72,11 @@ impl Harness {
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(2),
             bonds: std::env::var("VORTEX_NG_INTEROP_BONDS").is_ok_and(|v| v == "1"),
+            pit: match std::env::var("VORTEX_NG_INTEROP_PIT").as_deref() {
+                Ok("sw0") | Err(_) => Pit::Sw0,
+                Ok("tr0") => Pit::Tr0,
+                Ok(other) => panic!("VORTEX_NG_INTEROP_PIT={other}: sw0 or tr0"),
+            },
         })
     }
 
@@ -83,9 +90,16 @@ impl Harness {
     }
 }
 
-fn wallet(who: &str) -> PitWallet {
+fn wallet(who: &str, pit: Pit) -> PitWallet {
     let seed = Seed::from_mnemonic(WORDS, who, Network::Regtest).unwrap();
-    PitWallet::new(&seed, Pit::Sw0).unwrap()
+    PitWallet::new(&seed, pit).unwrap()
+}
+
+/// Where mined coins nobody needs go.
+fn sink() -> vortex_ng_core::bitcoin::Address {
+    wallet("interop-sink", Pit::Sw0)
+        .next_receive_address(0)
+        .unwrap()
 }
 
 /// Wait until `count` different nicks have an offer event on the relay.
@@ -134,8 +148,8 @@ async fn taker_with_joinmarket_ng_makers() {
     // Our coin: a coinbase. With bonds, a coinbase to each joinmarket-ng maker's bond address too, derived
     // here from its mnemonic (VORTEX_NG_INTEROP_BOND_MNEMONICS, `|`-separated) on joinmarket's bond path
     // (m/84'/coin'/0'/2/timenumber). The maker only has a bond to prove if it derives the same address.
-    let mut taker_wallet = wallet("interop-taker");
-    let sink = wallet("interop-sink").next_receive_address(0).unwrap();
+    let mut taker_wallet = wallet("interop-taker", harness.pit);
+    let sink = sink();
     rpc.generate_to_address(1, &taker_wallet.next_receive_address(0).unwrap())
         .unwrap();
     if harness.bonds {
@@ -161,7 +175,7 @@ async fn taker_with_joinmarket_ng_makers() {
     let utxo = taker_wallet.utxos(0).unwrap().remove(0);
     let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
     let cfg = TakerConfig {
-        pit: Pit::Sw0,
+        pit: harness.pit,
         network: Network::Regtest,
         amount: AMOUNT,
         makers: harness.makers,
@@ -269,7 +283,7 @@ async fn makers_with_joinmarket_ng_taker() {
     let names: Vec<String> = (0..harness.makers)
         .map(|i| format!("interop-maker{i}"))
         .collect();
-    let mut wallets: Vec<PitWallet> = names.iter().map(|n| wallet(n)).collect();
+    let mut wallets: Vec<PitWallet> = names.iter().map(|n| wallet(n, harness.pit)).collect();
     for w in &mut wallets {
         rpc.generate_to_address(1, &w.next_receive_address(0).unwrap())
             .unwrap();
@@ -278,8 +292,7 @@ async fn makers_with_joinmarket_ng_taker() {
                 .unwrap();
         }
     }
-    let sink = wallet("interop-sink").next_receive_address(0).unwrap();
-    rpc.generate_to_address(100, &sink).unwrap();
+    rpc.generate_to_address(100, &sink()).unwrap();
     let mut before = Vec::new();
     for w in &mut wallets {
         w.sync(&rpc, 0).unwrap();
@@ -289,14 +302,15 @@ async fn makers_with_joinmarket_ng_taker() {
 
     let until = Instant::now() + Duration::from_secs(900);
     let mut handles = Vec::new();
+    let offer_type = match harness.pit {
+        Pit::Tr0 => "tr0absoffer",
+        _ => "sw0absoffer",
+    };
     for (i, w) in wallets.into_iter().enumerate() {
         let (url, rpc) = (url.clone(), harness.rpc());
         handles.push(tokio::spawn(async move {
-            let offer = Offer::parse(
-                "sw0absoffer",
-                &format!("{i} 10000 100000000 {TXFEE} {CJFEE}"),
-            )
-            .unwrap();
+            let offer =
+                Offer::parse(offer_type, &format!("{i} 10000 100000000 {TXFEE} {CJFEE}")).unwrap();
             let mut maker = Maker::new(MakerConfig::new(vec![offer]), w).unwrap();
             let mut client = NickClient::connect(
                 NickKeys::generate(),
@@ -350,7 +364,7 @@ async fn makers_with_joinmarket_ng_taker() {
         harness.makers + 1
     );
     for (name, had) in names.iter().zip(before) {
-        let mut restored = wallet(name);
+        let mut restored = wallet(name, harness.pit);
         restored.sync(&rpc, 0).unwrap();
         assert_eq!(
             total(&restored),
