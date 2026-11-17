@@ -12,6 +12,8 @@
 # rounds, each on a relay run by vortex-ng's test crates/vortex-ng-node/tests/jmng_interop.rs:
 #   A. joinmarket-ng's two test makers (`jm-maker start`, Core's wallet backend, the relay as their only
 #      message channel) and a vortex-ng taker, which does a sw0 round with them and checks it on the node;
+# PIT=sw0 (the default) or PIT=tr0 picks the pit both sides trade in; tr0 needs a joinmarket-ng checkout that
+# has the Taproot pit (its PR #643) under the Nostr channel.
 # With BONDS=1 (the default) every maker holds a fidelity bond and each taker runs joinmarket-ng's default
 # policy (a maker that charges a fee is chosen only if its bond verifies), so each side must verify the other's
 # `!tbond` proofs; BONDS=0 turns bonds and that rule off.
@@ -26,6 +28,12 @@ CORE_VERSION=32.1
 CORE_SHA256=61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963
 PORT=18443
 BONDS=${BONDS:-1}
+PIT=${PIT:-sw0}
+case "$PIT" in
+  sw0) address_type=p2wpkh ;;
+  tr0) address_type=p2tr ;;
+  *) echo "PIT=$PIT: sw0 or tr0" >&2; exit 97 ;;
+esac
 # joinmarket-ng's test bond locktime (2099-12-01, timenumber 959). The bond addresses are derived by the
 # vortex-ng test from the makers' mnemonics: the address in joinmarket-ng's scripts/fund-test-wallets.sh is
 # the pre-timenumber derivation (child index 0) and is not what its maker derives today.
@@ -35,11 +43,7 @@ MAKER_MNEMONICS=(
   "avoid whisper mesh corn already blur sudden fine planet chicken hover sniff"
   "minute faint grape plate stock mercy tent world space opera apple rocket"
 )
-MAKER_ADDRESSES=(
-  bcrt1q6x4xurtda3szpc54knp6qpuh0jxgcjajmnmy89
-  bcrt1qfuzpvnf2lgg8z54p3xcjp8xf8x5ydla63tgud2
-)
-TAKER_ADDRESS=bcrt1q84l5vscg3pvjn6se8jp4ruymtyh393ed5v2d9e
+TAKER_MNEMONIC="burden notable love elephant orbit couch message galaxy elevator exile drop toilet"
 
 jmng=$(pwd)
 here=$(cd "$(dirname "$0")" && pwd)
@@ -68,10 +72,14 @@ apt-get install -y -qq --no-install-recommends python3 python3-venv libsecp256k1
 python3 -m venv "$work/venv"
 # shellcheck disable=SC1091
 . "$work/venv/bin/activate"
-for c in jmcore jmwallet maker taker; do
+# jmswap exists only in a checkout with the Taproot pit; its maker and taker import it.
+editable=()
+for c in jmcore jmwallet jmswap maker taker; do
+  [ -d "$jmng/$c" ] || continue
   pip install -q --disable-pip-version-check --require-hashes -r "$jmng/$c/requirements.txt"
+  editable+=(-e "$jmng/$c")
 done
-pip install -q --disable-pip-version-check --no-deps -e "$jmng/jmcore" -e "$jmng/jmwallet" -e "$jmng/maker" -e "$jmng/taker"
+pip install -q --disable-pip-version-check --no-deps "${editable[@]}"
 echo "joinmarket-ng $(git -C "$jmng" rev-parse --short=12 HEAD 2>/dev/null || echo snapshot), $(python3 --version)"
 
 # vortex-ng at the given commit; the test is built before anything starts.
@@ -98,7 +106,10 @@ cli getblockcount >/dev/null || { echo "bitcoind did not start" >&2; exit 21; }
 cli createwallet funder >/dev/null
 funder=$(cli -rpcwallet=funder getnewaddress "" bech32)
 cli generatetoaddress 110 "$funder" >/dev/null
-for address in "${MAKER_ADDRESSES[@]}" "$TAKER_ADDRESS"; do
+# Each joinmarket-ng wallet is funded at the first address joinmarket-ng itself derives for it in this pit.
+for mnemonic in "${MAKER_MNEMONICS[@]}" "$TAKER_MNEMONIC"; do
+  address=$(python3 "$here/jmng_address.py" "$address_type" "$mnemonic" "http://127.0.0.1:$PORT" "$cookie" "$work/derive")
+  case "$address" in bcrt1*) ;; *) echo "joinmarket-ng derived no regtest address" >&2; exit 24 ;; esac
   for _ in 1 2 3; do cli -rpcwallet=funder sendtoaddress "$address" 1.0 >/dev/null; done
 done
 cli generatetoaddress 6 "$funder" >/dev/null
@@ -108,8 +119,9 @@ echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcou
 vortex_pid=
 start_vortex() {  # $1 = role, $2 = its directory
   (cd "$work/vortex-ng" && VORTEX_NG_INTEROP_ROLE="$1" VORTEX_NG_INTEROP_DIR="$2" VORTEX_NG_INTEROP_BONDS="$BONDS" \
+    VORTEX_NG_INTEROP_PIT="$PIT" \
     VORTEX_NG_INTEROP_BOND_MNEMONICS="${MAKER_MNEMONICS[0]}|${MAKER_MNEMONICS[1]}" \
-    VORTEX_NG_INTEROP_MAKERS=${#MAKER_ADDRESSES[@]} VORTEX_NG_REGTEST_RPC="http://127.0.0.1:$PORT" \
+    VORTEX_NG_INTEROP_MAKERS=${#MAKER_MNEMONICS[@]} VORTEX_NG_REGTEST_RPC="http://127.0.0.1:$PORT" \
     VORTEX_NG_REGTEST_COOKIE="$cookie" \
     cargo test --locked -p vortex-ng-node --test jmng_interop -- --nocapture >"$logs/vortex-$1.log" 2>&1) &
   vortex_pid=$!
@@ -136,6 +148,7 @@ if [ "$rc_a" -eq 0 ]; then
       bond_args=(--fidelity-bond-locktime "$BOND_LOCKTIME")
       bond_env=("MAKER__FIDELITY_BOND_LOCKTIMES=$BOND_LOCKTIME" FIDELITY_BOND_INDEX=0)
     fi
+    if [ "$PIT" = tr0 ]; then bond_env+=(WALLET__ADDRESS_TYPE=p2tr); fi  # the pit switch; offers follow it
     env "${bond_env[@]}" \
     HOME="$home" JOINMARKET_DATA_DIR="$home/.joinmarket-ng" MNEMONIC="$mnemonic" \
       NETWORK_CONFIG__NETWORK=regtest NETWORK_CONFIG__BITCOIN_NETWORK=regtest \
@@ -147,9 +160,21 @@ if [ "$rc_a" -eq 0 ]; then
     maker_pids+=($!)
     pids+=($!)
   done
-  wait "$vortex_pid" || rc_a=$?
+  # A maker that has died will never announce an offer: stop instead of waiting out the taker's patience.
+  while kill -0 "$vortex_pid" 2>/dev/null; do
+    for p in "${maker_pids[@]}"; do
+      if ! kill -0 "$p" 2>/dev/null; then
+        echo "a joinmarket-ng maker exited before the round"
+        kill "$vortex_pid" 2>/dev/null || true
+        rc_a=25
+      fi
+    done
+    [ "$rc_a" -eq 0 ] || break
+    sleep 2
+  done
+  wait "$vortex_pid" || { [ "$rc_a" -ne 0 ] || rc_a=$?; }
 fi
-echo "== A: vortex-ng taker with joinmarket-ng makers (exit $rc_a)"
+echo "== A ($PIT, bonds $BONDS): vortex-ng taker with joinmarket-ng makers (exit $rc_a)"
 report "$logs/vortex-taker.log"
 if [ "$rc_a" -ne 0 ]; then
   show "$logs/vortex-taker.log" 40
@@ -158,6 +183,7 @@ else
   echo "txid $(cat "$work/a/taker.txid") at height $(cli getblockcount)"
   # joinmarket-ng's makers publish the taker's PoDLE commitment (!hp2) from a throwaway nick after !ioauth.
   for n in 1 2; do
+    grep -E 'Created offer' "$logs/maker$n.log" | tail -1 | grep -o 'type=[a-z0-9]*' || true
     grep -E 'bond_value=|No fidelity bond found|fidelity bond.*(found|loaded)' "$logs/maker$n.log" | tail -2 | cut -c1-260 || true
     echo "maker$n !hp2: $(grep -c 'CoinJoin message sent: command=!hp2' "$logs/maker$n.log") sent," \
       "$(grep -c 'Could not connect to any directory for ephemeral hp2 broadcast' "$logs/maker$n.log") could not connect"
@@ -171,8 +197,8 @@ start_vortex makers "$work/b" || rc_b=22
 if [ "$rc_b" -eq 0 ]; then
   relay=$(cat "$work/b/relay.url")
   sleep 5  # the makers publish their offers right after the relay URL is written
-  HOME="$work/taker" python3 "$here/jmng_taker.py" "$relay" "http://127.0.0.1:$PORT" "$cookie" \
-    "$work/taker/.joinmarket-ng" "$BONDS" >"$logs/jmng-taker.log" 2>&1 || rc_b=$?
+  HOME="$work/taker" JMNG_TAKER_MNEMONIC="$TAKER_MNEMONIC" python3 "$here/jmng_taker.py" "$relay" "http://127.0.0.1:$PORT" "$cookie" \
+    "$work/taker/.joinmarket-ng" "$BONDS" "$PIT" >"$logs/jmng-taker.log" 2>&1 || rc_b=$?
   txid=$(sed -n 's/^JMNG_TXID=//p' "$logs/jmng-taker.log" | tail -1)
   if [ "$rc_b" -eq 0 ] && [ -n "$txid" ] && [ "$txid" != None ]; then
     # The makers broadcast it: it must be in the node's mempool before a block can take it.
@@ -186,7 +212,7 @@ if [ "$rc_b" -eq 0 ]; then
     kill "$vortex_pid" 2>/dev/null || true
   fi
 fi
-echo "== B: joinmarket-ng taker with vortex-ng makers (exit $rc_b)"
+echo "== B ($PIT, bonds $BONDS): joinmarket-ng taker with vortex-ng makers (exit $rc_b)"
 report "$logs/vortex-makers.log"
 if [ "$rc_b" -ne 0 ]; then
   grep -v -E 'utxo_metadata|wallet\.sync|history_reconstruction' "$logs/jmng-taker.log" | tail -n 70 | cut -c1-400 || true
