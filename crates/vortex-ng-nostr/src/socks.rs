@@ -38,6 +38,219 @@ impl Connector for DirectConnector {
     }
 }
 
+/// Outbound through another SOCKS5 proxy, under a username and password of this connector's own.
+///
+/// For a Tor daemon's SOCKS port: Tor gives streams with different SOCKS credentials circuits of their own
+/// (`IsolateSOCKSAuth`, its default), so two connectors never share one. nostr-sdk cannot send SOCKS
+/// credentials itself; a nick's [`SocksShim`] in front of one of these does it for all of that nick's
+/// connections. Host names are passed on unresolved.
+///
+/// The proxy must accept username/password authentication (RFC 1929): one that does not could not keep
+/// nicks apart, and is refused rather than used.
+#[derive(Clone)]
+pub struct UpstreamSocks {
+    proxy: SocketAddr,
+    username: String,
+    password: String,
+}
+
+impl std::fmt::Debug for UpstreamSocks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamSocks")
+            .field("proxy", &self.proxy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpstreamSocks {
+    /// Through `proxy`, apart from every other connector: fresh random credentials.
+    pub fn isolated(proxy: SocketAddr) -> UpstreamSocks {
+        use vortex_ng_core::bitcoin::hex::DisplayHex;
+        use vortex_ng_core::tx::random_bytes;
+        UpstreamSocks {
+            proxy,
+            username: random_bytes::<16>()[..].to_lower_hex_string(),
+            password: random_bytes::<16>()[..].to_lower_hex_string(),
+        }
+    }
+
+    /// The SOCKS username this connector presents (what the proxy isolates on).
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+}
+
+const AUTH_USERPASS: u8 = 2;
+const AUTH_VERSION: u8 = 1;
+
+impl Connector for UpstreamSocks {
+    type Stream = TcpStream;
+    async fn connect(&self, host: String, port: u16) -> io::Result<TcpStream> {
+        let mut conn = TcpStream::connect(self.proxy).await?;
+        // Offer username/password only: without it the proxy cannot keep nicks apart.
+        conn.write_all(&[VERSION, 1, AUTH_USERPASS]).await?;
+        let mut chosen = [0u8; 2];
+        conn.read_exact(&mut chosen).await?;
+        if chosen != [VERSION, AUTH_USERPASS] {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the proxy takes no SOCKS username and password, so it cannot isolate streams",
+            ));
+        }
+        let (user, pass) = (self.username.as_bytes(), self.password.as_bytes());
+        let (Ok(user_len), Ok(pass_len)) = (u8::try_from(user.len()), u8::try_from(pass.len()))
+        else {
+            return Err(bad("credentials too long"));
+        };
+        let mut auth = vec![AUTH_VERSION, user_len];
+        auth.extend_from_slice(user);
+        auth.push(pass_len);
+        auth.extend_from_slice(pass);
+        conn.write_all(&auth).await?;
+        let mut status = [0u8; 2];
+        conn.read_exact(&mut status).await?;
+        if status[1] != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the proxy refused the SOCKS credentials",
+            ));
+        }
+        // CONNECT, the address as given: a name is resolved by the proxy, never here.
+        let mut request = vec![VERSION, CONNECT, 0];
+        if let Ok(v4) = host.parse::<Ipv4Addr>() {
+            request.push(1);
+            request.extend_from_slice(&v4.octets());
+        } else if let Ok(v6) = host.parse::<Ipv6Addr>() {
+            request.push(4);
+            request.extend_from_slice(&v6.octets());
+        } else {
+            let Ok(len) = u8::try_from(host.len()) else {
+                return Err(bad("host name too long"));
+            };
+            request.push(3);
+            request.push(len);
+            request.extend_from_slice(host.as_bytes());
+        }
+        request.extend_from_slice(&port.to_be_bytes());
+        conn.write_all(&request).await?;
+        let mut head = [0u8; 4];
+        conn.read_exact(&mut head).await?;
+        if head[0] != VERSION {
+            return Err(bad("not SOCKS5"));
+        }
+        if head[1] != REPLY_OK {
+            let kind = if head[1] == 5 || head[1] == REPLY_UNREACHABLE {
+                io::ErrorKind::ConnectionRefused
+            } else {
+                io::ErrorKind::Other
+            };
+            return Err(io::Error::new(
+                kind,
+                format!("the proxy answered {}", head[1]),
+            ));
+        }
+        // The bound address the reply carries is of no use: read past it.
+        let rest = match head[3] {
+            1 => 4 + 2,
+            4 => 16 + 2,
+            3 => {
+                let mut len = [0u8; 1];
+                conn.read_exact(&mut len).await?;
+                usize::from(len[0]) + 2
+            }
+            _ => return Err(bad("address type")),
+        };
+        let mut bound = vec![0u8; rest];
+        conn.read_exact(&mut bound).await?;
+        Ok(conn)
+    }
+}
+
+/// How nicks reach their relays.
+///
+/// Each nick takes a [`NickPath`] of its own from it ([`Outbound::path`]), so that with a proxy that can
+/// isolate streams no two nicks of this process share a path: not a maker and the throwaway nick it sends
+/// `!hp2` from, nor two rounds' takers.
+#[derive(Clone, Default)]
+pub enum Outbound {
+    /// Directly: the relays see this machine's address.
+    #[default]
+    Direct,
+    /// Through one SOCKS5 address as it is, for every nick alike. No isolation unless the address is
+    /// already a path of one nick's own (a [`SocksShim`]).
+    Proxy(SocketAddr),
+    /// Through a SOCKS5 proxy that isolates streams by username and password (a Tor daemon's SOCKS port):
+    /// every nick gets credentials of its own ([`UpstreamSocks`]).
+    IsolatingProxy(SocketAddr),
+    /// Through in-process Tor: every nick gets an isolated client of its own (feature `tor`).
+    #[cfg(feature = "tor")]
+    Tor(Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>),
+}
+
+impl std::fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outbound::Direct => f.write_str("Direct"),
+            Outbound::Proxy(addr) => write!(f, "Proxy({addr})"),
+            Outbound::IsolatingProxy(addr) => write!(f, "IsolatingProxy({addr})"),
+            #[cfg(feature = "tor")]
+            Outbound::Tor(_) => f.write_str("Tor"),
+        }
+    }
+}
+
+impl Outbound {
+    /// Whether relays see this machine's address.
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Outbound::Direct)
+    }
+
+    /// A path for one nick. Keep it for as long as the nick is connected.
+    pub async fn path(&self) -> io::Result<NickPath> {
+        Ok(match self {
+            Outbound::Direct => NickPath {
+                proxy: None,
+                shim: None,
+            },
+            Outbound::Proxy(addr) => NickPath {
+                proxy: Some(*addr),
+                shim: None,
+            },
+            Outbound::IsolatingProxy(addr) => {
+                NickPath::through(SocksShim::start(UpstreamSocks::isolated(*addr)).await?)
+            }
+            #[cfg(feature = "tor")]
+            Outbound::Tor(base) => NickPath::through(crate::tor::nick_proxy(base).await?),
+        })
+    }
+}
+
+/// One nick's way out: the SOCKS5 address its relay connections use, if any, and the local shim behind it.
+#[derive(Debug)]
+pub struct NickPath {
+    proxy: Option<SocketAddr>,
+    shim: Option<SocksShim>,
+}
+
+impl NickPath {
+    fn through(shim: SocksShim) -> NickPath {
+        NickPath {
+            proxy: Some(shim.addr()),
+            shim: Some(shim),
+        }
+    }
+
+    /// The SOCKS5 address to connect through; `None` for a direct connection.
+    pub fn proxy(&self) -> Option<SocketAddr> {
+        self.proxy
+    }
+
+    /// Whether this path is a shim of the nick's own.
+    pub fn is_own(&self) -> bool {
+        self.shim.is_some()
+    }
+}
+
 /// A running shim; stops accepting when dropped.
 #[derive(Debug)]
 pub struct SocksShim {
@@ -215,6 +428,142 @@ mod tests {
         let mut back = [0u8; 4];
         c.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"ping");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_proxy_sees_each_connector_under_its_own_name() {
+        use crate::testing::AuthSocks;
+
+        let echo = echo_server().await;
+        let proxy = AuthSocks::start().await.unwrap();
+        let (one, two) = (
+            UpstreamSocks::isolated(proxy.addr()),
+            UpstreamSocks::isolated(proxy.addr()),
+        );
+        assert_ne!(one.username(), two.username());
+        assert_eq!(one.username().len(), 32);
+        assert!(!format!("{one:?}").contains(one.username()));
+        // Bytes pass both ways; an address goes as an address, a name as a name (resolved at the proxy).
+        for (connector, host) in [
+            (&one, "127.0.0.1"),
+            (&two, "localhost"),
+            (&one, "echo.test"),
+        ] {
+            let mut stream = connector
+                .connect(host.to_string(), echo.port())
+                .await
+                .unwrap();
+            stream.write_all(b"ping").await.unwrap();
+            let mut back = [0u8; 4];
+            stream.read_exact(&mut back).await.unwrap();
+            assert_eq!(&back, b"ping");
+        }
+        let port = echo.port();
+        assert_eq!(
+            proxy.seen(),
+            vec![
+                (one.username().to_string(), format!("127.0.0.1:{port}")),
+                (two.username().to_string(), format!("localhost:{port}")),
+                (one.username().to_string(), format!("echo.test:{port}")),
+            ]
+        );
+        // Nothing listens there: the failure is the proxy's to report.
+        let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let refused = one
+            .connect("127.0.0.1".into(), dead_port)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_cannot_isolate_is_refused() {
+        // Our own shim speaks SOCKS5 without authentication: as an upstream it could not keep nicks apart.
+        let echo = echo_server().await;
+        let plain = SocksShim::start(DirectConnector).await.unwrap();
+        let refused = UpstreamSocks::isolated(plain.addr())
+            .connect("127.0.0.1".into(), echo.port())
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_nick_and_its_sibling_has_a_path_of_its_own() {
+        use crate::testing::AuthSocks;
+
+        let relay = MockRelay::run().await.unwrap();
+        // A name only the proxy can resolve: nothing reaches this relay directly.
+        let port = relay
+            .url()
+            .await
+            .to_string()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .trim_end_matches('/')
+            .to_string();
+        let relays = vec![format!("ws://relay.test:{port}")];
+        let proxy = AuthSocks::start().await.unwrap();
+        let outbound = Outbound::IsolatingProxy(proxy.addr());
+        assert!(!outbound.is_direct() && Outbound::default().is_direct());
+        let wait = Duration::from_secs(10);
+
+        let mut maker =
+            NickClient::connect_via(NickKeys::generate(), "regtest", &relays, &outbound, wait)
+                .await
+                .unwrap();
+        let taker =
+            NickClient::connect_via(NickKeys::generate(), "regtest", &relays, &outbound, wait)
+                .await
+                .unwrap();
+        // The nick a maker sends `!hp2` from.
+        let throwaway = maker.sibling(NickKeys::generate(), wait).await.unwrap();
+        maker.subscribe(unix_now() - 60, false, true).await.unwrap();
+        let deadline = std::time::Instant::now() + wait;
+        let mut heard = Vec::new();
+        while heard.len() < 2 {
+            for from in [&taker, &throwaway] {
+                let event = public_event(
+                    from.keys(),
+                    "regtest",
+                    "!orderbook",
+                    &[relays[0].as_str()],
+                    unix_now(),
+                )
+                .unwrap();
+                from.publish(&event).await.unwrap();
+            }
+            while let Some(Incoming::Public(author, _)) =
+                maker.next(Duration::from_millis(1100)).await
+            {
+                if !heard.contains(&author.nick) {
+                    heard.push(author.nick);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing through the proxy"
+            );
+        }
+        // Three nicks, three sets of credentials; every connection was for the relay, by its name.
+        assert_eq!(proxy.usernames().len(), 3);
+        assert!(
+            proxy
+                .seen()
+                .iter()
+                .all(|(_, to)| *to == format!("relay.test:{port}"))
+        );
+
+        // The other ways out: a direct path has no proxy; a given address is used as it is.
+        let direct = Outbound::Direct.path().await.unwrap();
+        assert!(direct.proxy().is_none() && !direct.is_own());
+        let fixed = Outbound::Proxy(proxy.addr()).path().await.unwrap();
+        assert!(fixed.proxy() == Some(proxy.addr()) && !fixed.is_own());
+        let own = outbound.path().await.unwrap();
+        assert!(own.is_own() && own.proxy() != Some(proxy.addr()));
     }
 
     #[tokio::test]

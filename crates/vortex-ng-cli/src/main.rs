@@ -47,6 +47,11 @@ Usage:
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
 
+`orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
+username and password, such as a Tor daemon's SOCKS port (127.0.0.1:9050). Every nick, a maker's throwaway
+`!hp2` nick included, then reaches the relays under credentials of its own. Without it the relays see this
+machine's address, and the command says so.
+
 Networks: regtest, signet, testnet4, testnet. Mainnet wallets are disabled in this pre-release.
 
 The wallet password is asked on the terminal, or read from `--password-file <file>`: a file only you can

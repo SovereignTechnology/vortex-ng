@@ -197,15 +197,12 @@ async fn deliver(
                 let _ = blocking(|| chain.broadcast(&tx));
             }
             Outgoing::PublicEphemeral(content) => {
-                // A fresh nick on its own connection, closed afterwards (the draft's !hp2 rule).
-                let throwaway = NickClient::connect(
-                    NickKeys::generate(),
-                    network,
-                    client.relays(),
-                    None,
-                    CONNECT_TIMEOUT,
-                )
-                .await?;
+                // A fresh nick on its own connection, closed afterwards (the draft's !hp2 rule), reaching
+                // the relays the way ours does but on a path of its own: never directly when we are behind
+                // a proxy.
+                let throwaway = client
+                    .sibling(NickKeys::generate(), CONNECT_TIMEOUT)
+                    .await?;
                 let relays: Vec<&str> = client.relays().iter().map(String::as_str).collect();
                 let event = public_event(throwaway.keys(), network, &content, &relays, unix_now())?;
                 let result = throwaway.publish(&event).await;

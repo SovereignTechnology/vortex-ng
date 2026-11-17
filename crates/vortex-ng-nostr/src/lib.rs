@@ -12,6 +12,8 @@ pub mod keys;
 pub mod pool;
 pub mod private;
 pub mod socks;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 #[cfg(feature = "tor")]
 pub mod tor;
 

@@ -8,6 +8,10 @@
 //! A third round is then taken by `vortex-ng coinjoin` itself, from a wallet file of its own, and
 //! `vortex-ng balance` shows where the coins went.
 //!
+//! Nobody reaches the relay directly: it is known to all by a name only the test's SOCKS proxy resolves, a
+//! proxy that, like a Tor daemon's, wants a username and password. Each nick must arrive under credentials
+//! of its own, the throwaway nicks the makers send `!hp2` from included.
+//!
 //! Skipped unless `VORTEX_NG_REGTEST_RPC` and `VORTEX_NG_REGTEST_COOKIE` are set (`tools/itest/run.sh`
 //! sets them). The taker is the library's, in this process; the relay is nostr-sdk's in-process relay.
 
@@ -28,6 +32,8 @@ use vortex_ng_core::tx::random_u64;
 use vortex_ng_node::{CONNECT_TIMEOUT, run_taker};
 use vortex_ng_nostr::client::NickClient;
 use vortex_ng_nostr::keys::NickKeys;
+use vortex_ng_nostr::socks::Outbound;
+use vortex_ng_nostr::testing::AuthSocks;
 use vortex_ng_taker::{DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, podle_for};
 use vortex_ng_wallet::bdk_wallet::LocalOutput;
 use vortex_ng_wallet::{PitWallet, Seed};
@@ -91,6 +97,7 @@ async fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) {
 async fn round(
     rpc: &CoreRpc,
     relay: &str,
+    outbound: &Outbound,
     wallet: &mut PitWallet,
     coin: &LocalOutput,
 ) -> Transaction {
@@ -119,11 +126,11 @@ async fn round(
         change,
     )
     .unwrap();
-    let mut client = NickClient::connect(
+    let mut client = NickClient::connect_via(
         NickKeys::generate(),
         "regtest",
         &[relay.to_string()],
-        None,
+        outbound,
         CONNECT_TIMEOUT,
     )
     .await
@@ -166,7 +173,19 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     .unwrap();
     assert_eq!(rpc.network().unwrap(), Network::Regtest, "regtest only");
     let relay = MockRelay::run().await.unwrap();
-    let relay_url = relay.url().await.to_string();
+    // The relay as everyone knows it: a name only the proxy resolves. A direct connection, or a name
+    // looked up on this machine instead of at the proxy, cannot reach it.
+    let listening = relay.url().await.to_string();
+    let port = listening
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .to_string();
+    let relay_url = format!("ws://relay.test:{port}");
+    let proxy = AuthSocks::start().await.unwrap();
+    let proxy_addr = proxy.addr().to_string();
+    let outbound = Outbound::IsolatingProxy(proxy.addr());
 
     let dir = std::env::temp_dir().join(format!(
         "vortex-ng-cli-maker-{}-{:016x}",
@@ -289,6 +308,8 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
                 "10000",
                 "--upkeep",
                 "2",
+                "--proxy",
+                &proxy_addr,
             ])
             .stdin(Stdio::null())
             .stdout(out)
@@ -320,6 +341,8 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     // What a taker would see: `vortex-ng orderbook` lists both makers' offers, and none in another pit.
     let listing = vortex(&[
         "orderbook",
+        "--proxy",
+        &proxy_addr,
         "--network",
         "regtest",
         "--relays",
@@ -342,6 +365,8 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     );
     let other = vortex(&[
         "orderbook",
+        "--proxy",
+        &proxy_addr,
         "--network",
         "regtest",
         "--relays",
@@ -358,10 +383,19 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     );
 
     // Round one.
-    let first = round(&rpc, &relay_url, &mut taker_wallet, &coins[0]).await;
+    let nicks_before = proxy.usernames().len();
+    let first = round(&rpc, &relay_url, &outbound, &mut taker_wallet, &coins[0]).await;
     rpc.generate_to_address(1, &sink).unwrap();
     assert_eq!(first.input.len(), MAKERS + 1);
     println!("round one confirmed: {}", first.compute_txid());
+    // The round brought new nicks to the proxy, each under credentials of its own: the taker, and the
+    // throwaway nick each maker sent `!hp2` from.
+    let nicks = proxy.usernames().len();
+    assert!(
+        nicks > nicks_before + MAKERS,
+        "{nicks_before} nicks before the round, {nicks} after: the makers' throwaway nicks did not come \
+         through the proxy under names of their own"
+    );
 
     // Each maker brings its wallet up to the new block and announces what it holds now.
     wait_for(
@@ -372,7 +406,7 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     .await;
 
     // Round two: each maker's only coin now is one that round one paid it.
-    let second = round(&rpc, &relay_url, &mut taker_wallet, &coins[1]).await;
+    let second = round(&rpc, &relay_url, &outbound, &mut taker_wallet, &coins[1]).await;
     rpc.generate_to_address(1, &sink).unwrap();
     let from_first = second
         .input
@@ -411,6 +445,8 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     let coinjoin = |extra: &[&str]| {
         let mut args = vec![
             "coinjoin",
+            "--proxy",
+            &proxy_addr,
             "--wallet",
             &cli_taker,
             "--password-file",
@@ -510,6 +546,22 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
         String::from_utf8_lossy(&young.stderr).contains("no coin to commit to"),
         "{}",
         String::from_utf8_lossy(&young.stderr)
+    );
+
+    // Everything the proxy carried was for the relay, by its name; and no maker said it was connecting
+    // directly.
+    assert!(
+        proxy
+            .seen()
+            .iter()
+            .all(|(_, to)| *to == format!("relay.test:{port}")),
+        "{:?}",
+        proxy.seen()
+    );
+    assert!(!show(&logs).contains("connecting to the relays directly"));
+    println!(
+        "{} nicks came through the proxy, each under its own credentials",
+        proxy.usernames().len()
     );
 
     // Nobody fell over.

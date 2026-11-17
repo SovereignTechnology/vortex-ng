@@ -21,6 +21,7 @@ use vortex_ng_core::offer::Offer;
 use crate::event::{Author, network_hashtag, read_offer_event, read_public_event};
 use crate::keys::NickKeys;
 use crate::private::{Reassembler, open_line, unwrap, wrap_line};
+use crate::socks::{NickPath, Outbound};
 use crate::{ChannelError, KIND_OFFER, KIND_PUBLIC};
 
 /// Most relays a private message is sent to.
@@ -55,6 +56,10 @@ pub struct NickClient {
     network: String,
     relays: Vec<String>,
     client: Client,
+    /// How this nick, and any sibling made from it, reaches the relays.
+    outbound: Outbound,
+    /// This nick's own way out; a local shim behind it lives as long as the client.
+    _path: NickPath,
     // Only `next(&mut self)` touches the stream; the Mutex (reached via `get_mut`, never locked) makes the
     // client `Sync`, so futures holding `&NickClient` can be spawned.
     notifications: std::sync::Mutex<Pin<Box<dyn Stream<Item = ClientNotification> + Send>>>,
@@ -77,7 +82,7 @@ fn io<E: std::fmt::Display>(e: E) -> ChannelError {
 
 impl NickClient {
     /// Connect `keys`' nick to `relays` (through `proxy`, a SOCKS5 address, when given), waiting up to
-    /// `timeout` for the connections.
+    /// `timeout` for the connections. See [`NickClient::connect_via`] for per-nick isolation.
     pub async fn connect(
         keys: NickKeys,
         network: &str,
@@ -85,10 +90,27 @@ impl NickClient {
         proxy: Option<SocketAddr>,
         timeout: Duration,
     ) -> Result<NickClient, ChannelError> {
+        let outbound = match proxy {
+            Some(addr) => Outbound::Proxy(addr),
+            None => Outbound::Direct,
+        };
+        NickClient::connect_via(keys, network, relays, &outbound, timeout).await
+    }
+
+    /// Connect `keys`' nick to `relays` on a path of its own taken from `outbound`, waiting up to `timeout`
+    /// for the connections.
+    pub async fn connect_via(
+        keys: NickKeys,
+        network: &str,
+        relays: &[String],
+        outbound: &Outbound,
+        timeout: Duration,
+    ) -> Result<NickClient, ChannelError> {
         if relays.is_empty() {
             return Err(ChannelError::Invalid("at least one relay"));
         }
-        let client = match proxy {
+        let path = outbound.path().await.map_err(io)?;
+        let client = match path.proxy() {
             Some(addr) => Client::builder().proxy(Proxy::all(addr)).build(),
             None => Client::builder().build(),
         };
@@ -107,10 +129,23 @@ impl NickClient {
                 .cloned()
                 .collect(),
             client,
+            outbound: outbound.clone(),
+            _path: path,
             notifications: std::sync::Mutex::new(notifications),
             seen: HashSet::new(),
             reassembler: Reassembler::new(REASSEMBLY_CAP),
         })
+    }
+
+    /// Another nick on the same relays, reaching them the way this one does but on a path of its own:
+    /// what a maker sends `!hp2` from. With [`Outbound::IsolatingProxy`] or `Outbound::Tor` the two share
+    /// no circuit; a nick connected directly has a direct sibling.
+    pub async fn sibling(
+        &self,
+        keys: NickKeys,
+        timeout: Duration,
+    ) -> Result<NickClient, ChannelError> {
+        NickClient::connect_via(keys, &self.network, &self.relays, &self.outbound, timeout).await
     }
 
     /// The nick's keys.

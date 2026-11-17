@@ -15,6 +15,7 @@ use vortex_ng_node::{
 };
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
+use vortex_ng_nostr::socks::Outbound;
 use vortex_ng_taker::{
     Coin, DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, TakerError, choose_coins, podle_for,
     verify_bond,
@@ -97,12 +98,24 @@ fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
         .map_err(failed)
 }
 
-/// Said once by every command that connects to relays.
-fn warn_direct() {
-    eprintln!(
-        "vortex-ng: connecting to the relays directly: they see this machine's address. Tor is not wired \
-         into this command yet."
-    );
+/// How the command's nicks reach the relays: through `--proxy` when given, each nick under SOCKS
+/// credentials of its own; directly otherwise, which is said aloud.
+fn outbound(args: &Args) -> Result<Outbound, Failure> {
+    match args.get("proxy") {
+        Some(text) => {
+            let addr = text.parse().map_err(|_| {
+                usage("`--proxy` is the address of a SOCKS5 proxy, such as 127.0.0.1:9050")
+            })?;
+            Ok(Outbound::IsolatingProxy(addr))
+        }
+        None => {
+            eprintln!(
+                "vortex-ng: connecting to the relays directly: they see this machine's address. Give \
+                 `--proxy <address>` (a Tor daemon's SOCKS port) to hide it."
+            );
+            Ok(Outbound::Direct)
+        }
+    }
 }
 
 fn fee_text(offer: &Offer) -> String {
@@ -114,7 +127,7 @@ fn fee_text(offer: &Offer) -> String {
 
 /// `vortex-ng orderbook`: ask the makers on the relays what they offer.
 pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
-    let mut valued = vec!["network", "relays", "pit", "wait"];
+    let mut valued = vec!["network", "relays", "pit", "wait", "proxy"];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
     let network = wallet::network(&args)?;
@@ -129,14 +142,14 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
         Some(_) => Some(node(&args, network)?),
         None => None,
     };
-    warn_direct();
+    let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let (me, book) = runtime()?.block_on(async {
-        let mut client = NickClient::connect(
+        let mut client = NickClient::connect_via(
             NickKeys::generate(),
             channel,
             &relays,
-            None,
+            &outbound,
             CONNECT_TIMEOUT,
         )
         .await
@@ -229,6 +242,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         "min-size",
         "max-size",
         "upkeep",
+        "proxy",
     ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
@@ -282,14 +296,14 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         birthday: file.birthday(),
         upkeep: Duration::from_secs(upkeep.into()),
     };
-    warn_direct();
+    let outbound = outbound(&args)?;
     let channel = channel_network(network);
     runtime()?.block_on(async {
-        let mut client = NickClient::connect(
+        let mut client = NickClient::connect_via(
             NickKeys::generate(),
             channel,
             &relays,
-            None,
+            &outbound,
             CONNECT_TIMEOUT,
         )
         .await
@@ -406,6 +420,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         "fee-rate",
         "max-maker-fee",
         "wait",
+        "proxy",
     ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &["yes", "allow-bondless-fees"])?;
@@ -547,14 +562,14 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         change.clone(),
     )
     .map_err(taker_failed)?;
-    warn_direct();
+    let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let tx = runtime()?.block_on(async {
-        let mut client = NickClient::connect(
+        let mut client = NickClient::connect_via(
             NickKeys::generate(),
             channel,
             &relays,
-            None,
+            &outbound,
             CONNECT_TIMEOUT,
         )
         .await

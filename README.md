@@ -89,8 +89,13 @@ vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
 - Every PoDLE commitment sent is first written to `<wallet>.podle` (the public value makers broadcast, one
   per line): a commitment is spent even by a round that fails, and each coin has three.
 - `orderbook` lists what the makers on the relays answer, and verifies their fidelity bonds when given a node.
-- **No Tor yet in `orderbook`, `maker` and `coinjoin`**: they connect to the relays directly, so the relays see the machine's
-  address, and they say so when they start. The Tor transport exists in `vortex-ng-nostr` and is wired in next.
+- `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
+  username and password, such as a Tor daemon's SOCKS port (`127.0.0.1:9050`). Every nick then reaches the
+  relays under credentials of its own, so Tor gives it circuits of its own: a maker and the throwaway nick it
+  sends `!hp2` from share nothing. Relay names are resolved by the proxy, never on this machine. A proxy that
+  takes no credentials could not keep nicks apart and is refused. **Without `--proxy` the relays see this
+  machine's address**, and the command says so when it starts. In-process Tor (arti, feature `tor` of
+  `vortex-ng-nostr`) is not wired into the commands yet.
 
 ## Building
 

@@ -23,6 +23,8 @@ tor-rtcompat = { workspace = true, optional = true }
 [features]
 # In-process Tor (arti): one isolated circuit set per nick behind a local SOCKS shim.
 tor = ["dep:arti-client", "dep:tor-rtcompat"]
+# Test helpers for other crates' tests (`vortex_ng_nostr::testing`). Never needed to run vortex-ng.
+test-util = []
 
 [dev-dependencies]
 nostr-sdk = { workspace = true, features = ["local-relay"] }
