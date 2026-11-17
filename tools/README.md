@@ -58,3 +58,8 @@
   seed, held its fee less its mining-fee share. Not covered: `tr0` and `wsh0` (joinmarket-ng main has only `sw0`),
   fidelity bonds across implementations, `!push` (joinmarket-ng's taker broadcast the transaction itself; vortex-ng's
   makers do not broadcast for a taker yet), joinmarket-ng's `!hp2` over the relay, Tor, and more than one relay.
+  **Run 2026-11-16, with `!push` and `!hp2`** (vortex-ng `211f36f`, joinmarket-ng channel at `d880fdff`): both
+  directions pass again. In B joinmarket-ng's taker ran with `tx_broadcast = not-self`, so its round reached the
+  node only because a vortex-ng maker honoured `!push`; in A each joinmarket-ng maker sent its `!hp2` over the
+  relay (1 sent, 0 failed to connect, from its log). Still not covered: `tr0` and `wsh0`, fidelity bonds across
+  implementations, Tor, more than one relay.
