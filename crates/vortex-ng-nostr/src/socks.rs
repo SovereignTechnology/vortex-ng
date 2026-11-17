@@ -258,17 +258,29 @@ mod tests {
             .await
             .unwrap();
         maker.subscribe(unix_now() - 60, false, true).await.unwrap();
-        let event = public_event(
-            taker.keys(),
-            "regtest",
-            "!orderbook",
-            &[url.as_str()],
-            unix_now(),
-        )
-        .unwrap();
-        taker.publish(&event).await.unwrap();
-        let Some(Incoming::Public(_, commands)) = maker.next(wait).await else {
-            panic!("nothing through the proxy")
+        // An ephemeral event reaches only the subscriptions the relay already has, and `subscribe` returns
+        // once the request is sent, not once the relay has it. So ask until it arrives: a new second each
+        // time, hence a new event.
+        let deadline = std::time::Instant::now() + wait;
+        let commands = loop {
+            let event = public_event(
+                taker.keys(),
+                "regtest",
+                "!orderbook",
+                &[url.as_str()],
+                unix_now(),
+            )
+            .unwrap();
+            taker.publish(&event).await.unwrap();
+            if let Some(Incoming::Public(_, commands)) =
+                maker.next(Duration::from_millis(1100)).await
+            {
+                break commands;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing through the proxy"
+            );
         };
         assert_eq!(commands, vec![Command::Orderbook]);
     }
