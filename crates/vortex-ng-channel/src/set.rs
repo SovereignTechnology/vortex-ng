@@ -105,6 +105,8 @@ pub trait DynChannel: Send + Sync {
         &'a self,
         line: &'a str,
     ) -> BoxFuture<'a, Result<(), ChannelError>>;
+    /// [`Channel::prepare`], for the peers whose routes are this channel's.
+    fn erased_prepare<'a>(&'a self, peers: &'a [(String, AnyRoute)]) -> BoxFuture<'a, ()>;
     /// [`Channel::receive`].
     fn erased_receive(&mut self, wait: Duration) -> BoxFuture<'_, Next<AnyRoute>>;
     /// [`Channel::shutdown`].
@@ -169,6 +171,17 @@ impl<C: Channel> DynChannel for C {
         line: &'a str,
     ) -> BoxFuture<'a, Result<(), ChannelError>> {
         Box::pin(Channel::publish_unlinked(self, line))
+    }
+
+    fn erased_prepare<'a>(&'a self, peers: &'a [(String, AnyRoute)]) -> BoxFuture<'a, ()> {
+        let ours: Vec<(String, C::Route)> = peers
+            .iter()
+            .filter_map(|(nick, route)| {
+                let route = route.0.downcast_ref::<C::Route>()?;
+                Some((nick.clone(), route.clone()))
+            })
+            .collect();
+        Box::pin(async move { Channel::prepare(self, &ours).await })
     }
 
     fn erased_receive(&mut self, wait: Duration) -> BoxFuture<'_, Next<AnyRoute>> {
@@ -340,6 +353,19 @@ impl Channel for ChannelSet {
 
     async fn publish_unlinked(&self, line: &str) -> Result<(), ChannelError> {
         self.on_all(|c| c.erased_publish_unlinked(line)).await
+    }
+
+    async fn prepare(&self, peers: &[(String, SetRoute)]) {
+        for (index, channel) in self.channels.iter().enumerate() {
+            let here: Vec<(String, AnyRoute)> = peers
+                .iter()
+                .filter(|(_, route)| route.channel == index)
+                .map(|(nick, route)| (nick.clone(), route.route.clone()))
+                .collect();
+            if !here.is_empty() {
+                channel.erased_prepare(&here).await;
+            }
+        }
     }
 
     async fn receive(&mut self, wait: Duration) -> Next<SetRoute> {

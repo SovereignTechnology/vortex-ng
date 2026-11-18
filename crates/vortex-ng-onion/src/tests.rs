@@ -5,7 +5,7 @@ use vortex_ng_core::line::sign_line;
 use vortex_ng_core::protocol::NOSTR_HOSTID;
 
 use super::*;
-use crate::testing::TestDirectory;
+use crate::testing::{TestDirectory, TestPeer};
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -14,6 +14,7 @@ fn config(directories: &[&TestDirectory], network: &str) -> OnionConfig {
         directories: directories.iter().map(|d| d.directory()).collect(),
         network: network.to_string(),
         timeout: Duration::from_secs(5),
+        peers: PeerPolicy::Relay,
     }
 }
 
@@ -242,4 +243,160 @@ async fn lines_are_bounded() {
         Some(7000)
     );
     assert_eq!(Directory::parse("bad host:1"), None);
+}
+
+/// Wait until `check` holds (connections and forwarding finish in the background).
+async fn eventually(check: impl Fn() -> bool) -> bool {
+    for _ in 0..100 {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    false
+}
+
+/// A taker channel that may connect to loopback peers, with a route to `maker` learned from a private line
+/// the directory relayed (and, before it, the directory's peer list naming where `maker` serves, as
+/// joinmarket-clientserver's directories send when they relay a line).
+async fn taker_with_route(
+    directory: &TestDirectory,
+    maker: &NickIdentity,
+    location: Option<String>,
+) -> (OnionChannel, OnionRoute) {
+    let mut cfg = config(&[directory], "regtest");
+    cfg.peers = PeerPolicy::Local;
+    let mut taker = OnionChannel::connect(NickIdentity::generate(), cfg, &Outbound::Direct)
+        .await
+        .unwrap();
+    taker.listen(true, false).await.unwrap();
+    settled(&[directory], 1).await;
+    if let Some(location) = location {
+        assert!(directory.send(
+            taker.nick(),
+            PEERLIST,
+            &format!("{};{location}", maker.nick())
+        ));
+    }
+    let offer = sign_line(
+        &Secp256k1::signing_only(),
+        maker.secret(),
+        taker.nick(),
+        "sw0absoffer",
+        "0 10000 100000 0 500",
+        ONION_HOSTID,
+    )
+    .unwrap();
+    assert!(directory.send(taker.nick(), PRIVMSG, &offer));
+    let Next::Message(Incoming::Private { route, .. }) = taker.receive(WAIT).await else {
+        panic!("the offer")
+    };
+    (taker, route)
+}
+
+#[tokio::test]
+async fn a_chosen_maker_is_reached_directly() {
+    // joinmarket-clientserver's maker accepts a handshake silently; JoinMarket-NG's answers it.
+    for answer in [false, true] {
+        let directory = TestDirectory::start("regtest", None).await;
+        let maker = NickIdentity::generate();
+        let peer = TestPeer::start("regtest", maker.nick(), answer).await;
+        let (mut taker, route) = taker_with_route(&directory, &maker, Some(peer.location())).await;
+        taker
+            .prepare(&[(maker.nick().to_string(), route.clone())])
+            .await;
+        let handshakes = peer.handshakes();
+        assert_eq!(handshakes.len(), 1, "answer {answer}");
+        assert!(
+            handshakes[0].contains(taker.nick()) && handshakes[0].contains("NOT-SERVING-ONION")
+        );
+
+        // The round's lines go over the direct connection; the directory never sees them.
+        taker
+            .send_private(&route, maker.nick(), "fill", "0 50000 abc")
+            .await
+            .unwrap();
+        let fill = format!("{}!{}!fill ", taker.nick(), maker.nick());
+        assert!(
+            eventually(|| peer
+                .received()
+                .iter()
+                .any(|(kind, line)| *kind == PRIVMSG && line.starts_with(&fill)))
+            .await
+        );
+        assert!(
+            !directory
+                .received()
+                .iter()
+                .any(|(_, _, line)| line.contains("!fill "))
+        );
+
+        // Only the maker's own lines count on its connection.
+        let secp = Secp256k1::signing_only();
+        let stranger = NickIdentity::generate();
+        let foreign = sign_line(
+            &secp,
+            stranger.secret(),
+            taker.nick(),
+            "pubkey",
+            &"ab".repeat(32),
+            ONION_HOSTID,
+        )
+        .unwrap();
+        let answer_line = sign_line(
+            &secp,
+            maker.secret(),
+            taker.nick(),
+            "pubkey",
+            &"cd".repeat(32),
+            ONION_HOSTID,
+        )
+        .unwrap();
+        assert!(peer.send(PRIVMSG, &foreign));
+        assert!(peer.send(PRIVMSG, &answer_line));
+        let Next::Message(Incoming::Private { msg, .. }) = taker.receive(WAIT).await else {
+            panic!("the maker's answer")
+        };
+        assert_eq!(
+            (msg.from.as_str(), msg.command.as_str()),
+            (maker.nick(), "pubkey")
+        );
+        assert!(matches!(
+            taker.receive(Duration::from_millis(300)).await,
+            Next::Timeout
+        ));
+    }
+}
+
+#[tokio::test]
+async fn without_a_direct_way_lines_go_by_the_directory() {
+    let directory = TestDirectory::start("regtest", None).await;
+    let maker = NickIdentity::generate();
+    // Where nobody listens; named only in answer to GETPEERLIST, as JoinMarket-NG's directories do.
+    let closed = {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    directory.set_peerlist(&[format!("{};127.0.0.1:{closed}", maker.nick())]);
+    let (taker, route) = taker_with_route(&directory, &maker, None).await;
+    taker
+        .prepare(&[(maker.nick().to_string(), route.clone())])
+        .await;
+    assert!(
+        directory
+            .received()
+            .iter()
+            .any(|(from, kind, _)| from == taker.nick() && *kind == GETPEERLIST)
+    );
+    taker
+        .send_private(&route, maker.nick(), "fill", "0 50000 abc")
+        .await
+        .unwrap();
+    assert!(
+        eventually(|| directory
+            .received()
+            .iter()
+            .any(|(_, kind, line)| *kind == PRIVMSG && line.contains("!fill ")))
+        .await
+    );
 }

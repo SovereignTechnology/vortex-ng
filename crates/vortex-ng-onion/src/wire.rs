@@ -187,6 +187,105 @@ pub fn directory_id(host: &str, port: u16) -> Option<String> {
     v3.then(|| format!("{host}:{port}"))
 }
 
+/// Most entries taken from one peer list.
+pub const MAX_PEERLIST_ENTRIES: usize = 1_000;
+
+/// One entry of a directory's peer list: a nick and where it serves, or that it left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerEntry {
+    /// The peer's nick.
+    pub nick: String,
+    /// Its onion host (or, for local test setups, a loopback address).
+    pub host: String,
+    /// Its port.
+    pub port: u16,
+    /// The directory says it left (`;D`).
+    pub gone: bool,
+}
+
+/// Whether `host` is a v3 onion name: 56 base32 characters and `.onion`.
+pub fn is_v3_onion(host: &str) -> bool {
+    host.strip_suffix(".onion").is_some_and(|name| {
+        name.len() == 56 && name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+    })
+}
+
+/// Whether `nick` looks like a JoinMarket nick (`J`, a version digit, base58 characters).
+fn plain_nick(nick: &str) -> bool {
+    (3..=32).contains(&nick.len())
+        && nick.starts_with('J')
+        && nick.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Parse a `PEERLIST` line: comma-separated entries `nick;host:port`, followed by `;D` when the peer left and
+/// by `;F:<features>` from JoinMarket-NG directories (ignored). An entry that does not parse, names a host
+/// that is not a v3 onion (with `local`, `127.0.0.1` and `localhost` too, for regtest setups that run without
+/// Tor), or comes after the first [`MAX_PEERLIST_ENTRIES`], is skipped.
+pub fn parse_peerlist(line: &str, local: bool) -> Vec<PeerEntry> {
+    line.split(',')
+        .take(MAX_PEERLIST_ENTRIES)
+        .filter_map(|entry| {
+            let mut parts = entry.split(';');
+            let nick = parts.next()?;
+            let location = parts.next()?;
+            let mut gone = false;
+            for part in parts {
+                match part {
+                    "D" => gone = true,
+                    features if features.starts_with("F:") => {}
+                    _ => return None,
+                }
+            }
+            let (host, port) = location.rsplit_once(':')?;
+            let port: u16 = port.parse().ok().filter(|p| *p > 0)?;
+            let reachable =
+                is_v3_onion(host) || (local && matches!(host, "127.0.0.1" | "localhost"));
+            (plain_nick(nick) && reachable).then(|| PeerEntry {
+                nick: nick.to_string(),
+                host: host.to_string(),
+                port,
+                gone,
+            })
+        })
+        .collect()
+}
+
+/// Check a peer's answer to our handshake on a direct connection (JoinMarket-NG sends one; joinmarket-clientserver
+/// accepts silently): JoinMarket, not a directory, protocol version 5, the same network.
+pub fn read_peer_hello(line: &str, network: &str) -> Result<(), WireError> {
+    let value: Value =
+        serde_json::from_str(line).map_err(|_| WireError("handshake is not JSON"))?;
+    let object = value
+        .as_object()
+        .ok_or(WireError("handshake is not an object"))?;
+    if object.get("app-name").and_then(Value::as_str) != Some(APP_NAME) {
+        return Err(WireError("not JoinMarket"));
+    }
+    if object.get("directory").and_then(Value::as_bool) == Some(true) {
+        return Err(WireError("a directory, not a peer"));
+    }
+    if object.get("accepted").and_then(Value::as_bool) == Some(false) {
+        return Err(WireError("the peer did not accept us"));
+    }
+    if object.get("network").and_then(Value::as_str) != Some(network) {
+        return Err(WireError("the peer is on another network"));
+    }
+    let version = |key: &str| object.get(key).and_then(Value::as_u64);
+    let supported = match (
+        version("proto-ver"),
+        version("proto-ver-min"),
+        version("proto-ver-max"),
+    ) {
+        (Some(v), _, _) => v == u64::from(JM_VERSION),
+        (None, Some(min), Some(max)) => (min..=max).contains(&u64::from(JM_VERSION)),
+        _ => false,
+    };
+    if !supported {
+        return Err(WireError("no common protocol version"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +372,58 @@ mod tests {
         );
         assert_eq!(directory_id("127.0.0.1", 5222), None);
         assert_eq!(directory_id("short.onion", 5222), None);
+    }
+
+    #[test]
+    fn peer_lists_are_parsed_and_checked() {
+        let onion = format!("{}.onion", "a".repeat(52) + "2345");
+        let line = format!(
+            "J5aaaaaaaaaaaaaa;{onion}:5222,J5bbbbbbbbbbbbbb;{onion}:5222;D,J5cccccccccccccc;{onion}:80;F:ping+neutrino_compat,\
+             J5dddddddddddddd;127.0.0.1:18082,J5eeeeeeeeeeeeee;evil.example.com:80,bad nick;{onion}:1,\
+             J5ffffffffffffff;{onion}:0,J5gggggggggggggg;{onion}:5222;X,J5hhhhhhhhhhhhhh"
+        );
+        let entries = parse_peerlist(&line, false);
+        let nicks: Vec<(&str, bool)> = entries.iter().map(|e| (e.nick.as_str(), e.gone)).collect();
+        assert_eq!(
+            nicks,
+            vec![
+                ("J5aaaaaaaaaaaaaa", false),
+                ("J5bbbbbbbbbbbbbb", true),
+                ("J5cccccccccccccc", false)
+            ]
+        );
+        assert_eq!(entries[2].port, 80);
+        // Loopback addresses only where asked for (regtest without Tor).
+        let local = parse_peerlist(&line, true);
+        assert!(
+            local
+                .iter()
+                .any(|e| e.nick == "J5dddddddddddddd" && e.host == "127.0.0.1" && e.port == 18082)
+        );
+        assert!(!is_v3_onion("short.onion"));
+        assert!(!is_v3_onion(&format!("{}.onion", "A".repeat(56))));
+        // Bounded.
+        let many =
+            vec![format!("J5aaaaaaaaaaaaaa;{onion}:5222"); MAX_PEERLIST_ENTRIES + 50].join(",");
+        assert_eq!(parse_peerlist(&many, false).len(), MAX_PEERLIST_ENTRIES);
+    }
+
+    #[test]
+    fn a_peer_answer_is_checked() {
+        let ng = r#"{"app-name":"joinmarket","directory":false,"location-string":"NOT-SERVING-ONION","proto-ver":5,"features":{},"nick":"J5x","network":"regtest"}"#;
+        assert!(read_peer_hello(ng, "regtest").is_ok());
+        assert!(read_peer_hello(ng, "testnet").is_err());
+        let directory = ng.replace(r#""directory":false"#, r#""directory":true"#);
+        assert!(read_peer_hello(&directory, "regtest").is_err());
+        let refused = ng.replace(r#""features":{}"#, r#""features":{},"accepted":false"#);
+        assert!(read_peer_hello(&refused, "regtest").is_err());
+        assert!(
+            read_peer_hello(
+                &ng.replace(r#""proto-ver":5"#, r#""proto-ver":4"#),
+                "regtest"
+            )
+            .is_err()
+        );
+        assert!(read_peer_hello("[]", "regtest").is_err());
     }
 }

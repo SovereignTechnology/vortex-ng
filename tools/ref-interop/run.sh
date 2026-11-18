@@ -193,7 +193,7 @@ start_vortex() {  # $1 = role, $2 = its directory
 }
 report() { grep -E 'IRC server at|directory at|IRC signature domain|answered on the|maker .* nick|taker nick|CoinJoin .* confirmed|panicked|failed|test result' "$1" | cut -c1-400 || true; }
 bot_report() {  # what a reference bot said that matters
-  grep -E -i 'offerlist=|txid|hp2|rejected|refus|invalid|Traceback|Error|giving up|Signature|Handshake' "$logs/$1.log" \
+  grep -E -i 'offerlist=|txid|hp2|rejected|refus|invalid|Traceback|Error|giving up|Signature|Handshake|connect-in' "$logs/$1.log" \
     | grep -v -E 'DEBUG.*(tick|sync)' | tail -n "$2" | cut -c1-300 || true
 }
 

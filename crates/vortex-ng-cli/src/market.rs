@@ -22,7 +22,7 @@ use vortex_ng_node::{
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_nostr::socks::Outbound;
-use vortex_ng_onion::{Directory, OnionChannel, OnionConfig};
+use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy};
 use vortex_ng_taker::{
     Coin, DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, TakerError, choose_coins, podle_for,
     verify_bond,
@@ -251,6 +251,13 @@ async fn channels(
             directories: meeting.directories.clone(),
             network: network.to_string(),
             timeout: Duration::from_secs(60),
+            // A taker connects directly to makers that serve an onion; on regtest, where setups run without
+            // Tor, to loopback addresses too.
+            peers: if network == "regtest" {
+                PeerPolicy::Local
+            } else {
+                PeerPolicy::Onion
+            },
         };
         let onion = OnionChannel::connect(identity(), config, outbound)
             .await

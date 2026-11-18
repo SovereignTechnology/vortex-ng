@@ -153,6 +153,15 @@ pub trait Channel: Send + Sync {
     fn publish_unlinked(&self, line: &str)
     -> impl Future<Output = Result<(), ChannelError>> + Send;
 
+    /// The driver is about to talk privately to these peers (a taker, to the makers it chose). A channel that
+    /// can reach a peer more directly than through what relays its lines may get ready to: the onion channel
+    /// opens direct connections to makers that serve an onion. It waits a bounded time and never fails: a
+    /// peer it cannot reach directly is reached as before.
+    fn prepare(&self, peers: &[(String, Self::Route)]) -> impl Future<Output = ()> + Send {
+        let _ = peers;
+        async {}
+    }
+
     /// Wait up to `wait` for the next message.
     fn receive(&mut self, wait: Duration) -> impl Future<Output = Next<Self::Route>> + Send;
 

@@ -609,6 +609,12 @@ pub async fn run_taker<C: Channel>(
     let bonds = blocking(|| verify_bonds(&proofs, &candidates, me, chain, unix_now(), cfg));
     let chosen = select_makers(&offers, &bonds, cfg);
     let in_round: HashSet<String> = chosen.iter().map(|(nick, _)| nick.clone()).collect();
+    // Where a channel can reach a chosen maker more directly, it gets ready before the first line goes.
+    let ready: Vec<(String, C::Route)> = chosen
+        .iter()
+        .filter_map(|(nick, _)| Some((nick.clone(), peers.get(nick)?.clone())))
+        .collect();
+    client.prepare(&ready).await;
     let outgoing = taker.start(chosen).map_err(NodeError::Taker)?;
     deliver(client, &peers, chain, outgoing).await?;
     while let Some(left) = until.checked_duration_since(Instant::now()) {

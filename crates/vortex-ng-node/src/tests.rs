@@ -504,6 +504,7 @@ async fn a_whole_coinjoin_through_an_onion_directory() {
         directories: vec![directory.directory()],
         network: "regtest".into(),
         timeout: Duration::from_secs(5),
+        peers: vortex_ng_onion::PeerPolicy::Relay,
     };
     let pit = Pit::Sw0;
     let mut utxos = HashMap::new();
@@ -782,6 +783,7 @@ async fn one_maker_on_three_channels_serves_a_taker_on_each() {
         directories: vec![directory.directory()],
         network: "regtest".into(),
         timeout: Duration::from_secs(5),
+        peers: vortex_ng_onion::PeerPolicy::Relay,
     };
     let irc_config = IrcConfig {
         server: irc.server(),

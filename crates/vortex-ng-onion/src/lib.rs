@@ -2,10 +2,17 @@
 //! and JoinMarket-NG (`jmcore/directory_client.py`) speak it (ADR 0007).
 //!
 //! An [`OnionChannel`] is one nick connected to every configured directory node at once. It serves no onion
-//! of its own (`NOT-SERVING-ONION`), so every private line is relayed by a directory: the directory sees who
-//! talks to whom, when, and how much, and the plain-text steps of a round (`!fill`, `!pubkey`); the encrypted
-//! steps stay encrypted. Private lines are JMP-0001 lines signed with `hostid` `onion-network`; public lines
-//! are unsigned.
+//! of its own (`NOT-SERVING-ONION`), so a private line is relayed by a directory unless a direct connection
+//! carries it: the directory sees who talks to whom, when, and how much, and the plain-text steps of a round
+//! (`!fill`, `!pubkey`); the encrypted steps stay encrypted. Private lines are JMP-0001 lines signed with
+//! `hostid` `onion-network`; public lines are unsigned.
+//!
+//! Direct connections (a taker's, issue #45): directories tell where peers that serve an onion are (peer
+//! lists, which joinmarket-clientserver's directories send when they relay a line and JoinMarket-NG's on
+//! request). When a taker has chosen its makers ([`Channel::prepare`]), the channel connects to each one that
+//! serves an onion, on a way out of its own (its own Tor circuit), says its handshake, and from then on sends
+//! that maker's private lines there and reads the maker's answers there; the directory no longer sees them. A
+//! connection that fails or drops leaves the lines to the directories. Nothing is ever accepted inbound.
 //!
 //! Each directory has a task that connects (through the nick's own [`NickConnector`], so a Tor daemon gives
 //! this nick circuits of its own), does the handshake (and JoinMarket-NG's nick authentication, JMP-0005,
@@ -41,8 +48,9 @@ use vortex_ng_core::protocol::ONION_HOSTID;
 use vortex_ng_core::sigmsg;
 
 use crate::wire::{
-    DN_HANDSHAKE, HANDSHAKE, NICK_AUTH_CHALLENGE, NICK_AUTH_PROOF, NICK_AUTH_RESULT, PING, PONG,
-    PRIVMSG, PUBMSG, encode, public_line, read_directory_hello, read_public_line,
+    DN_HANDSHAKE, GETPEERLIST, HANDSHAKE, NICK_AUTH_CHALLENGE, NICK_AUTH_PROOF, NICK_AUTH_RESULT,
+    PEERLIST, PING, PONG, PRIVMSG, PUBMSG, encode, parse_peerlist, public_line,
+    read_directory_hello, read_peer_hello, read_public_line,
 };
 
 /// The port directory nodes listen on.
@@ -61,6 +69,18 @@ const MAX_BACKOFF: Duration = Duration::from_secs(600);
 const NICK_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// The domain JoinMarket-NG's nick-authentication proof ends with (JMP-0005).
 const NICK_AUTH_DOMAIN: &[u8] = b"nick-auth-v1";
+/// Most peer locations remembered.
+const MAX_LOCATIONS: usize = 10_000;
+/// How long a peer location is trusted after a directory named it.
+const LOCATION_TTL: Duration = Duration::from_secs(3_600);
+/// Most direct connections open at once.
+const MAX_LINKS: usize = 32;
+/// How long a peer may take to answer our handshake on a direct connection (it need not answer at all).
+const PEER_HELLO_WAIT: Duration = Duration::from_secs(2);
+/// How long `prepare` waits for directories to name unknown peers' locations.
+const LOCATION_WAIT: Duration = Duration::from_secs(3);
+/// The longest `prepare` takes, at most `config.timeout`.
+const PREPARE_LIMIT: Duration = Duration::from_secs(30);
 
 fn transport(e: impl std::fmt::Display) -> ChannelError {
     ChannelError::Transport(format!("onion directory: {e}"))
@@ -99,6 +119,18 @@ impl Directory {
     }
 }
 
+/// Whether, and where, a taker connects to makers directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerPolicy {
+    /// Never: every private line goes through the directories.
+    Relay,
+    /// To makers that serve a v3 onion, through the way out (a Tor daemon's SOCKS port).
+    Onion,
+    /// Also to loopback addresses: regtest setups that run without Tor (joinmarket-clientserver's testing
+    /// mode). Never outside regtest.
+    Local,
+}
+
 /// What an [`OnionChannel`] connects to.
 #[derive(Clone, Debug)]
 pub struct OnionConfig {
@@ -109,12 +141,21 @@ pub struct OnionConfig {
     pub network: String,
     /// How long a connection and its handshake may take.
     pub timeout: Duration,
+    /// Direct connections to makers.
+    pub peers: PeerPolicy,
 }
 
-/// The directory a line came through, and the one an answer goes back through.
+/// Where a line came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Via {
+    Directory(usize),
+    Peer(String),
+}
+
+/// The directory or direct connection a line came through; an answer goes back the most direct way open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnionRoute {
-    directory: usize,
+    via: Via,
 }
 
 /// Lines recently seen, to drop the copies other directories deliver.
@@ -153,15 +194,59 @@ struct Shared {
     connector: NickConnector,
     /// Per directory, the writer while connected.
     writers: Vec<Mutex<Option<mpsc::Sender<String>>>>,
-    inbox: mpsc::Sender<(usize, u64, String)>,
+    inbox: mpsc::Sender<(Via, u64, String)>,
     stop: AtomicBool,
+    /// Where peers serve, as directories named them: nick -> (host, port, when).
+    locations: Mutex<HashMap<String, (String, u16, Instant)>>,
+    /// Open direct connections: nick -> writer.
+    links: Mutex<HashMap<String, mpsc::Sender<String>>>,
+}
+
+impl Shared {
+    /// Take in a directory's peer list.
+    fn learn(&self, line: &str) {
+        if self.config.peers == PeerPolicy::Relay {
+            return;
+        }
+        let entries = parse_peerlist(line, self.config.peers == PeerPolicy::Local);
+        let Ok(mut locations) = self.locations.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        for entry in entries {
+            if entry.gone {
+                locations.remove(&entry.nick);
+                continue;
+            }
+            if locations.len() >= MAX_LOCATIONS && !locations.contains_key(&entry.nick) {
+                locations.retain(|_, (_, _, at)| now.duration_since(*at) < LOCATION_TTL);
+                if locations.len() >= MAX_LOCATIONS {
+                    continue;
+                }
+            }
+            locations.insert(entry.nick, (entry.host, entry.port, now));
+        }
+    }
+
+    /// Where `nick` serves, if a directory said so recently.
+    fn location(&self, nick: &str) -> Option<(String, u16)> {
+        let locations = self.locations.lock().ok()?;
+        let (host, port, at) = locations.get(nick)?;
+        (at.elapsed() < LOCATION_TTL).then(|| (host.clone(), *port))
+    }
+
+    /// The writer of the direct connection to `nick`, if one is open.
+    fn link(&self, nick: &str) -> Option<mpsc::Sender<String>> {
+        let links = self.links.lock().ok()?;
+        links.get(nick).filter(|w| !w.is_closed()).cloned()
+    }
 }
 
 /// One nick on JoinMarket's onion directories. See the crate documentation.
 pub struct OnionChannel {
     shared: Arc<Shared>,
     outbound: Outbound,
-    inbox: Mutex<mpsc::Receiver<(usize, u64, String)>>,
+    inbox: Mutex<mpsc::Receiver<(Via, u64, String)>>,
     seen: Mutex<Seen>,
     /// Bit 0: offers wanted; bit 1: public messages wanted.
     wants: AtomicU8,
@@ -356,10 +441,16 @@ async fn session(
     let result = loop {
         match read_line(&mut reader).await {
             Ok((kind @ (PRIVMSG | PUBMSG), line)) => {
-                if shared.inbox.send((index, kind, line)).await.is_err() {
+                if shared
+                    .inbox
+                    .send((Via::Directory(index), kind, line))
+                    .await
+                    .is_err()
+                {
                     break Ok(());
                 }
             }
+            Ok((PEERLIST, line)) => shared.learn(&line),
             Ok((PING, _)) => {
                 if let Ok(pong) = encode(PONG, "") {
                     let _ = out_tx.try_send(pong);
@@ -368,7 +459,7 @@ async fn session(
             Ok((NICK_AUTH_CHALLENGE | NICK_AUTH_PROOF | NICK_AUTH_RESULT, _)) => {
                 break Err("nick authentication after the handshake".into());
             }
-            // Peer lists, pongs and anything else are not needed without direct connections.
+            // Pongs and anything else.
             Ok(_) => {}
             Err(e) => break Err(e),
         }
@@ -417,6 +508,8 @@ impl OnionChannel {
             connector: outbound.connector(),
             inbox: inbox_tx,
             stop: AtomicBool::new(false),
+            locations: Mutex::new(HashMap::new()),
+            links: Mutex::new(HashMap::new()),
         });
         let (ready_tx, mut ready_rx) = mpsc::channel(count);
         let tasks = (0..count)
@@ -486,16 +579,28 @@ impl OnionChannel {
             .count()
     }
 
-    /// What arrived on directory `index`, as a message for the drivers, if it is one.
-    fn message(&self, index: usize, kind: u64, line: &str) -> Option<Incoming<OnionRoute>> {
-        let route = OnionRoute { directory: index };
+    /// What arrived through `via`, as a message for the drivers, if it is one. A direct connection carries
+    /// only private lines from the peer it leads to.
+    fn message(&self, via: Via, kind: u64, line: &str) -> Option<Incoming<OnionRoute>> {
         let nick = self.shared.identity.nick();
         let wants = self.wants.load(Ordering::SeqCst);
         if kind == PRIVMSG {
             let msg =
                 verify_line(&Secp256k1::verification_only(), line, ONION_HOSTID, nick).ok()?;
-            return Some(Incoming::Private { msg, route });
+            if let Via::Peer(peer) = &via
+                && msg.from != *peer
+            {
+                return None;
+            }
+            return Some(Incoming::Private {
+                msg,
+                route: OnionRoute { via },
+            });
         }
+        if matches!(via, Via::Peer(_)) {
+            return None;
+        }
+        let route = OnionRoute { via };
         let (from, text) = read_public_line(line)?;
         if from == nick {
             return None;
@@ -534,8 +639,8 @@ impl Channel for OnionChannel {
         self.shared.identity.nick()
     }
 
-    // A directory forwards lines; joinmarket-clientserver's does not check who sent them, and any directory
-    // can deliver a line again.
+    // A directory forwards lines and need not check who sent them; any directory can deliver a line again. A
+    // direct connection's peer location came from a directory too.
     fn authenticates(&self, _route: &OnionRoute) -> bool {
         false
     }
@@ -562,11 +667,97 @@ impl Channel for OnionChannel {
             ONION_HOSTID,
         )
         .map_err(ChannelError::Line)?;
-        // The directory the peer's line came through holds its connection; another may too.
-        match self.send_to(route.directory, PRIVMSG, &line) {
+        // A direct connection first; then the directory the peer's line came through, which holds its
+        // connection; then any other.
+        if let Some(link) = self.shared.link(to) {
+            let encoded = encode(PRIVMSG, &line).map_err(|e| ChannelError::Invalid(e.0))?;
+            if link.try_send(encoded).is_ok() {
+                return Ok(());
+            }
+        }
+        let sent = match &route.via {
+            Via::Directory(index) => self.send_to(*index, PRIVMSG, &line),
+            Via::Peer(_) => Err(transport("no directory named")),
+        };
+        match sent {
             Ok(()) => Ok(()),
             Err(e @ ChannelError::Invalid(_)) => Err(e),
             Err(_) => self.send_all(PRIVMSG, &line),
+        }
+    }
+
+    async fn prepare(&self, peers: &[(String, OnionRoute)]) {
+        if self.shared.config.peers == PeerPolicy::Relay {
+            return;
+        }
+        let wanted: Vec<&str> = peers
+            .iter()
+            .map(|(nick, _)| nick.as_str())
+            .filter(|nick| self.shared.link(nick).is_none())
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        // Ask the directories for peers they have not named yet (JoinMarket-NG's answer; joinmarket-clientserver's
+        // ignore it, and name a peer when they relay its line).
+        if wanted
+            .iter()
+            .any(|nick| self.shared.location(nick).is_none())
+        {
+            let _ = self.send_all(GETPEERLIST, "");
+            let until = Instant::now() + LOCATION_WAIT;
+            while Instant::now() < until
+                && wanted
+                    .iter()
+                    .any(|nick| self.shared.location(nick).is_none())
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let limit = self.shared.config.timeout.min(PREPARE_LIMIT);
+        let mut attempts = Vec::new();
+        for nick in wanted {
+            let Some((host, port)) = self.shared.location(nick) else {
+                continue;
+            };
+            let open_links = self
+                .shared
+                .links
+                .lock()
+                .map(|l| l.len())
+                .unwrap_or(MAX_LINKS);
+            if open_links + attempts.len() >= MAX_LINKS {
+                break;
+            }
+            let shared = Arc::clone(&self.shared);
+            let connector = self.outbound.connector();
+            let nick = nick.to_string();
+            attempts.push(tokio::spawn(async move {
+                let opened = tokio::time::timeout(
+                    limit,
+                    open_peer(
+                        &connector,
+                        &host,
+                        port,
+                        &shared.identity,
+                        &shared.config.network,
+                    ),
+                )
+                .await;
+                match opened {
+                    Ok(Ok((reader, writer, first))) => Some((nick, reader, writer, first)),
+                    _ => None,
+                }
+            }));
+        }
+        for attempt in attempts {
+            let Ok(Some((nick, reader, writer, first))) = attempt.await else {
+                continue;
+            };
+            let task = start_link(Arc::clone(&self.shared), nick, reader, writer, first);
+            if let Ok(mut tasks) = self.tasks.lock() {
+                tasks.extend(task);
+            }
         }
     }
 
@@ -638,7 +829,7 @@ impl Channel for OnionChannel {
             let Ok(inbox) = self.inbox.get_mut() else {
                 return Next::Closed;
             };
-            let (index, kind, line) = match tokio::time::timeout_at(deadline, inbox.recv()).await {
+            let (via, kind, line) = match tokio::time::timeout_at(deadline, inbox.recv()).await {
                 Ok(Some(item)) => item,
                 Ok(None) => return Next::Closed,
                 Err(_) => return Next::Timeout,
@@ -651,7 +842,7 @@ impl Channel for OnionChannel {
             if !fresh {
                 continue;
             }
-            if let Some(message) = self.message(index, kind, &line) {
+            if let Some(message) = self.message(via, kind, &line) {
                 return Next::Message(message);
             }
         }
@@ -669,7 +860,100 @@ impl Channel for OnionChannel {
                 *writer = None;
             }
         }
+        if let Ok(mut links) = self.shared.links.lock() {
+            links.clear();
+        }
     }
+}
+
+/// Connect to a peer that serves an onion and say our handshake. Returns the connection and, if the peer
+/// sent a line other than a handshake straight away, that line.
+async fn open_peer(
+    connector: &NickConnector,
+    host: &str,
+    port: u16,
+    identity: &NickIdentity,
+    network: &str,
+) -> Result<(Reader, Writer, Option<(u64, String)>), String> {
+    let stream = connector
+        .connect(host, port)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (read, mut write) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read);
+    let handshake = wire::client_handshake(identity.nick(), network, &[]);
+    write_line(&mut write, HANDSHAKE, &handshake).await?;
+    // JoinMarket-NG answers with a handshake of its own; joinmarket-clientserver accepts silently.
+    let first = match tokio::time::timeout(PEER_HELLO_WAIT, read_line(&mut reader)).await {
+        Err(_) => None,
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok((HANDSHAKE, line))) => {
+            read_peer_hello(&line, network).map_err(|e| e.to_string())?;
+            None
+        }
+        Ok(Ok(other)) => Some(other),
+    };
+    Ok((reader, write, first))
+}
+
+/// Keep a direct connection to `nick`: its writer goes into the shared links, its reader hands that peer's
+/// private lines on. The connection is forgotten when it drops.
+fn start_link(
+    shared: Arc<Shared>,
+    nick: String,
+    mut reader: Reader,
+    mut writer: Writer,
+    first: Option<(u64, String)>,
+) -> Vec<JoinHandle<()>> {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOX);
+    if let Ok(mut links) = shared.links.lock() {
+        links.insert(nick.clone(), out_tx.clone());
+    }
+    let write_task = tokio::spawn(async move {
+        while let Some(line) = out_rx.recv().await {
+            if writer.write_all(line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+    let read_task = tokio::spawn(async move {
+        let mut next = first;
+        loop {
+            let (kind, line) = match next.take() {
+                Some(item) => item,
+                None => match read_line(&mut reader).await {
+                    Ok(item) => item,
+                    Err(_) => break,
+                },
+            };
+            match kind {
+                PRIVMSG => {
+                    if shared
+                        .inbox
+                        .send((Via::Peer(nick.clone()), kind, line))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                PING => {
+                    if let Ok(pong) = encode(PONG, "") {
+                        let _ = out_tx.try_send(pong);
+                    }
+                }
+                // A late handshake, or anything else a peer has no business sending here.
+                _ => {}
+            }
+        }
+        if let Ok(mut links) = shared.links.lock()
+            && links.get(&nick).is_some_and(|w| w.same_channel(&out_tx))
+        {
+            links.remove(&nick);
+        }
+    });
+    vec![write_task, read_task]
 }
 
 #[cfg(test)]

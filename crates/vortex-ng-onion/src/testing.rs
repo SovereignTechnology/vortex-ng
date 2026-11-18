@@ -5,7 +5,10 @@
 //! (refusing another network and a nick already connected), offers ping and, when given an identity, nick
 //! authentication (JMP-0005); it forwards a public line to every other peer and a private line to its
 //! recipient, and only from the nick that connected. It records what it received, and a test can make it
-//! send any line to a peer.
+//! send any line to a peer, or give it a peer list to answer `GETPEERLIST` with.
+//!
+//! [`TestPeer`] is a peer that serves on loopback, as a maker serving an onion would: it takes one direct
+//! connection, records the handshake and the lines it gets, and sends lines back when told.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -25,8 +28,8 @@ use vortex_ng_core::sigmsg;
 use vortex_ng_core::tx::random_bytes;
 
 use crate::wire::{
-    DN_HANDSHAKE, HANDSHAKE, NICK_AUTH_CHALLENGE, NICK_AUTH_PROOF, NICK_AUTH_RESULT, PING, PONG,
-    PRIVMSG, PUBMSG, encode,
+    DN_HANDSHAKE, GETPEERLIST, HANDSHAKE, NICK_AUTH_CHALLENGE, NICK_AUTH_PROOF, NICK_AUTH_RESULT,
+    PEERLIST, PING, PONG, PRIVMSG, PUBMSG, encode,
 };
 use crate::{Directory, NICK_AUTH_DOMAIN, read_line};
 
@@ -36,6 +39,7 @@ struct State {
     verified: Vec<String>,
     pongs: usize,
     received: Vec<(String, u64, String)>,
+    peerlist: Vec<String>,
 }
 
 /// A directory node on `127.0.0.1:<ephemeral>`.
@@ -129,6 +133,13 @@ impl TestDirectory {
             .ok()
             .and_then(|s| s.peers.get(nick).map(|tx| tx.send(encoded).is_ok()))
             .unwrap_or(false)
+    }
+
+    /// The peer list (`nick;host:port` entries) to answer `GETPEERLIST` with.
+    pub fn set_peerlist(&self, entries: &[String]) {
+        if let Ok(mut s) = self.state.lock() {
+            s.peerlist = entries.to_vec();
+        }
     }
 
     /// Ping every connected peer.
@@ -268,11 +279,146 @@ async fn serve(
                 }
             }
             PONG => s.pongs += 1,
+            GETPEERLIST if !s.peerlist.is_empty() => {
+                if let (Some(peer), Ok(list)) =
+                    (s.peers.get(&nick), encode(PEERLIST, &s.peerlist.join(",")))
+                {
+                    let _ = peer.send(list);
+                }
+            }
             _ => {}
         }
     }
     if let Ok(mut s) = state.lock() {
         s.peers.remove(&nick);
+    }
+    writer.abort();
+    Ok(())
+}
+
+#[derive(Default)]
+struct PeerState {
+    handshakes: Vec<String>,
+    received: Vec<(u64, String)>,
+    writer: Option<mpsc::UnboundedSender<String>>,
+}
+
+/// A peer serving on `127.0.0.1:<ephemeral>` (see the module documentation).
+pub struct TestPeer {
+    addr: SocketAddr,
+    state: Arc<Mutex<PeerState>>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for TestPeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl TestPeer {
+    /// A peer on `network` named `nick`. With `answer`, it answers a handshake with its own, as
+    /// JoinMarket-NG does; without, it accepts silently, as joinmarket-clientserver does.
+    pub async fn start(network: &str, nick: &str, answer: bool) -> TestPeer {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap_or_else(|e| panic!("bind: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("address: {e}"));
+        let state = Arc::new(Mutex::new(PeerState::default()));
+        let task_state = Arc::clone(&state);
+        let (network, nick) = (network.to_string(), nick.to_string());
+        let task = tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                let (state, network, nick) =
+                    (Arc::clone(&task_state), network.clone(), nick.clone());
+                tokio::spawn(async move {
+                    let _ = serve_peer(conn, state, &network, &nick, answer).await;
+                });
+            }
+        });
+        TestPeer { addr, state, task }
+    }
+
+    /// Its location, as a directory's peer list names it.
+    pub fn location(&self) -> String {
+        format!("{}:{}", self.addr.ip(), self.addr.port())
+    }
+
+    /// The handshakes it was sent.
+    pub fn handshakes(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|s| s.handshakes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every line it got after a handshake: type, line.
+    pub fn received(&self) -> Vec<(u64, String)> {
+        self.state
+            .lock()
+            .map(|s| s.received.clone())
+            .unwrap_or_default()
+    }
+
+    /// Send `line` of type `kind` on the open connection.
+    pub fn send(&self, kind: u64, line: &str) -> bool {
+        let Ok(encoded) = encode(kind, line) else {
+            return false;
+        };
+        self.state
+            .lock()
+            .ok()
+            .and_then(|s| s.writer.as_ref().map(|w| w.send(encoded).is_ok()))
+            .unwrap_or(false)
+    }
+}
+
+async fn serve_peer(
+    conn: TcpStream,
+    state: Arc<Mutex<PeerState>>,
+    network: &str,
+    nick: &str,
+    answer: bool,
+) -> Result<(), String> {
+    let (read, mut write) = conn.into_split();
+    let mut reader = BufReader::new(read);
+    let (kind, handshake) = tokio::time::timeout(Duration::from_secs(10), read_line(&mut reader))
+        .await
+        .map_err(|_| "no handshake")??;
+    if kind != HANDSHAKE {
+        return Err("expected a handshake".into());
+    }
+    if let Ok(mut s) = state.lock() {
+        s.handshakes.push(handshake);
+    }
+    if answer {
+        let ours = json!({
+            "app-name": "joinmarket", "directory": false, "location-string": "127.0.0.1:1",
+            "proto-ver": 5, "features": {}, "nick": nick, "network": network,
+        });
+        let line = encode(HANDSHAKE, &ours.to_string()).map_err(|e| e.to_string())?;
+        write
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    if let Ok(mut s) = state.lock() {
+        s.writer = Some(tx);
+    }
+    let writer = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            if write.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    });
+    while let Ok((kind, line)) = read_line(&mut reader).await {
+        if let Ok(mut s) = state.lock() {
+            s.received.push((kind, line));
+        }
     }
     writer.abort();
     Ok(())

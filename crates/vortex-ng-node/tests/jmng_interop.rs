@@ -42,7 +42,7 @@ use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{CONNECT_TIMEOUT, run_maker, run_taker};
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
-use vortex_ng_onion::{Directory, OnionChannel, OnionConfig};
+use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy};
 use vortex_ng_taker::{DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, podle_for};
 use vortex_ng_wallet::{MIXDEPTHS, PitWallet, Seed};
 
@@ -172,6 +172,9 @@ async fn meet(harness: &Harness, url: &str) -> ChannelSet {
                         directories: vec![directory.clone()],
                         network: harness.onion_network.clone(),
                         timeout: Duration::from_secs(60),
+                        // The reference's makers serve on loopback in its testing mode: a taker reaches
+                        // them directly once the directory names them.
+                        peers: PeerPolicy::Local,
                     },
                     &Outbound::Direct,
                 )
