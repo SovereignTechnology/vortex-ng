@@ -534,9 +534,8 @@ impl Channel for IrcChannel {
         Ok(())
     }
 
-    // A throwaway nick on a way out of its own joins the pit and says it in public. joinmarket-clientserver
-    // instead hands the line to a random maker in private, which tells that maker and the server who is in a
-    // round; its makers accept the public line from any nick.
+    // A throwaway nick on a way out of its own joins the pit and says it in public, so the line is not tied to
+    // the nick that relays it.
     async fn publish_unlinked(&self, line: &str) -> Result<(), ChannelError> {
         let throwaway = NickIdentity::generate();
         let config = IrcConfig {

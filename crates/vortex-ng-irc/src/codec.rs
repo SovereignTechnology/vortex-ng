@@ -9,7 +9,7 @@
 //!   `!command `, each ends with ` ;` (more follows) or ` ~` (the last). Pieces are chosen by position, not
 //!   by comparing their text as joinmarket-clientserver does (which mislabels equal pieces); its receivers
 //!   read either the same way.
-//! - Reassembly per sender, bounded in size, time and senders (joinmarket-clientserver's is not).
+//! - Reassembly per sender, bounded in size, time and senders.
 //! - The signature domain (`hostid`) is the server's `NETWORK=` from its `005` line; see [`Hostid`].
 //! - One line per [`LINE_INTERVAL`], the rate joinmarket-clientserver keeps ([`Pacer`]).
 //! - CTCP (`\x01…\x01`) is never answered.
