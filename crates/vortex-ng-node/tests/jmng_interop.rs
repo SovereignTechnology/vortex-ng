@@ -1,13 +1,16 @@
-//! A CoinJoin between vortex-ng and joinmarket-ng on a regtest node, over the Nostr message channel or over
-//! JoinMarket's onion directory channel.
+//! A CoinJoin between vortex-ng and another JoinMarket implementation on a regtest node: joinmarket-ng
+//! (`tools/jmng-interop/run.sh`) over the Nostr message channel or JoinMarket's onion directory channel, or
+//! joinmarket-clientserver (`tools/ref-interop/run.sh`) over the onion directory channel or IRC.
 //!
-//! Skipped unless `VORTEX_NG_INTEROP_DIR` is set (`tools/jmng-interop/run.sh` sets it, with
-//! `VORTEX_NG_REGTEST_RPC` and `VORTEX_NG_REGTEST_COOKIE`). On Nostr this side runs the relay (nostr-sdk's
-//! in-process relay, on loopback) and joinmarket-ng's makers, built with its Nostr channel, join it. With
+//! Skipped unless `VORTEX_NG_INTEROP_DIR` is set (the harnesses set it, with `VORTEX_NG_REGTEST_RPC` and
+//! `VORTEX_NG_REGTEST_COOKIE`). On Nostr this side runs the relay (nostr-sdk's in-process relay, on loopback)
+//! and joinmarket-ng's makers, built with its Nostr channel, join it. With
 //! `VORTEX_NG_INTEROP_DIRECTORY=<host:port>` (and `VORTEX_NG_INTEROP_DIRECTORY_ID`, its JMP-0005 identity)
-//! both sides meet on joinmarket-ng's own directory server instead, which the harness runs. Either way this
-//! side writes where to meet to `<dir>/relay.url` once the chain is ready, and the harness then starts
-//! joinmarket-ng's side.
+//! both sides meet on a directory node the harness runs instead; `VORTEX_NG_INTEROP_ONION_NETWORK` is the
+//! network name the directory expects (`regtest`, or `testnet` for joinmarket-clientserver, which runs regtest
+//! as testnet). With `VORTEX_NG_INTEROP_IRC=<host:port>` (and `VORTEX_NG_INTEROP_IRC_NETWORK`, the `NETWORK`
+//! name the server announces, if any) both sides meet on an IRC server. Either way this side writes where to
+//! meet to `<dir>/relay.url` once the chain is ready, and the harness then starts the other side.
 //!
 //! `taker_with_joinmarket_ng_makers` (`VORTEX_NG_INTEROP_ROLE=taker`): a vortex-ng taker waits until the
 //! joinmarket-ng makers have announced their offers, asks them for the orderbook, and runs a round with them
@@ -34,6 +37,7 @@ use vortex_ng_channel::{Channel, Incoming as Arrived, Next};
 use vortex_ng_core::bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
 use vortex_ng_core::nick::NickIdentity;
 use vortex_ng_core::offer::{Offer, Pit};
+use vortex_ng_irc::{IrcChannel, IrcConfig, IrcServer};
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{CONNECT_TIMEOUT, run_maker, run_taker};
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
@@ -66,6 +70,10 @@ struct Harness {
     pit: Pit,
     /// `VORTEX_NG_INTEROP_DIRECTORY`: meet on this onion directory node instead of a Nostr relay.
     directory: Option<Directory>,
+    /// `VORTEX_NG_INTEROP_ONION_NETWORK`: the network name in the directory handshake.
+    onion_network: String,
+    /// `VORTEX_NG_INTEROP_IRC`: meet on this IRC server instead.
+    irc: Option<IrcServer>,
 }
 
 impl Harness {
@@ -95,7 +103,23 @@ impl Harness {
                     directory.id = std::env::var("VORTEX_NG_INTEROP_DIRECTORY_ID").ok();
                     directory
                 }),
+            onion_network: std::env::var("VORTEX_NG_INTEROP_ONION_NETWORK")
+                .unwrap_or_else(|_| "regtest".into()),
+            irc: std::env::var("VORTEX_NG_INTEROP_IRC").ok().map(|text| {
+                let mut server = IrcServer::parse(&text).expect("an IRC server host:port");
+                server.expected_network = std::env::var("VORTEX_NG_INTEROP_IRC_NETWORK").ok();
+                server
+            }),
         })
+    }
+
+    /// Where the sides meet, for the log.
+    fn place(&self, url: &str) -> String {
+        match (&self.irc, &self.directory) {
+            (Some(irc), _) => format!("IRC server at {}:{}", irc.host, irc.port),
+            (None, Some(directory)) => format!("directory at {}:{}", directory.host, directory.port),
+            (None, None) => format!("relay at {url}"),
+        }
     }
 
     fn rpc(&self) -> CoreRpc {
@@ -120,15 +144,30 @@ fn sink() -> vortex_ng_core::bitcoin::Address {
         .unwrap()
 }
 
-/// A channel for a new nick: on the directory when one is given, else on the relay at `url`.
+/// A channel for a new nick: on the IRC server or the directory when one is given, else on the relay at `url`.
 async fn meet(harness: &Harness, url: &str) -> ChannelSet {
-    let channel: Box<dyn vortex_ng_channel::set::DynChannel> = match &harness.directory {
-        Some(directory) => Box::new(
+    let channel: Box<dyn vortex_ng_channel::set::DynChannel> = match (&harness.irc, &harness.directory) {
+        (Some(server), _) => {
+            let channel = IrcChannel::connect(
+                NickIdentity::generate(),
+                IrcConfig {
+                    server: server.clone(),
+                    network: "regtest".into(),
+                    timeout: Duration::from_secs(60),
+                },
+                &Outbound::Direct,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the IRC server: {e}"));
+            println!("IRC signature domain {:?}", channel.hostid());
+            Box::new(channel)
+        }
+        (None, Some(directory)) => Box::new(
             OnionChannel::connect(
                 NickIdentity::generate(),
                 OnionConfig {
                     directories: vec![directory.clone()],
-                    network: "regtest".into(),
+                    network: harness.onion_network.clone(),
                     timeout: Duration::from_secs(60),
                 },
                 &Outbound::Direct,
@@ -136,7 +175,7 @@ async fn meet(harness: &Harness, url: &str) -> ChannelSet {
             .await
             .unwrap_or_else(|e| panic!("the directory: {e}")),
         ),
-        None => Box::new(
+        (None, None) => Box::new(
             NickClient::connect(
                 NickKeys::generate(),
                 "regtest",
@@ -151,8 +190,9 @@ async fn meet(harness: &Harness, url: &str) -> ChannelSet {
     ChannelSet::new(vec![channel]).unwrap()
 }
 
-/// Wait until `count` different makers answer `!orderbook` on the directory (asked every five seconds).
-async fn wait_for_directory_makers(harness: &Harness, count: usize, limit: Duration) {
+/// Wait until `count` different makers answer `!orderbook` on the directory or IRC server (asked every five
+/// seconds).
+async fn wait_for_answering_makers(harness: &Harness, count: usize, limit: Duration) {
     let mut observer = meet(harness, "").await;
     observer.listen(true, false).await.unwrap();
     let until = Instant::now() + limit;
@@ -174,7 +214,7 @@ async fn wait_for_directory_makers(harness: &Harness, count: usize, limit: Durat
             _ => continue,
         };
         if seen.insert(nick.clone()) {
-            println!("maker {nick} answered on the directory");
+            println!("maker {nick} answered on the {}", harness.place(""));
         }
     }
     observer.shutdown().await;
@@ -246,15 +286,11 @@ async fn taker_with_joinmarket_ng_makers() {
 
     // Everything the makers need is on the chain: tell the harness where to send them.
     std::fs::write(harness.dir.join("relay.url"), &url).unwrap();
-    match &harness.directory {
-        Some(directory) => {
-            println!("directory at {}:{}", directory.host, directory.port);
-            wait_for_directory_makers(&harness, harness.makers, Duration::from_secs(900)).await;
-        }
-        None => {
-            println!("relay at {url}");
-            wait_for_makers(&url, harness.makers, Duration::from_secs(900)).await;
-        }
+    println!("{}", harness.place(&url));
+    if harness.directory.is_some() || harness.irc.is_some() {
+        wait_for_answering_makers(&harness, harness.makers, Duration::from_secs(900)).await;
+    } else {
+        wait_for_makers(&url, harness.makers, Duration::from_secs(900)).await;
     }
 
     let utxo = taker_wallet.utxos(0).unwrap().remove(0);
@@ -299,7 +335,7 @@ async fn taker_with_joinmarket_ng_makers() {
         Instant::now() + Duration::from_secs(180),
     )
     .await
-    .unwrap_or_else(|e| panic!("the round with joinmarket-ng's makers failed: {e}"));
+    .unwrap_or_else(|e| panic!("the round with the other side's makers failed: {e}"));
 
     rpc.test_accept(&tx)
         .unwrap()
@@ -332,7 +368,7 @@ async fn taker_with_joinmarket_ng_makers() {
     );
     std::fs::write(harness.dir.join("taker.txid"), txid.to_string()).unwrap();
     println!(
-        "CoinJoin {txid} with {} joinmarket-ng makers confirmed: {} inputs, {} outputs",
+        "CoinJoin {txid} with {} makers of the other implementation confirmed: {} inputs, {} outputs",
         harness.makers,
         tx.input.len(),
         tx.output.len()
@@ -413,9 +449,9 @@ async fn makers_with_joinmarket_ng_taker() {
     }
     // The makers are connecting: tell the harness where.
     std::fs::write(harness.dir.join("relay.url"), &url).unwrap();
-    println!("relay at {url}");
+    println!("{}", harness.place(&url));
 
-    // The harness runs joinmarket-ng's taker, mines a block, then names the transaction.
+    // The harness runs the other implementation's taker, mines a block, then names the transaction.
     let result = harness.dir.join("jmng.txid");
     let txid: Txid = loop {
         if let Ok(text) = std::fs::read_to_string(&result) {
@@ -423,7 +459,7 @@ async fn makers_with_joinmarket_ng_taker() {
         }
         assert!(
             Instant::now() < until,
-            "joinmarket-ng's taker never finished a round"
+            "the other implementation's taker never finished a round"
         );
         for handle in &handles {
             assert!(!handle.is_finished(), "a maker stopped before the round");
@@ -460,7 +496,7 @@ async fn makers_with_joinmarket_ng_taker() {
         );
     }
     println!(
-        "CoinJoin {txid} by joinmarket-ng's taker with {} vortex-ng makers confirmed: {} inputs, {} outputs",
+        "CoinJoin {txid} by the other implementation's taker with {} vortex-ng makers confirmed: {} inputs, {} outputs",
         harness.makers,
         tx.input.len(),
         tx.output.len()

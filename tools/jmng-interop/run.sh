@@ -200,7 +200,7 @@ if [ "$rc_a" -eq 0 ]; then
     [ "$rc_a" -eq 0 ] || break
     sleep 2
   done
-  wait "$vortex_pid" || { [ "$rc_a" -ne 0 ] || rc_a=$?; }
+  wait "$vortex_pid" || { rc=$?; [ "$rc_a" -ne 0 ] || rc_a=$rc; }
 fi
 echo "== A ($CHANNEL, $PIT, bonds $BONDS): vortex-ng taker with joinmarket-ng makers (exit $rc_a)"
 report "$logs/vortex-taker.log"
