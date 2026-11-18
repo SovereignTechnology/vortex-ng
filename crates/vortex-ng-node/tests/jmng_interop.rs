@@ -117,7 +117,9 @@ impl Harness {
     fn place(&self, url: &str) -> String {
         match (&self.irc, &self.directory) {
             (Some(irc), _) => format!("IRC server at {}:{}", irc.host, irc.port),
-            (None, Some(directory)) => format!("directory at {}:{}", directory.host, directory.port),
+            (None, Some(directory)) => {
+                format!("directory at {}:{}", directory.host, directory.port)
+            }
             (None, None) => format!("relay at {url}"),
         }
     }
@@ -146,47 +148,48 @@ fn sink() -> vortex_ng_core::bitcoin::Address {
 
 /// A channel for a new nick: on the IRC server or the directory when one is given, else on the relay at `url`.
 async fn meet(harness: &Harness, url: &str) -> ChannelSet {
-    let channel: Box<dyn vortex_ng_channel::set::DynChannel> = match (&harness.irc, &harness.directory) {
-        (Some(server), _) => {
-            let channel = IrcChannel::connect(
-                NickIdentity::generate(),
-                IrcConfig {
-                    server: server.clone(),
-                    network: "regtest".into(),
-                    timeout: Duration::from_secs(60),
-                },
-                &Outbound::Direct,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("the IRC server: {e}"));
-            println!("IRC signature domain {:?}", channel.hostid());
-            Box::new(channel)
-        }
-        (None, Some(directory)) => Box::new(
-            OnionChannel::connect(
-                NickIdentity::generate(),
-                OnionConfig {
-                    directories: vec![directory.clone()],
-                    network: harness.onion_network.clone(),
-                    timeout: Duration::from_secs(60),
-                },
-                &Outbound::Direct,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("the directory: {e}")),
-        ),
-        (None, None) => Box::new(
-            NickClient::connect(
-                NickKeys::generate(),
-                "regtest",
-                &[url.to_string()],
-                None,
-                CONNECT_TIMEOUT,
-            )
-            .await
-            .unwrap(),
-        ),
-    };
+    let channel: Box<dyn vortex_ng_channel::set::DynChannel> =
+        match (&harness.irc, &harness.directory) {
+            (Some(server), _) => {
+                let channel = IrcChannel::connect(
+                    NickIdentity::generate(),
+                    IrcConfig {
+                        server: server.clone(),
+                        network: "regtest".into(),
+                        timeout: Duration::from_secs(60),
+                    },
+                    &Outbound::Direct,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("the IRC server: {e}"));
+                println!("IRC signature domain {:?}", channel.hostid());
+                Box::new(channel)
+            }
+            (None, Some(directory)) => Box::new(
+                OnionChannel::connect(
+                    NickIdentity::generate(),
+                    OnionConfig {
+                        directories: vec![directory.clone()],
+                        network: harness.onion_network.clone(),
+                        timeout: Duration::from_secs(60),
+                    },
+                    &Outbound::Direct,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("the directory: {e}")),
+            ),
+            (None, None) => Box::new(
+                NickClient::connect(
+                    NickKeys::generate(),
+                    "regtest",
+                    &[url.to_string()],
+                    None,
+                    CONNECT_TIMEOUT,
+                )
+                .await
+                .unwrap(),
+            ),
+        };
     ChannelSet::new(vec![channel]).unwrap()
 }
 
