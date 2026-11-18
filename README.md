@@ -74,9 +74,11 @@ vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
 vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
 ```
 
-`where` is `--relays <url[,url...]>` (Nostr relays), `--directories <host:port[,...]>` (JoinMarket's onion
-directory nodes, ADR 0007; regtest only in this pre-release), or both. On several channels at once a maker uses
-one nick on all of them and a taker a different nick on each; a peer stays on the channel it first spoke on.
+`where` is any of `--relays <url[,url...]>` (Nostr relays), `--directories <host:port[,...]>` (JoinMarket's
+onion directory nodes) and `--irc <host:port[,...]>` (JoinMarket's IRC pit, as joinmarket-clientserver uses it);
+the last two are regtest only in this pre-release (ADR 0007). On several channels at once a maker uses one nick on
+all of them and a taker a different nick on each; a peer stays on the channel it first spoke on. An IRC server
+whose signature domain (its `NETWORK` name) could be mistaken for another channel's is refused.
 
 `node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
 `--rpc-password-file <file>`): a Bitcoin Core compatible node on the wallet's network.

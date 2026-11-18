@@ -5758,6 +5758,7 @@ dependencies = [
  "vortex-ng-chain",
  "vortex-ng-channel",
  "vortex-ng-core",
+ "vortex-ng-irc",
  "vortex-ng-maker",
  "vortex-ng-node",
  "vortex-ng-nostr",
@@ -5779,6 +5780,8 @@ dependencies = [
 name = "vortex-ng-irc"
 version = "0.0.1"
 dependencies = [
+ "tokio",
+ "vortex-ng-channel",
  "vortex-ng-core",
 ]
 
@@ -5830,6 +5833,7 @@ dependencies = [
  "vortex-ng-chain",
  "vortex-ng-channel",
  "vortex-ng-core",
+ "vortex-ng-irc",
  "vortex-ng-joinstr",
  "vortex-ng-maker",
  "vortex-ng-nostr",

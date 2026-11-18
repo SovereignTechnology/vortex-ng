@@ -642,3 +642,121 @@ async fn a_whole_coinjoin_through_an_onion_directory() {
         handle.abort();
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_coinjoin_on_an_irc_server() {
+    use vortex_ng_channel::socks::Outbound;
+    use vortex_ng_core::nick::NickIdentity;
+    use vortex_ng_irc::testing::TestIrc;
+    use vortex_ng_irc::{IrcChannel, IrcConfig};
+
+    let irc = TestIrc::start(Some("TestNet")).await;
+    let config = IrcConfig {
+        server: irc.server(),
+        network: "regtest".into(),
+        timeout: Duration::from_secs(5),
+    };
+    let pit = Pit::Sw0;
+    let mut utxos = HashMap::new();
+    let maker_wallets: Vec<PitWallet> = (0..2)
+        .map(|i| {
+            let bond = Some(1_000_000 + u64::from(i));
+            funded(
+                pit,
+                &format!("irc-maker{i}"),
+                500_000,
+                bond,
+                50 + i,
+                &mut utxos,
+            )
+        })
+        .collect();
+    let mut taker_wallet = funded(pit, "irc-taker", 600_000, None, 60, &mut utxos);
+    let chain = SharedChain(Arc::new(utxos));
+    // IRC keeps to one line per 1.3 s: a round is slow.
+    let until = Instant::now() + Duration::from_secs(240);
+
+    let mut handles = Vec::new();
+    for (i, wallet) in maker_wallets.into_iter().enumerate() {
+        let (chain, config) = (chain.clone(), config.clone());
+        handles.push(tokio::spawn(async move {
+            let offer =
+                Offer::parse("sw0absoffer", &format!("{i} 10000 10000000 100 500")).unwrap();
+            let mut maker = Maker::new(MakerConfig::new(vec![offer]), wallet).unwrap();
+            let mut channel =
+                IrcChannel::connect(NickIdentity::generate(), config, &Outbound::Direct)
+                    .await
+                    .unwrap();
+            run_maker(&mut maker, &mut channel, &chain, "regtest", until).await
+        }));
+    }
+    for _ in 0..100 {
+        if irc.nicks().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let utxo = taker_wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+    let cfg = TakerConfig {
+        pit,
+        network: Network::Regtest,
+        amount: AMOUNT,
+        makers: 2,
+        max_cjfee: 1_000,
+        fee_rate_sat_per_kwu: 2_500,
+        max_maker_utxos: 20,
+        bondless_makers_allowance: vortex_ng_taker::DEFAULT_BONDLESS_ALLOWANCE,
+        bondless_require_zero_fee: true,
+        bond_params: Default::default(),
+    };
+    let cj = taker_wallet
+        .next_receive_address(1)
+        .unwrap()
+        .script_pubkey();
+    let change = taker_wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(
+        cfg.clone(),
+        0,
+        vec![(utxo.outpoint, utxo.txout.clone())],
+        podle,
+        cj,
+        change,
+    )
+    .unwrap();
+    let mut channel = IrcChannel::connect(NickIdentity::generate(), config, &Outbound::Direct)
+        .await
+        .unwrap();
+    let tx = run_taker(
+        &mut taker,
+        &taker_wallet,
+        &mut channel,
+        &chain,
+        &cfg,
+        Duration::from_secs(8),
+        until,
+    )
+    .await
+    .unwrap();
+    assert_eq!(tx.input.len(), 3);
+    assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+    assert_eq!(
+        tx.output
+            .iter()
+            .filter(|o| o.value.to_sat() == AMOUNT)
+            .count(),
+        3
+    );
+    // Every private line of the round went as pieces of at most 450 characters.
+    assert!(
+        irc.received()
+            .iter()
+            .filter(|(_, line)| line.starts_with("PRIVMSG J"))
+            .all(|(_, line)| line.len() <= 450)
+    );
+    for handle in handles {
+        handle.abort();
+    }
+}

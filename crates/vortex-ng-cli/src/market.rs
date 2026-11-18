@@ -11,6 +11,9 @@ use vortex_ng_core::bitcoin::{Address, Network, OutPoint, TxOut};
 use vortex_ng_core::bond::BondValueParams;
 use vortex_ng_core::nick::NickIdentity;
 use vortex_ng_core::offer::{CjFee, Offer, RelativeFee};
+use vortex_ng_core::protocol::{NOSTR_HOSTID, ONION_HOSTID};
+use vortex_ng_irc::codec::Hostid;
+use vortex_ng_irc::{IrcChannel, IrcConfig, IrcServer};
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{
     CONNECT_TIMEOUT, MAX_BOND_LOOKUPS, MakerReport, MakerService, NodeError, OfferFee, OfferPolicy,
@@ -70,23 +73,28 @@ fn relays(args: &Args) -> Result<Vec<String>, Failure> {
 /// Directory nodes a command may use at most.
 const MAX_DIRECTORIES: usize = 16;
 
-/// Where a command meets other peers: Nostr relays, JoinMarket's onion directory nodes, or both.
+/// Where a command meets other peers: Nostr relays, JoinMarket's onion directory nodes, IRC servers.
 struct Meeting {
     relays: Vec<String>,
     directories: Vec<Directory>,
+    irc: Vec<IrcServer>,
 }
 
 impl Meeting {
     fn describe(&self) -> String {
         format!(
-            "{} relay(s), {} directory node(s)",
+            "{} relay(s), {} directory node(s), {} IRC server(s)",
             self.relays.len(),
-            self.directories.len()
+            self.directories.len(),
+            self.irc.len()
         )
     }
 }
 
-/// `--relays` and `--directories`: at least one of them.
+/// IRC servers a command may use at most.
+const MAX_IRC: usize = 4;
+
+/// `--relays`, `--directories` and `--irc`: at least one of them.
 fn meeting(args: &Args) -> Result<Meeting, Failure> {
     let relays = relays(args)?;
     let directories = match args.get("directories") {
@@ -103,12 +111,29 @@ fn meeting(args: &Args) -> Result<Meeting, Failure> {
             }
         }
     };
-    if relays.is_empty() && directories.is_empty() {
-        return Err(usage("give `--relays`, `--directories`, or both"));
+    let irc = match args.get("irc") {
+        None => Vec::new(),
+        Some(given) => {
+            let parsed: Option<Vec<IrcServer>> = given.split(',').map(IrcServer::parse).collect();
+            match parsed {
+                Some(list) if !list.is_empty() && list.len() <= MAX_IRC => list,
+                _ => {
+                    return Err(usage(
+                        "`--irc` is one to four host:port, separated by commas",
+                    ));
+                }
+            }
+        }
+    };
+    if relays.is_empty() && directories.is_empty() && irc.is_empty() {
+        return Err(usage(
+            "give at least one of `--relays`, `--directories`, `--irc`",
+        ));
     }
     Ok(Meeting {
         relays,
         directories,
+        irc,
     })
 }
 
@@ -116,9 +141,9 @@ impl Meeting {
     /// The onion directories are for regtest only in this pre-release (ADR 0007): nothing here has been
     /// tried on a live network.
     fn allowed_on(&self, network: Network) -> Result<(), Failure> {
-        if !self.directories.is_empty() && network != Network::Regtest {
+        if (!self.directories.is_empty() || !self.irc.is_empty()) && network != Network::Regtest {
             return Err(failed(
-                "JoinMarket's onion directories are enabled on regtest only in this pre-release",
+                "JoinMarket's onion directories and IRC are enabled on regtest only in this pre-release",
             ));
         }
         Ok(())
@@ -229,12 +254,48 @@ async fn channels(
             .map_err(failed)?;
         set.push(Box::new(onion));
     }
+    // The signature domains of all the channels must stay apart: a line signed for one must never verify on
+    // another (IRC's is the server's NETWORK name; see vortex_ng_irc::codec::Hostid).
+    let mut domains: Vec<String> = Vec::new();
+    if !meeting.relays.is_empty() {
+        domains.push(NOSTR_HOSTID.to_string());
+    }
+    if !meeting.directories.is_empty() {
+        domains.push(ONION_HOSTID.to_string());
+    }
+    for server in &meeting.irc {
+        let config = IrcConfig {
+            server: server.clone(),
+            network: network.to_string(),
+            timeout: Duration::from_secs(60),
+        };
+        let irc = IrcChannel::connect(identity(), config, outbound)
+            .await
+            .map_err(failed)?;
+        let domain = irc.hostid();
+        if let Some(other) = domains.iter().find(|d| Hostid::confusable(d, &domain)) {
+            return Err(failed(format!(
+                "the IRC server {}:{} signs as \"{domain}\", which could be mistaken for \"{other}\"",
+                server.host, server.port
+            )));
+        }
+        domains.push(domain);
+        set.push(Box::new(irc));
+    }
     ChannelSet::new(set).map_err(failed)
 }
 
 /// `vortex-ng orderbook`: ask the makers on the relays what they offer.
 pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
-    let mut valued = vec!["network", "relays", "directories", "pit", "wait", "proxy"];
+    let mut valued = vec![
+        "network",
+        "relays",
+        "directories",
+        "irc",
+        "pit",
+        "wait",
+        "proxy",
+    ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
     let network = wallet::network(&args)?;
@@ -344,6 +405,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         "password-file",
         "relays",
         "directories",
+        "irc",
         "pit",
         "fee-rel",
         "fee-abs",
@@ -515,6 +577,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         "password-file",
         "relays",
         "directories",
+        "irc",
         "pit",
         "amount",
         "makers",

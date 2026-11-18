@@ -44,9 +44,10 @@ Usage:
   vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
   vortex-ng --version
 
-where: --relays <url[,url...]> (Nostr relays), --directories <host:port[,...]> (JoinMarket's onion directory
-nodes; regtest only in this pre-release), or both. A maker uses one nick on all of them, a taker a different
-nick on each.
+where: any of --relays <url[,url...]> (Nostr relays), --directories <host:port[,...]> (JoinMarket's onion
+directory nodes) and --irc <host:port[,...]> (JoinMarket's IRC pit; onion IRC hosts reach the server through
+the proxy); the last two on regtest only in this pre-release. A maker uses one nick on all of them, a taker a
+different nick on each.
 
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
