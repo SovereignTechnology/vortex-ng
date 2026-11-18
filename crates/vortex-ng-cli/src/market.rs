@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 
 use vortex_ng_chain::{Auth, CoreRpc};
 use vortex_ng_channel::Channel;
-use vortex_ng_channel::set::ChannelSet;
+use vortex_ng_channel::set::{ChannelSet, DynChannel};
 use vortex_ng_core::bitcoin::{Address, Network, OutPoint, TxOut};
 use vortex_ng_core::bond::BondValueParams;
+use vortex_ng_core::nick::NickIdentity;
 use vortex_ng_core::offer::{CjFee, Offer, RelativeFee};
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{
@@ -18,6 +19,7 @@ use vortex_ng_node::{
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_nostr::socks::Outbound;
+use vortex_ng_onion::{Directory, OnionChannel, OnionConfig};
 use vortex_ng_taker::{
     Coin, DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, TakerError, choose_coins, podle_for,
     verify_bond,
@@ -46,9 +48,10 @@ fn usage(why: &str) -> Failure {
 /// The relays `--relays` names: one to eight `ws://` or `wss://` URLs, separated by commas.
 fn relays(args: &Args) -> Result<Vec<String>, Failure> {
     let wrong = || usage("`--relays` is one to eight ws:// or wss:// URLs, separated by commas");
-    let relays: Vec<String> = args
-        .required("relays")
-        .map_err(Failure::Usage)?
+    let Some(given) = args.get("relays") else {
+        return Ok(Vec::new());
+    };
+    let relays: Vec<String> = given
         .split(',')
         .map(|relay| relay.trim().to_string())
         .collect();
@@ -62,6 +65,64 @@ fn relays(args: &Args) -> Result<Vec<String>, Failure> {
         return Err(wrong());
     }
     Ok(relays)
+}
+
+/// Directory nodes a command may use at most.
+const MAX_DIRECTORIES: usize = 16;
+
+/// Where a command meets other peers: Nostr relays, JoinMarket's onion directory nodes, or both.
+struct Meeting {
+    relays: Vec<String>,
+    directories: Vec<Directory>,
+}
+
+impl Meeting {
+    fn describe(&self) -> String {
+        format!(
+            "{} relay(s), {} directory node(s)",
+            self.relays.len(),
+            self.directories.len()
+        )
+    }
+}
+
+/// `--relays` and `--directories`: at least one of them.
+fn meeting(args: &Args) -> Result<Meeting, Failure> {
+    let relays = relays(args)?;
+    let directories = match args.get("directories") {
+        None => Vec::new(),
+        Some(given) => {
+            let parsed: Option<Vec<Directory>> = given.split(',').map(Directory::parse).collect();
+            match parsed {
+                Some(list) if !list.is_empty() && list.len() <= MAX_DIRECTORIES => list,
+                _ => {
+                    return Err(usage(
+                        "`--directories` is one to sixteen host:port, separated by commas",
+                    ));
+                }
+            }
+        }
+    };
+    if relays.is_empty() && directories.is_empty() {
+        return Err(usage("give `--relays`, `--directories`, or both"));
+    }
+    Ok(Meeting {
+        relays,
+        directories,
+    })
+}
+
+impl Meeting {
+    /// The onion directories are for regtest only in this pre-release (ADR 0007): nothing here has been
+    /// tried on a live network.
+    fn allowed_on(&self, network: Network) -> Result<(), Failure> {
+        if !self.directories.is_empty() && network != Network::Regtest {
+            return Err(failed(
+                "JoinMarket's onion directories are enabled on regtest only in this pre-release",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The node `--rpc-url` names, authenticated with its cookie file or with a user and password, and checked
@@ -127,31 +188,58 @@ fn fee_text(offer: &Offer) -> String {
     }
 }
 
-/// The command's channels, as one set: today the Nostr relays.
+/// Who the channels speak for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// One nick on every channel: takers and bond checks know a maker by its nick.
+    Maker,
+    /// A different nick on each channel, so the channels cannot be linked through it.
+    Taker,
+}
+
+/// The command's channels, as one set: Nostr relays and onion directory nodes, as given.
 async fn channels(
     network: &str,
-    relays: &[String],
+    meeting: &Meeting,
     outbound: &Outbound,
+    role: Role,
 ) -> Result<ChannelSet, Failure> {
-    let nostr = NickClient::connect_via(
-        NickKeys::generate(),
-        network,
-        relays,
-        outbound,
-        CONNECT_TIMEOUT,
-    )
-    .await
-    .map_err(failed)?;
-    ChannelSet::new(vec![Box::new(nostr)]).map_err(failed)
+    let maker = NickIdentity::generate();
+    let identity = || match role {
+        Role::Maker => maker.clone(),
+        Role::Taker => NickIdentity::generate(),
+    };
+    let mut set: Vec<Box<dyn DynChannel>> = Vec::new();
+    if !meeting.relays.is_empty() {
+        let keys = NickKeys::from_identity(identity()).map_err(failed)?;
+        let nostr =
+            NickClient::connect_via(keys, network, &meeting.relays, outbound, CONNECT_TIMEOUT)
+                .await
+                .map_err(failed)?;
+        set.push(Box::new(nostr));
+    }
+    if !meeting.directories.is_empty() {
+        let config = OnionConfig {
+            directories: meeting.directories.clone(),
+            network: network.to_string(),
+            timeout: Duration::from_secs(60),
+        };
+        let onion = OnionChannel::connect(identity(), config, outbound)
+            .await
+            .map_err(failed)?;
+        set.push(Box::new(onion));
+    }
+    ChannelSet::new(set).map_err(failed)
 }
 
 /// `vortex-ng orderbook`: ask the makers on the relays what they offer.
 pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
-    let mut valued = vec!["network", "relays", "pit", "wait", "proxy"];
+    let mut valued = vec!["network", "relays", "directories", "pit", "wait", "proxy"];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
     let network = wallet::network(&args)?;
-    let relays = relays(&args)?;
+    let meeting = meeting(&args)?;
+    meeting.allowed_on(network)?;
     let only = match args.get("pit") {
         Some(_) => Some(wallet::pit(&args)?.0),
         None => None,
@@ -165,7 +253,7 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let (us, book) = runtime()?.block_on(async {
-        let mut client = channels(channel, &relays, &outbound).await?;
+        let mut client = channels(channel, &meeting, &outbound, Role::Taker).await?;
         let book = fetch_orderbook(&mut client, channel, Duration::from_secs(wait.into()))
             .await
             .map_err(failed)?;
@@ -189,9 +277,9 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
         .collect();
     if offers.is_empty() {
         println!(
-            "No offers on {} within {wait} s ({} relay(s)).",
+            "No offers on {} within {wait} s ({}).",
             network_name(network),
-            relays.len()
+            meeting.describe()
         );
         return Ok(());
     }
@@ -255,6 +343,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         "wallet",
         "password-file",
         "relays",
+        "directories",
         "pit",
         "fee-rel",
         "fee-abs",
@@ -266,7 +355,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
-    let relays = relays(&args)?;
+    let meeting = meeting(&args)?;
     let (pit, pit_name) = wallet::pit(&args)?;
     let fee = match (
         args.get("fee-rel"),
@@ -308,6 +397,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
 
     let file = wallet::open(&args)?;
     let network = file.network();
+    meeting.allowed_on(network)?;
     let chain = node(&args, network)?;
     let pit_wallet = PitWallet::new(&file.seed().map_err(failed)?, pit).map_err(failed)?;
     let mut maker = Maker::new(MakerConfig::new(Vec::new()), pit_wallet).map_err(failed)?;
@@ -319,12 +409,12 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     runtime()?.block_on(async {
-        let mut client = channels(channel, &relays, &outbound).await?;
+        let mut client = channels(channel, &meeting, &outbound, Role::Maker).await?;
         println!(
-            "maker {} in the {pit_name} pit on {}, {} relay(s)",
+            "maker {} in the {pit_name} pit on {}, {}",
             client.nick(),
             network_name(network),
-            relays.len()
+            meeting.describe()
         );
         let mut report = |report: MakerReport| match report {
             MakerReport::Offering {
@@ -424,6 +514,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         "wallet",
         "password-file",
         "relays",
+        "directories",
         "pit",
         "amount",
         "makers",
@@ -436,7 +527,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &["yes", "allow-bondless-fees"])?;
-    let relays = relays(&args)?;
+    let meeting = meeting(&args)?;
     let (pit, pit_name) = wallet::pit(&args)?;
     let amount = match args.sats("amount").map_err(Failure::Usage)? {
         Some(amount) if amount > 0 => amount,
@@ -466,6 +557,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let wallet_path = Path::new(args.required("wallet").map_err(Failure::Usage)?);
     let file = wallet::open(&args)?;
     let network = file.network();
+    meeting.allowed_on(network)?;
     let chain = node(&args, network)?;
     let mut pit_wallet = PitWallet::new(&file.seed().map_err(failed)?, pit).map_err(failed)?;
     let height = pit_wallet.sync(&chain, file.birthday()).map_err(failed)?;
@@ -577,7 +669,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let tx = runtime()?.block_on(async {
-        let mut client = channels(channel, &relays, &outbound).await?;
+        let mut client = channels(channel, &meeting, &outbound, Role::Taker).await?;
         let gather = Duration::from_secs(wait.into());
         let round = run_taker(
             &mut taker,

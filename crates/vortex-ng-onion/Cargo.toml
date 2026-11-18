@@ -1,0 +1,25 @@
+[package]
+name = "vortex-ng-onion"
+description = "JoinMarket's onion directory message channel, as joinmarket-clientserver and JoinMarket-NG speak it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vortex-ng-core = { workspace = true }
+vortex-ng-channel = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Test helpers for other crates' tests (`vortex_ng_onion::testing`): a directory node in memory.
+test-util = []
+
+[dev-dependencies]
+vortex-ng-channel = { workspace = true, features = ["test-util"] }

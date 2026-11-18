@@ -1,9 +1,13 @@
-//! A CoinJoin between vortex-ng and joinmarket-ng over the Nostr message channel, on a regtest node.
+//! A CoinJoin between vortex-ng and joinmarket-ng on a regtest node, over the Nostr message channel or over
+//! JoinMarket's onion directory channel.
 //!
 //! Skipped unless `VORTEX_NG_INTEROP_DIR` is set (`tools/jmng-interop/run.sh` sets it, with
-//! `VORTEX_NG_REGTEST_RPC` and `VORTEX_NG_REGTEST_COOKIE`). This side runs the relay (nostr-sdk's
-//! in-process relay, on loopback) and writes its URL to `<dir>/relay.url`; the harness then starts
-//! joinmarket-ng's makers, built with its Nostr channel, on that relay.
+//! `VORTEX_NG_REGTEST_RPC` and `VORTEX_NG_REGTEST_COOKIE`). On Nostr this side runs the relay (nostr-sdk's
+//! in-process relay, on loopback) and joinmarket-ng's makers, built with its Nostr channel, join it. With
+//! `VORTEX_NG_INTEROP_DIRECTORY=<host:port>` (and `VORTEX_NG_INTEROP_DIRECTORY_ID`, its JMP-0005 identity)
+//! both sides meet on joinmarket-ng's own directory server instead, which the harness runs. Either way this
+//! side writes where to meet to `<dir>/relay.url` once the chain is ready, and the harness then starts
+//! joinmarket-ng's side.
 //!
 //! `taker_with_joinmarket_ng_makers` (`VORTEX_NG_INTEROP_ROLE=taker`): a vortex-ng taker waits until the
 //! joinmarket-ng makers have announced their offers, asks them for the orderbook, and runs a round with them
@@ -24,12 +28,17 @@ use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::MockRelay;
 use vortex_ng_chain::{Auth, CoreRpc};
+use vortex_ng_channel::set::ChannelSet;
+use vortex_ng_channel::socks::Outbound;
+use vortex_ng_channel::{Channel, Incoming as Arrived, Next};
 use vortex_ng_core::bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
+use vortex_ng_core::nick::NickIdentity;
 use vortex_ng_core::offer::{Offer, Pit};
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{CONNECT_TIMEOUT, run_maker, run_taker};
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
+use vortex_ng_onion::{Directory, OnionChannel, OnionConfig};
 use vortex_ng_taker::{DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, podle_for};
 use vortex_ng_wallet::{MIXDEPTHS, PitWallet, Seed};
 
@@ -55,6 +64,8 @@ struct Harness {
     bonds: bool,
     /// `VORTEX_NG_INTEROP_PIT`: the pit both sides trade in.
     pit: Pit,
+    /// `VORTEX_NG_INTEROP_DIRECTORY`: meet on this onion directory node instead of a Nostr relay.
+    directory: Option<Directory>,
 }
 
 impl Harness {
@@ -77,6 +88,13 @@ impl Harness {
                 Ok("tr0") => Pit::Tr0,
                 Ok(other) => panic!("VORTEX_NG_INTEROP_PIT={other}: sw0 or tr0"),
             },
+            directory: std::env::var("VORTEX_NG_INTEROP_DIRECTORY")
+                .ok()
+                .map(|text| {
+                    let mut directory = Directory::parse(&text).expect("a directory host:port");
+                    directory.id = std::env::var("VORTEX_NG_INTEROP_DIRECTORY_ID").ok();
+                    directory
+                }),
         })
     }
 
@@ -100,6 +118,66 @@ fn sink() -> vortex_ng_core::bitcoin::Address {
     wallet("interop-sink", Pit::Sw0)
         .next_receive_address(0)
         .unwrap()
+}
+
+/// A channel for a new nick: on the directory when one is given, else on the relay at `url`.
+async fn meet(harness: &Harness, url: &str) -> ChannelSet {
+    let channel: Box<dyn vortex_ng_channel::set::DynChannel> = match &harness.directory {
+        Some(directory) => Box::new(
+            OnionChannel::connect(
+                NickIdentity::generate(),
+                OnionConfig {
+                    directories: vec![directory.clone()],
+                    network: "regtest".into(),
+                    timeout: Duration::from_secs(60),
+                },
+                &Outbound::Direct,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the directory: {e}")),
+        ),
+        None => Box::new(
+            NickClient::connect(
+                NickKeys::generate(),
+                "regtest",
+                &[url.to_string()],
+                None,
+                CONNECT_TIMEOUT,
+            )
+            .await
+            .unwrap(),
+        ),
+    };
+    ChannelSet::new(vec![channel]).unwrap()
+}
+
+/// Wait until `count` different makers answer `!orderbook` on the directory (asked every five seconds).
+async fn wait_for_directory_makers(harness: &Harness, count: usize, limit: Duration) {
+    let mut observer = meet(harness, "").await;
+    observer.listen(true, false).await.unwrap();
+    let until = Instant::now() + limit;
+    let mut seen = HashSet::new();
+    let mut asked: Option<Instant> = None;
+    while seen.len() < count {
+        assert!(
+            Instant::now() < until,
+            "only {} of {count} makers answered",
+            seen.len()
+        );
+        if asked.is_none_or(|at| at.elapsed() >= Duration::from_secs(5)) {
+            observer.ask_orderbook().await.unwrap();
+            asked = Some(Instant::now());
+        }
+        let nick = match observer.receive(Duration::from_secs(1)).await {
+            Next::Message(Arrived::Private { msg, .. }) => msg.from,
+            Next::Message(Arrived::Offers { nick, .. }) => nick,
+            _ => continue,
+        };
+        if seen.insert(nick.clone()) {
+            println!("maker {nick} answered on the directory");
+        }
+    }
+    observer.shutdown().await;
 }
 
 /// Wait until `count` different nicks have an offer event on the relay.
@@ -168,9 +246,16 @@ async fn taker_with_joinmarket_ng_makers() {
 
     // Everything the makers need is on the chain: tell the harness where to send them.
     std::fs::write(harness.dir.join("relay.url"), &url).unwrap();
-    println!("relay at {url}");
-
-    wait_for_makers(&url, harness.makers, Duration::from_secs(900)).await;
+    match &harness.directory {
+        Some(directory) => {
+            println!("directory at {}:{}", directory.host, directory.port);
+            wait_for_directory_makers(&harness, harness.makers, Duration::from_secs(900)).await;
+        }
+        None => {
+            println!("relay at {url}");
+            wait_for_makers(&url, harness.makers, Duration::from_secs(900)).await;
+        }
+    }
 
     let utxo = taker_wallet.utxos(0).unwrap().remove(0);
     let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
@@ -202,16 +287,8 @@ async fn taker_with_joinmarket_ng_makers() {
         change,
     )
     .unwrap();
-    let mut client = NickClient::connect(
-        NickKeys::generate(),
-        "regtest",
-        std::slice::from_ref(&url),
-        None,
-        CONNECT_TIMEOUT,
-    )
-    .await
-    .unwrap();
-    println!("taker nick {}", client.keys().nick());
+    let mut client = meet(&harness, &url).await;
+    println!("taker nick {}", client.nick());
     let tx = run_taker(
         &mut taker,
         &taker_wallet,
@@ -324,21 +401,13 @@ async fn makers_with_joinmarket_ng_taker() {
         _ => "sw0absoffer",
     };
     for (i, w) in wallets.into_iter().enumerate() {
-        let (url, rpc) = (url.clone(), harness.rpc());
+        let rpc = harness.rpc();
+        let mut client = meet(&harness, &url).await;
         handles.push(tokio::spawn(async move {
             let offer =
                 Offer::parse(offer_type, &format!("{i} 10000 100000000 {TXFEE} {CJFEE}")).unwrap();
             let mut maker = Maker::new(MakerConfig::new(vec![offer]), w).unwrap();
-            let mut client = NickClient::connect(
-                NickKeys::generate(),
-                "regtest",
-                &[url],
-                None,
-                CONNECT_TIMEOUT,
-            )
-            .await
-            .unwrap();
-            println!("maker {i} nick {}", client.keys().nick());
+            println!("maker {i} nick {}", client.nick());
             run_maker(&mut maker, &mut client, &rpc, "regtest", until).await
         }));
     }

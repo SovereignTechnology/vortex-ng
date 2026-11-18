@@ -5761,6 +5761,7 @@ dependencies = [
  "vortex-ng-maker",
  "vortex-ng-node",
  "vortex-ng-nostr",
+ "vortex-ng-onion",
  "vortex-ng-taker",
  "vortex-ng-wallet",
  "zeroize",
@@ -5825,6 +5826,7 @@ dependencies = [
  "vortex-ng-joinstr",
  "vortex-ng-maker",
  "vortex-ng-nostr",
+ "vortex-ng-onion",
  "vortex-ng-taker",
  "vortex-ng-wallet",
 ]
@@ -5836,6 +5838,16 @@ dependencies = [
  "futures",
  "nostr",
  "nostr-sdk",
+ "tokio",
+ "vortex-ng-channel",
+ "vortex-ng-core",
+]
+
+[[package]]
+name = "vortex-ng-onion"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
  "tokio",
  "vortex-ng-channel",
  "vortex-ng-core",

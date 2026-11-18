@@ -32,17 +32,21 @@ Usage:
   vortex-ng wallet info         --wallet <file>
   vortex-ng wallet addresses    --wallet <file> [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--count <n>] [--change]
   vortex-ng wallet bond-address --wallet <file> --locktime <YYYY-MM>
-  vortex-ng orderbook --network <network> --relays <url[,url...]> [--pit sw0|tr0|wsh0] [--wait <seconds>]
+  vortex-ng orderbook --network <network> where [--pit sw0|tr0|wsh0] [--wait <seconds>]
                       [node]
-  vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fraction> | --fee-abs <sats>)
+  vortex-ng maker     --wallet <file> where node (--fee-rel <fraction> | --fee-abs <sats>)
                       [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
                       [--upkeep <seconds>]
-  vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
+  vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
                       [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                       [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
                       [--allow-bondless-fees] [--yes]
   vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
   vortex-ng --version
+
+where: --relays <url[,url...]> (Nostr relays), --directories <host:port[,...]> (JoinMarket's onion directory
+nodes; regtest only in this pre-release), or both. A maker uses one nick on all of them, a taker a different
+nick on each.
 
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
