@@ -760,3 +760,200 @@ async fn a_whole_coinjoin_on_an_irc_server() {
         handle.abort();
     }
 }
+
+/// One maker with one nick on a Nostr relay, an onion directory and an IRC server at once (ADR 0007), and a
+/// taker on each of them in turn: each round runs on the taker's channel, with the maker's bond proof made
+/// for that taker's nick there.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_maker_on_three_channels_serves_a_taker_on_each() {
+    use vortex_ng_channel::set::{ChannelSet, DynChannel};
+    use vortex_ng_channel::socks::Outbound;
+    use vortex_ng_core::nick::NickIdentity;
+    use vortex_ng_irc::testing::TestIrc;
+    use vortex_ng_irc::{IrcChannel, IrcConfig};
+    use vortex_ng_onion::testing::TestDirectory;
+    use vortex_ng_onion::{OnionChannel, OnionConfig};
+
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let directory = TestDirectory::start("regtest", None).await;
+    let irc = TestIrc::start(Some("TestNet")).await;
+    let onion_config = OnionConfig {
+        directories: vec![directory.directory()],
+        network: "regtest".into(),
+        timeout: Duration::from_secs(5),
+    };
+    let irc_config = IrcConfig {
+        server: irc.server(),
+        network: "regtest".into(),
+        timeout: Duration::from_secs(5),
+    };
+    let pit = Pit::Sw0;
+    let mut utxos = HashMap::new();
+    let maker_wallet = funded(
+        pit,
+        "three-maker",
+        2_000_000,
+        Some(1_000_000),
+        70,
+        &mut utxos,
+    );
+    let taker_wallets: Vec<PitWallet> = (0..3u8)
+        .map(|i| {
+            funded(
+                pit,
+                &format!("three-taker{i}"),
+                600_000,
+                None,
+                71 + i,
+                &mut utxos,
+            )
+        })
+        .collect();
+    let chain = SharedChain(Arc::new(utxos));
+    // IRC keeps to one line per 1.3 s.
+    let until = Instant::now() + Duration::from_secs(300);
+
+    // The maker: one nick on all three channels.
+    let identity = NickIdentity::generate();
+    let maker_channels: Vec<Box<dyn DynChannel>> = vec![
+        Box::new(
+            NickClient::connect(
+                NickKeys::from_identity(identity.clone()).unwrap(),
+                "regtest",
+                std::slice::from_ref(&url),
+                None,
+                CONNECT_TIMEOUT,
+            )
+            .await
+            .unwrap(),
+        ),
+        Box::new(
+            OnionChannel::connect(identity.clone(), onion_config.clone(), &Outbound::Direct)
+                .await
+                .unwrap(),
+        ),
+        Box::new(
+            IrcChannel::connect(identity.clone(), irc_config.clone(), &Outbound::Direct)
+                .await
+                .unwrap(),
+        ),
+    ];
+    let mut maker_set = ChannelSet::new(maker_channels).unwrap();
+    let maker_nick = maker_set.nick().to_string();
+    assert_eq!(maker_nick, identity.nick());
+    let maker_chain = chain.clone();
+    let maker = tokio::spawn(async move {
+        let offer = Offer::parse("sw0absoffer", "0 10000 10000000 100 500").unwrap();
+        let mut maker = Maker::new(MakerConfig::new(vec![offer]), maker_wallet).unwrap();
+        run_maker(&mut maker, &mut maker_set, &maker_chain, "regtest", until).await
+    });
+    for _ in 0..100 {
+        if directory.nicks().len() == 1 && irc.nicks().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for (i, mut taker_wallet) in taker_wallets.into_iter().enumerate() {
+        let channel: Box<dyn DynChannel> = match i {
+            0 => Box::new(
+                NickClient::connect(
+                    NickKeys::generate(),
+                    "regtest",
+                    std::slice::from_ref(&url),
+                    None,
+                    CONNECT_TIMEOUT,
+                )
+                .await
+                .unwrap(),
+            ),
+            1 => Box::new(
+                OnionChannel::connect(
+                    NickIdentity::generate(),
+                    onion_config.clone(),
+                    &Outbound::Direct,
+                )
+                .await
+                .unwrap(),
+            ),
+            _ => Box::new(
+                IrcChannel::connect(
+                    NickIdentity::generate(),
+                    irc_config.clone(),
+                    &Outbound::Direct,
+                )
+                .await
+                .unwrap(),
+            ),
+        };
+        let mut set = ChannelSet::new(vec![channel]).unwrap();
+        let taker_nick = set.nick().to_string();
+        let utxo = taker_wallet.utxos(0).unwrap().remove(0);
+        let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+        let cfg = TakerConfig {
+            pit,
+            network: Network::Regtest,
+            amount: AMOUNT,
+            makers: 1,
+            max_cjfee: 1_000,
+            fee_rate_sat_per_kwu: 2_500,
+            max_maker_utxos: 20,
+            bondless_makers_allowance: vortex_ng_taker::DEFAULT_BONDLESS_ALLOWANCE,
+            // The maker charges a fee: it is chosen only if its bond proof verifies on this channel.
+            bondless_require_zero_fee: true,
+            bond_params: Default::default(),
+        };
+        let cj = taker_wallet
+            .next_receive_address(1)
+            .unwrap()
+            .script_pubkey();
+        let change = taker_wallet.next_change_address(0).unwrap().script_pubkey();
+        let mut taker = Taker::new(
+            cfg.clone(),
+            0,
+            vec![(utxo.outpoint, utxo.txout.clone())],
+            podle,
+            cj,
+            change,
+        )
+        .unwrap();
+        let tx = run_taker(
+            &mut taker,
+            &taker_wallet,
+            &mut set,
+            &chain,
+            &cfg,
+            Duration::from_secs(8),
+            until,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the round on channel {i} failed: {e}"));
+        assert_eq!(tx.input.len(), 2, "channel {i}");
+        assert!(tx.input.iter().all(|input| !input.witness.is_empty()));
+        assert_eq!(
+            tx.output
+                .iter()
+                .filter(|o| o.value.to_sat() == AMOUNT)
+                .count(),
+            2,
+            "channel {i}"
+        );
+        // The round's private lines went over the taker's channel.
+        match i {
+            1 => assert!(directory.received().iter().any(|(from, kind, line)| {
+                *from == taker_nick
+                    && *kind == vortex_ng_onion::wire::PRIVMSG
+                    && line.starts_with(&format!("{taker_nick}!{maker_nick}!fill "))
+            })),
+            2 => assert!(irc.received().iter().any(|(from, line)| {
+                *from == taker_nick && line.starts_with(&format!("PRIVMSG {maker_nick} :!fill "))
+            })),
+            _ => {}
+        }
+        set.shutdown().await;
+    }
+    assert!(!maker.is_finished(), "the maker kept serving");
+    maker.abort();
+}
