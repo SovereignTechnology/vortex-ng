@@ -493,6 +493,17 @@ async fn a_maker_on_two_channels_is_reached_through_one() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_whole_coinjoin_through_an_onion_directory() {
+    whole_coinjoin_through_a_directory(false).await;
+}
+
+/// The same round through a directory that delivers every private line twice, to everyone, and replays
+/// each recipient's previous line before the next (ADR 0007, rule 3): the round still completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_coinjoin_through_a_mischievous_directory() {
+    whole_coinjoin_through_a_directory(true).await;
+}
+
+async fn whole_coinjoin_through_a_directory(mischief: bool) {
     use vortex_ng_channel::socks::Outbound;
     use vortex_ng_core::nick::NickIdentity;
     use vortex_ng_core::protocol::ONION_HOSTID;
@@ -500,6 +511,7 @@ async fn a_whole_coinjoin_through_an_onion_directory() {
     use vortex_ng_onion::{OnionChannel, OnionConfig};
 
     let directory = TestDirectory::start("regtest", None).await;
+    directory.set_mischief(mischief);
     let config = OnionConfig {
         directories: vec![directory.directory()],
         network: "regtest".into(),
@@ -640,6 +652,12 @@ async fn a_whole_coinjoin_through_an_onion_directory() {
         .collect();
     assert_eq!(hp2_from.len(), 2, "one per maker");
     assert!(hp2_from.iter().all(|nick| !makers.contains(nick)));
+    if mischief {
+        assert!(
+            directory.mischief_done() > 0,
+            "the directory did no mischief"
+        );
+    }
     for handle in handles {
         handle.abort();
     }

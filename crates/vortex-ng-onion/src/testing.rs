@@ -40,6 +40,12 @@ struct State {
     pongs: usize,
     received: Vec<(String, u64, String)>,
     peerlist: Vec<String>,
+    /// Misbehave: see [`TestDirectory::set_mischief`].
+    mischief: bool,
+    /// The last private line delivered to each nick, to deliver again.
+    last_to: HashMap<String, String>,
+    /// Lines delivered out of mischief.
+    extra: usize,
 }
 
 /// A directory node on `127.0.0.1:<ephemeral>`.
@@ -133,6 +139,20 @@ impl TestDirectory {
             .ok()
             .and_then(|s| s.peers.get(nick).map(|tx| tx.send(encoded).is_ok()))
             .unwrap_or(false)
+    }
+
+    /// Misbehave as a directory can, since a private line's signature covers neither its command nor its
+    /// recipient: deliver every private line twice, hand a copy to every other connected peer too, and before
+    /// each line deliver again the last line its recipient got.
+    pub fn set_mischief(&self, on: bool) {
+        if let Ok(mut s) = self.state.lock() {
+            s.mischief = on;
+        }
+    }
+
+    /// How many lines were delivered out of mischief.
+    pub fn mischief_done(&self) -> usize {
+        self.state.lock().map(|s| s.extra).unwrap_or_default()
     }
 
     /// The peer list (`nick;host:port` entries) to answer `GETPEERLIST` with.
@@ -273,9 +293,24 @@ async fn serve(
                 let mut parts = line.splitn(3, '!');
                 if let (Some(from), Some(to)) = (parts.next(), parts.next())
                     && from == nick
-                    && let Some(peer) = s.peers.get(to)
+                    && let Some(peer) = s.peers.get(to).cloned()
                 {
+                    if s.mischief {
+                        let mut extra = 0;
+                        if let Some(old) = s.last_to.get(to).and_then(|l| encode(PRIVMSG, l).ok()) {
+                            extra += usize::from(peer.send(old).is_ok());
+                        }
+                        extra += usize::from(peer.send(encoded.clone()).is_ok());
+                        for (other, stranger) in &s.peers {
+                            if other != to && *other != nick {
+                                extra += usize::from(stranger.send(encoded.clone()).is_ok());
+                            }
+                        }
+                        s.extra += extra;
+                    }
                     let _ = peer.send(encoded);
+                    let to = to.to_string();
+                    s.last_to.insert(to, line.clone());
                 }
             }
             PONG => s.pongs += 1,
