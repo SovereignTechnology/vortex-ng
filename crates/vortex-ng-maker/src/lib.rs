@@ -115,7 +115,9 @@ pub struct Maker {
     sessions: HashMap<String, Stage>,
     /// When each session's `!fill` arrived.
     started: HashMap<String, u64>,
-    used_commitments: HashSet<[u8; 32]>,
+    used_commitments: Commitments,
+    /// When we announced commitments handed to us privately, within the last window.
+    hp2_relayed: std::collections::VecDeque<u64>,
     bond: Option<BondTemplate>,
 }
 
@@ -134,6 +136,42 @@ pub const MAX_SESSIONS: usize = 64;
 /// (joinmarket-ng's `session_timeout_sec` default). Older sessions are forgotten, so quiet takers and
 /// finished rounds cannot fill the table.
 pub const SESSION_TTL: u64 = 300;
+
+/// Most PoDLE commitments remembered as used; the oldest are forgotten first. Anyone can announce
+/// commitments, so the list must not grow without end.
+pub const MAX_COMMITMENTS: usize = 100_000;
+/// Commitments handed to us privately that we announce in [`HP2_RELAY_WINDOW`] seconds, at most. Each one
+/// costs a throwaway nick's connections.
+pub const HP2_RELAYS_PER_WINDOW: usize = 10;
+/// See [`HP2_RELAYS_PER_WINDOW`].
+pub const HP2_RELAY_WINDOW: u64 = 600;
+
+/// PoDLE commitments seen used, bounded: the oldest are forgotten first.
+#[derive(Default)]
+struct Commitments {
+    seen: HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl Commitments {
+    fn contains(&self, commitment: &[u8; 32]) -> bool {
+        self.seen.contains(commitment)
+    }
+
+    /// Remember `commitment`; whether it was new.
+    fn insert(&mut self, commitment: [u8; 32]) -> bool {
+        if !self.seen.insert(commitment) {
+            return false;
+        }
+        self.order.push_back(commitment);
+        while self.order.len() > MAX_COMMITMENTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+}
 
 /// Most of our UTXOs looked up on the node while picking coins for one fill.
 pub const MAX_SELECT_LOOKUPS: usize = 64;
@@ -156,7 +194,8 @@ impl Maker {
             wallet,
             sessions: HashMap::new(),
             started: HashMap::new(),
-            used_commitments: HashSet::new(),
+            used_commitments: Commitments::default(),
+            hp2_relayed: std::collections::VecDeque::new(),
             bond: None,
         })
     }
@@ -174,6 +213,31 @@ impl Maker {
     /// Record a commitment another maker broadcast (`!hp2`).
     pub fn on_hp2(&mut self, commitment: [u8; 32]) {
         self.used_commitments.insert(commitment);
+    }
+
+    /// A commitment another maker handed to us privately to announce (joinmarket-clientserver's way on IRC:
+    /// the maker in the round passes it to a random other maker, so the announcer is not the one being
+    /// filled). Recorded; announced unlinked from our nick if it is new and we have announced fewer than
+    /// [`HP2_RELAYS_PER_WINDOW`] such in the last [`HP2_RELAY_WINDOW`] seconds.
+    fn on_private_hp2(&mut self, commitment: [u8; 32], now: u64) -> Vec<Outgoing> {
+        if !self.used_commitments.insert(commitment) {
+            return Vec::new();
+        }
+        while self
+            .hp2_relayed
+            .front()
+            .is_some_and(|at| now.saturating_sub(*at) >= HP2_RELAY_WINDOW)
+        {
+            self.hp2_relayed.pop_front();
+        }
+        if self.hp2_relayed.len() >= HP2_RELAYS_PER_WINDOW {
+            return Vec::new();
+        }
+        self.hp2_relayed.push_back(now);
+        vec![Outgoing::PublicEphemeral(format!(
+            "!hp2 {}",
+            commitment.to_lower_hex_string()
+        ))]
     }
 
     /// Pick the wallet's most valuable fidelity bond and certify it for `!tbond` proofs (JMP-0001 "Fidelity
@@ -275,10 +339,7 @@ impl Maker {
             // `!orderbook` is a public command (JMP-0001); the transport answers it with `on_orderbook`.
             Command::Orderbook => return Vec::new(),
             Command::Push(tx) => return self.on_push(from, &tx),
-            Command::Hp2(c) => {
-                self.on_hp2(c);
-                return Vec::new();
-            }
+            Command::Hp2(c) => return self.on_private_hp2(c, now),
             Command::Fill {
                 oid,
                 amount,

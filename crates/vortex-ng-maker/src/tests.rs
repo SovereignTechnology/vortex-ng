@@ -431,6 +431,93 @@ fn liquidity_and_offers_follow_the_wallet() {
 }
 
 #[test]
+fn a_commitment_handed_over_privately_is_announced_once_and_sparingly() {
+    let mut maker = funded_maker();
+    let (taker, chain) = new_taker();
+    let hp2 = |c: [u8; 32]| Command::Hp2(c);
+    let announce = |c: [u8; 32]| {
+        vec![Outgoing::PublicEphemeral(format!(
+            "!hp2 {}",
+            c.to_lower_hex_string()
+        ))]
+    };
+    // A new commitment from another maker: announced, unlinked from our nick.
+    assert_eq!(
+        maker.handle("J5other", hp2([1; 32]), &chain, NOW),
+        announce([1; 32])
+    );
+    // The same again, or one already seen in public, is not announced again.
+    assert!(
+        maker
+            .handle("J5other", hp2([1; 32]), &chain, NOW)
+            .is_empty()
+    );
+    maker.on_hp2([2; 32]);
+    assert!(
+        maker
+            .handle("J5other", hp2([2; 32]), &chain, NOW)
+            .is_empty()
+    );
+    // At most HP2_RELAYS_PER_WINDOW in a window; later, again.
+    for i in 1..HP2_RELAYS_PER_WINDOW {
+        let c = [10 + i as u8; 32];
+        assert_eq!(
+            maker.handle("J5other", hp2(c), &chain, NOW + 1),
+            announce(c)
+        );
+    }
+    assert!(
+        maker
+            .handle("J5other", hp2([99; 32]), &chain, NOW + 2)
+            .is_empty()
+    );
+    let later = NOW + HP2_RELAY_WINDOW + 1;
+    assert_eq!(
+        maker.handle("J5other", hp2([100; 32]), &chain, later),
+        announce([100; 32])
+    );
+    // Whatever was handed over, announced or not, is refused in a fill.
+    let secp = Secp256k1::new();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    assert!(
+        maker
+            .handle("J5x", hp2(podle.commitment()), &chain, later)
+            .len()
+            <= 1
+    );
+    let out = maker.handle(
+        "J5taker",
+        Command::Fill {
+            oid: 0,
+            amount: AMOUNT,
+            nacl_pubkey: taker.nacl.public_hex(),
+            commitment: podle.commitment(),
+        },
+        &chain,
+        later,
+    );
+    assert_eq!(private(&out[0]).0, "error");
+}
+
+#[test]
+fn remembered_commitments_are_bounded() {
+    let mut commitments = Commitments::default();
+    let key = |i: usize| {
+        let mut c = [0u8; 32];
+        c[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        c
+    };
+    for i in 0..=MAX_COMMITMENTS {
+        assert!(commitments.insert(key(i)));
+    }
+    assert!(!commitments.insert(key(MAX_COMMITMENTS)));
+    // The oldest went first.
+    assert!(!commitments.contains(&key(0)));
+    assert!(commitments.contains(&key(1)));
+    assert_eq!(commitments.seen.len(), MAX_COMMITMENTS);
+}
+
+#[test]
 fn a_stray_line_leaves_the_session_as_it_was() {
     let secp = Secp256k1::new();
     let mut maker = funded_maker();
