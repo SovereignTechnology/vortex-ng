@@ -66,6 +66,11 @@ impl Channel for NickClient {
         NOSTR_HOSTID
     }
 
+    // A gift wrap is encrypted to its recipient, and its seal is signed by the sender's nick key.
+    fn authenticates_sender(&self) -> bool {
+        true
+    }
+
     async fn listen(&self, offers: bool, public: bool) -> Result<(), ChannelError> {
         self.subscribe(unix_now().saturating_sub(60), offers, public)
             .await?;

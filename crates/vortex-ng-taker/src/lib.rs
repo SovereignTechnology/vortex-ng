@@ -527,7 +527,9 @@ impl Taker {
         &self.prevouts
     }
 
-    /// Handle a verified command from maker `from`.
+    /// Handle a verified command from maker `from`. A stray line is ignored (`Ok` with nothing to send); an
+    /// error is a maker that failed the round, or `!error`. A driver on a channel that does not authenticate
+    /// senders should not pass `!error` on: anyone could have delivered it.
     pub fn handle(
         &mut self,
         from: &str,
@@ -535,7 +537,7 @@ impl Taker {
         chain: &impl ChainLookup,
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
         if !self.makers.contains_key(from) {
-            return Err(err(from, "not one of our makers"));
+            return Ok(self.stray());
         }
         match command {
             Command::Pubkey { nacl_pubkey, .. } => self.on_pubkey(from, &nacl_pubkey),
@@ -555,7 +557,7 @@ impl Taker {
                         .collect::<String>()
                 ),
             )),
-            _ => Err(err(from, "unexpected command")),
+            _ => Ok(self.stray()),
         }
     }
 
@@ -570,7 +572,7 @@ impl Taker {
             .get_mut(from)
             .ok_or_else(|| err(from, "unknown"))?;
         if slot.session.is_some() {
-            return Err(err(from, "second !pubkey"));
+            return Ok(self.stray());
         }
         let session = self
             .nacl
@@ -612,23 +614,19 @@ impl Taker {
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
         let secp = Secp256k1::new();
         let pit = self.cfg.pit;
-        let (plaintext, already, maker_nacl) = {
-            let slot = self.makers.get(from).ok_or_else(|| err(from, "unknown"))?;
-            let session = slot
-                .session
-                .as_ref()
-                .ok_or_else(|| err(from, "!ioauth before !pubkey"))?;
-            (
-                session
-                    .decrypt(ciphertext)
-                    .map_err(|e| err(from, e.to_string()))?,
-                slot.io.is_some(),
-                slot.maker_nacl.clone(),
-            )
+        let (plaintext, maker_nacl) = {
+            let Some(slot) = self.makers.get(from) else {
+                return Ok(self.stray());
+            };
+            // Before `!pubkey`, after an `!ioauth` already taken, or not for this session: not this round's.
+            let (Some(session), None) = (slot.session.as_ref(), slot.io.as_ref()) else {
+                return Ok(self.stray());
+            };
+            let Ok(plaintext) = session.decrypt(ciphertext) else {
+                return Ok(self.stray());
+            };
+            (plaintext, slot.maker_nacl.clone())
         };
-        if already {
-            return Err(err(from, "second !ioauth"));
-        }
         let io = Ioauth::parse(&plaintext).ok_or_else(|| err(from, "malformed !ioauth"))?;
         if io.utxos.len() > self.cfg.max_maker_utxos {
             return Err(err(from, "too many inputs"));
@@ -817,19 +815,18 @@ impl Taker {
         from: &str,
         ciphertext: &str,
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| err(from, "!sig before !tx"))?;
-        let slot = self.makers.get(from).ok_or_else(|| err(from, "unknown"))?;
-        let session = slot
-            .session
-            .as_ref()
-            .ok_or_else(|| err(from, "no session"))?;
-        let io = slot.io.as_ref().ok_or_else(|| err(from, "no !ioauth"))?;
-        let payload = session
-            .decrypt(ciphertext)
-            .map_err(|e| err(from, e.to_string()))?;
+        let Some(tx) = self.tx.as_ref() else {
+            return Ok(self.stray());
+        };
+        let Some(slot) = self.makers.get(from) else {
+            return Ok(self.stray());
+        };
+        let (Some(session), Some(io)) = (slot.session.as_ref(), slot.io.as_ref()) else {
+            return Ok(self.stray());
+        };
+        let Ok(payload) = session.decrypt(ciphertext) else {
+            return Ok(self.stray());
+        };
         let secp = Secp256k1::verification_only();
         let theirs: BTreeSet<OutPoint> = io.utxos.iter().map(|(o, _)| *o).collect();
         let mut placed = false;
@@ -845,21 +842,36 @@ impl Taker {
                 break;
             }
         }
+        // A signature already taken (a duplicate delivery) or one that fits none of the maker's inputs. A maker
+        // that never sends a good one fails the round at its deadline.
         if !placed {
-            return Err(err(from, "signature fits none of its inputs"));
+            return Ok(self.stray());
         }
+        Ok((Vec::new(), self.progress()))
+    }
+
+    /// Where the round is: every maker input signed, or still waiting.
+    pub fn progress(&self) -> Progress {
         let maker_inputs: usize = self
             .makers
             .values()
             .filter_map(|s| s.io.as_ref())
             .map(|io| io.utxos.len())
             .sum();
-        let progress = if self.witnesses.len() == maker_inputs {
+        if self.tx.is_some() && self.witnesses.len() == maker_inputs {
             Progress::MakersSigned
         } else {
             Progress::Waiting
-        };
-        Ok((Vec::new(), progress))
+        }
+    }
+
+    /// A line that verifies but does not belong to the round as it stands: a duplicate, a line from another
+    /// exchange, one out of order, or an encrypted line that does not decrypt with the maker's session. It
+    /// is ignored, and the round stays where it is (ADR 0007: on channels where a directory or server
+    /// forwards lines, anyone who saw a line can deliver it again). A maker that really fails to answer is
+    /// caught by the round's deadline.
+    fn stray(&self) -> (Vec<Outgoing>, Progress) {
+        (Vec::new(), self.progress())
     }
 
     /// Sign our own inputs (after every maker's, and after any channel's `funding_signed`) and return the

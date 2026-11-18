@@ -582,6 +582,11 @@ pub async fn run_taker<C: Channel>(
         }
         remember(&mut peers, &msg.from, &route);
         for cmd in commands(&msg) {
+            // Where anyone could have delivered it, a lone `!error` says nothing about the maker: the round's
+            // deadline decides.
+            if matches!(cmd, Command::Error(_)) && !client.authenticates_sender() {
+                continue;
+            }
             let (outgoing, progress) =
                 blocking(|| taker.handle(&msg.from, cmd, chain)).map_err(NodeError::Taker)?;
             deliver(client, &peers, chain, outgoing).await?;

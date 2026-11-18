@@ -94,6 +94,11 @@ pub trait Channel: Send + Sync {
     /// The `hostid` this channel signs and verifies private lines with (JMP-0001).
     fn hostid(&self) -> &str;
 
+    /// Whether a private line's sender and recipient are authenticated by the channel itself, beyond the
+    /// line's own signature (which covers neither the command nor the recipient). Where they are not, a line
+    /// seen once can be delivered again to anyone, so a driver must not act on a lone `!error`.
+    fn authenticates_sender(&self) -> bool;
+
     /// Start receiving private messages, and also offers and public messages as asked.
     fn listen(
         &self,

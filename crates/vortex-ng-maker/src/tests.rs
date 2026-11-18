@@ -431,6 +431,74 @@ fn liquidity_and_offers_follow_the_wallet() {
 }
 
 #[test]
+fn a_stray_line_leaves_the_session_as_it_was() {
+    let secp = Secp256k1::new();
+    let mut maker = funded_maker();
+    let (taker, chain) = new_taker();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    let fill = Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: taker.nacl.public_hex(),
+        commitment: podle.commitment(),
+    };
+    let garbage = |name: &str| Command::Encrypted {
+        name: name.into(),
+        ciphertext: "AAAA".into(),
+    };
+    // Before any `!fill`: nothing is sent and nothing is started.
+    for stray in [garbage("auth"), garbage("tx"), Command::Error("x".into())] {
+        assert!(maker.handle("J5taker", stray, &chain, NOW).is_empty());
+    }
+    assert!(maker.sessions.is_empty());
+
+    let out = maker.handle("J5taker", fill.clone(), &chain, NOW);
+    assert_eq!(private(&out[0]).0, "pubkey");
+    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    // Filled: the same `!fill` again, lines not encrypted for this session, lines out of order.
+    for stray in [
+        fill.clone(),
+        garbage("auth"),
+        garbage("tx"),
+        garbage("sig"),
+        Command::Error("x".into()),
+    ] {
+        assert!(maker.handle("J5taker", stray, &chain, NOW).is_empty());
+        assert!(matches!(
+            maker.sessions.get("J5taker"),
+            Some(Stage::Filled(_))
+        ));
+    }
+    // An `!auth` encrypted for another session (another maker's, or an old one) is not this session's.
+    let elsewhere = NaclKeypair::generate();
+    let foreign = taker.nacl.session(&elsewhere.public_hex()).unwrap();
+    let foreign_auth = Command::Encrypted {
+        name: "auth".into(),
+        ciphertext: foreign.encrypt(&podle.revelation()).unwrap(),
+    };
+    assert!(
+        maker
+            .handle("J5taker", foreign_auth, &chain, NOW)
+            .is_empty()
+    );
+
+    // The real `!auth` still works, and afterwards its copy is stray too.
+    let auth = Command::Encrypted {
+        name: "auth".into(),
+        ciphertext: session.encrypt(&podle.revelation()).unwrap(),
+    };
+    let out = maker.handle("J5taker", auth.clone(), &chain, NOW);
+    assert_eq!(private(&out[0]).0, "ioauth");
+    for stray in [auth, fill, garbage("tx")] {
+        assert!(maker.handle("J5taker", stray, &chain, NOW).is_empty());
+        assert!(matches!(
+            maker.sessions.get("J5taker"),
+            Some(Stage::Authed(_))
+        ));
+    }
+}
+
+#[test]
 fn refusals_end_the_session_with_a_fixed_error() {
     let secp = Secp256k1::new();
     let (taker, chain) = new_taker();
@@ -447,15 +515,17 @@ fn refusals_end_the_session_with_a_fixed_error() {
         body: ERROR_TEXT.into(),
     }];
 
-    // Out of range, unknown oid, auth before fill.
+    // Out of range, unknown oid.
     let mut maker = funded_maker();
     assert_eq!(maker.handle("J5taker", fill(5_000), &chain, NOW), error);
     assert_eq!(
         maker.handle(
             "J5taker",
-            Command::Encrypted {
-                name: "auth".into(),
-                ciphertext: "AAAA".into()
+            Command::Fill {
+                oid: 7,
+                amount: AMOUNT,
+                nacl_pubkey: taker.nacl.public_hex(),
+                commitment: podle.commitment(),
             },
             &chain,
             NOW

@@ -54,9 +54,14 @@ impl MakerConfig {
     }
 }
 
-/// Why the maker dropped a session. Only a fixed `!error` reaches the taker.
+/// Why the maker dropped a session, or did nothing. Only a fixed `!error` reaches the taker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MakerError {
+    /// A line that verifies but does not belong to the session as it stands: a duplicate, a line from
+    /// another exchange, one out of order, or an encrypted line that does not decrypt with the session's
+    /// key. It is ignored: the session is kept as it was and nothing is sent (ADR 0007: on channels where a
+    /// directory or server forwards lines, anyone who saw a line can deliver it again).
+    Stray(&'static str),
     /// A message out of order, or for an unknown session.
     State(&'static str),
     /// The fill is not for one of our offers, or out of range.
@@ -249,7 +254,8 @@ impl Maker {
             .collect()
     }
 
-    /// Handle one verified command from taker `from`. Errors drop the session and answer `!error`.
+    /// Handle one verified command from taker `from`. A refusal drops the session and answers `!error`; a
+    /// stray line (see [`MakerError::Stray`]) is ignored.
     pub fn handle(
         &mut self,
         from: &str,
@@ -285,20 +291,24 @@ impl Maker {
             Command::Encrypted { name, ciphertext } if name == "tx" => {
                 self.on_tx(from, &ciphertext, chain, now)
             }
-            _ => Err(MakerError::State("unexpected command")),
+            _ => Err(MakerError::Stray("not a command a maker answers here")),
         };
         if self.sessions.contains_key(from) {
             self.started.entry(from.to_string()).or_insert(now);
         }
-        result.unwrap_or_else(|_| {
-            self.sessions.remove(from);
-            self.started.remove(from);
-            vec![Outgoing::Private {
-                to: from.to_string(),
-                command: "error".into(),
-                body: ERROR_TEXT.into(),
-            }]
-        })
+        match result {
+            Ok(out) => out,
+            Err(MakerError::Stray(_)) => Vec::new(),
+            Err(_) => {
+                self.sessions.remove(from);
+                self.started.remove(from);
+                vec![Outgoing::Private {
+                    to: from.to_string(),
+                    command: "error".into(),
+                    body: ERROR_TEXT.into(),
+                }]
+            }
+        }
     }
 
     fn on_fill(
@@ -310,7 +320,8 @@ impl Maker {
         commitment: [u8; 32],
     ) -> Result<Vec<Outgoing>, MakerError> {
         if self.sessions.contains_key(from) {
-            return Err(MakerError::State("session exists"));
+            // The taker's own `!fill` again (a duplicate delivery), or a copy of one it sent to another maker.
+            return Err(MakerError::Stray("session exists"));
         }
         if self.sessions.len() >= MAX_SESSIONS {
             return Err(MakerError::State("too many open sessions"));
@@ -360,13 +371,17 @@ impl Maker {
         ciphertext: &str,
         chain: &impl Chain,
     ) -> Result<Vec<Outgoing>, MakerError> {
-        let Some(Stage::Filled(filled)) = self.sessions.remove(from) else {
-            return Err(MakerError::State("auth before fill"));
+        // Only a line encrypted for this session counts; anything else leaves the session as it is.
+        let revelation = match self.sessions.get(from) {
+            Some(Stage::Filled(filled)) => filled
+                .session
+                .decrypt(ciphertext)
+                .map_err(|_| MakerError::Stray("auth not for this session"))?,
+            _ => return Err(MakerError::Stray("auth out of place")),
         };
-        let revelation = filled
-            .session
-            .decrypt(ciphertext)
-            .map_err(|e| MakerError::Internal(e.to_string()))?;
+        let Some(Stage::Filled(filled)) = self.sessions.remove(from) else {
+            return Err(MakerError::Stray("auth out of place"));
+        };
         let podle =
             Podle::parse_revelation(&revelation).map_err(|e| MakerError::Podle(e.to_string()))?;
         let secp = Secp256k1::new();
@@ -543,14 +558,18 @@ impl Maker {
         chain: &impl Chain,
         now: u64,
     ) -> Result<Vec<Outgoing>, MakerError> {
-        let Some(Stage::Authed(authed)) = self.sessions.remove(from) else {
-            return Err(MakerError::State("tx before auth"));
+        // Only a line encrypted for this session counts; anything else leaves the session as it is.
+        let plaintext = match self.sessions.get(from) {
+            Some(Stage::Authed(authed)) => authed
+                .filled
+                .session
+                .decrypt(ciphertext)
+                .map_err(|_| MakerError::Stray("tx not for this session"))?,
+            _ => return Err(MakerError::Stray("tx out of place")),
         };
-        let plaintext = authed
-            .filled
-            .session
-            .decrypt(ciphertext)
-            .map_err(|e| MakerError::Internal(e.to_string()))?;
+        let Some(Stage::Authed(authed)) = self.sessions.remove(from) else {
+            return Err(MakerError::Stray("tx out of place"));
+        };
         let raw = STANDARD
             .decode(plaintext)
             .map_err(|_| MakerError::Tx("tx base64".into()))?;
