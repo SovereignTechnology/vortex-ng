@@ -25,6 +25,7 @@ nostr = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+vortex-ng-channel = { workspace = true, features = ["test-util"] }
 nostr-sdk = { workspace = true, features = ["local-relay"] }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }

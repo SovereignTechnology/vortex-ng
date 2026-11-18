@@ -55,11 +55,12 @@ fn blocking<T>(work: impl FnOnce() -> T) -> T {
 }
 
 /// Check the `!tbond` proofs of the nicks worth it: those with an offer the taker would consider
-/// (`candidates`), at most [`MAX_BOND_LOOKUPS`] of them, against a tip read once.
+/// (`candidates`), at most [`MAX_BOND_LOOKUPS`] of them, against a tip read once. A proof is made out to
+/// the nick the maker knows us by: `me(maker)`.
 fn verify_bonds(
     proofs: &HashMap<String, String>,
     candidates: &HashSet<String>,
-    me: &str,
+    me: impl Fn(&str) -> String,
     chain: &impl ChainLookup,
     now: u64,
     cfg: &TakerConfig,
@@ -72,7 +73,7 @@ fn verify_bonds(
         .filter(|(nick, _)| candidates.contains(*nick))
         .take(MAX_BOND_LOOKUPS)
         .filter_map(|(nick, proof)| {
-            verify_bond(proof, me, nick, chain, height, now, cfg.bond_params)
+            verify_bond(proof, &me(nick), nick, chain, height, now, cfg.bond_params)
                 .ok()
                 .map(|bond| (nick.clone(), bond))
         })
@@ -176,8 +177,17 @@ async fn deliver<C: Channel>(
     Ok(())
 }
 
-fn remember<R: Clone>(peers: &mut HashMap<String, R>, nick: &str, route: &R) {
-    peers.insert(nick.to_string(), route.clone());
+/// Learn how to reach `nick`. A private line is the authoritative route and replaces what was known; a
+/// public line only fills in a nick not known yet, so a public line on another channel never moves a peer
+/// off the channel its private lines use.
+fn remember<R: Clone>(peers: &mut HashMap<String, R>, nick: &str, route: &R, private: bool) {
+    if private {
+        peers.insert(nick.to_string(), route.clone());
+    } else {
+        peers
+            .entry(nick.to_string())
+            .or_insert_with(|| route.clone());
+    }
 }
 
 /// The maker's `!orderbook` rate limits (the Nostr draft's SHOULD): each answer costs a proof and a gift
@@ -240,7 +250,15 @@ pub async fn run_maker<C: Channel>(
         let Next::Message(incoming) = client.receive(left).await else {
             break;
         };
-        let outgoing = maker_step(maker, chain, &mut peers, &mut limiter, &me, incoming);
+        let outgoing = maker_step(
+            maker,
+            client,
+            chain,
+            &mut peers,
+            &mut limiter,
+            &me,
+            incoming,
+        );
         // A failed send to one taker must not stop the maker.
         let _ = deliver(client, &peers, chain, outgoing).await;
     }
@@ -248,13 +266,14 @@ pub async fn run_maker<C: Channel>(
 }
 
 /// What a maker does with one message from the channel: the answers to send.
-fn maker_step<R: Clone>(
+fn maker_step<C: Channel>(
     maker: &mut Maker,
+    client: &C,
     chain: &impl ChainLookup,
-    peers: &mut HashMap<String, R>,
+    peers: &mut HashMap<String, C::Route>,
     limiter: &mut OrderbookLimiter,
     me: &str,
-    incoming: Incoming<R>,
+    incoming: Incoming<C::Route>,
 ) -> Vec<Outgoing> {
     match incoming {
         Incoming::Public {
@@ -262,11 +281,13 @@ fn maker_step<R: Clone>(
             commands,
             route,
         } => {
-            remember(peers, &nick, &route);
+            remember(peers, &nick, &route, false);
+            // Rate-limited per channel and nick: a taker asking on two channels is two askers.
+            let asker = format!("{}:{nick}", client.channel_of(&route));
             let mut out = Vec::new();
             for cmd in commands {
                 match cmd {
-                    Command::Orderbook if limiter.allow(&nick, Instant::now()) => {
+                    Command::Orderbook if limiter.allow(&asker, Instant::now()) => {
                         // A failed refresh keeps the current certificate while it lasts.
                         let _ = blocking(|| maker.refresh_bond(chain, unix_now()));
                         out.extend(maker.on_orderbook(&nick, me));
@@ -278,7 +299,7 @@ fn maker_step<R: Clone>(
             out
         }
         Incoming::Private { msg, route } => {
-            remember(peers, &msg.from, &route);
+            remember(peers, &msg.from, &route, true);
             let mut out = Vec::new();
             for cmd in commands(&msg) {
                 out.extend(blocking(|| maker.handle(&msg.from, cmd, chain, unix_now())));
@@ -459,7 +480,15 @@ pub async fn serve_maker<B: ChainLookup + BlockSource, C: Channel>(
                 continue;
             }
         };
-        let outgoing = maker_step(maker, chain, &mut peers, &mut limiter, &me, incoming);
+        let outgoing = maker_step(
+            maker,
+            client,
+            chain,
+            &mut peers,
+            &mut limiter,
+            &me,
+            incoming,
+        );
         // A failed send to one taker must not stop the maker.
         let _ = deliver(client, &peers, chain, outgoing).await;
     }
@@ -473,6 +502,13 @@ pub struct Orderbook<R> {
     /// Each answering maker's `!tbond` proof, not yet verified (see [`verify_bond`]).
     pub proofs: HashMap<String, String>,
     peers: HashMap<String, R>,
+}
+
+impl<R> Orderbook<R> {
+    /// How to reach maker `nick`: the route its private answer came by.
+    pub fn route(&self, nick: &str) -> Option<&R> {
+        self.peers.get(nick)
+    }
 }
 
 impl<R> Default for Orderbook<R> {
@@ -504,7 +540,7 @@ pub async fn fetch_orderbook<C: Channel>(
         match client.receive(left).await {
             Next::Message(Incoming::Offers { nick, route, .. }) => {
                 if book.peers.contains_key(&nick) || book.peers.len() < MAX_ANSWERING_NICKS {
-                    remember(&mut book.peers, &nick, &route);
+                    remember(&mut book.peers, &nick, &route, false);
                 }
                 // Public offers are a discovery cache (the draft): a maker that has not answered may have
                 // started listening after our request, so ask again.
@@ -535,7 +571,7 @@ pub async fn fetch_orderbook<C: Channel>(
                     }
                 }
                 if per_nick.contains_key(&msg.from) {
-                    remember(&mut book.peers, &msg.from, &route);
+                    remember(&mut book.peers, &msg.from, &route, true);
                 }
             }
             Next::Message(Incoming::Public { .. }) => {}
@@ -559,14 +595,18 @@ pub async fn run_taker<C: Channel>(
     until: Instant,
 ) -> Result<Transaction, NodeError> {
     let network = channel_network(cfg.network);
-    let me = client.nick().to_string();
     let Orderbook {
         offers,
         proofs,
         mut peers,
     } = fetch_orderbook(client, network, gather).await?;
     let candidates = candidate_nicks(&offers, cfg);
-    let bonds = blocking(|| verify_bonds(&proofs, &candidates, &me, chain, unix_now(), cfg));
+    // Each maker made its proof out to the nick it knows us by, on the channel it answered on.
+    let me = |maker: &str| match peers.get(maker) {
+        Some(route) => client.nick_on(route).to_string(),
+        None => client.nick().to_string(),
+    };
+    let bonds = blocking(|| verify_bonds(&proofs, &candidates, me, chain, unix_now(), cfg));
     let chosen = select_makers(&offers, &bonds, cfg);
     let in_round: HashSet<String> = chosen.iter().map(|(nick, _)| nick.clone()).collect();
     let outgoing = taker.start(chosen).map_err(NodeError::Taker)?;
@@ -580,11 +620,11 @@ pub async fn run_taker<C: Channel>(
         if !in_round.contains(&msg.from) {
             continue;
         }
-        remember(&mut peers, &msg.from, &route);
+        remember(&mut peers, &msg.from, &route, true);
         for cmd in commands(&msg) {
             // Where anyone could have delivered it, a lone `!error` says nothing about the maker: the round's
             // deadline decides.
-            if matches!(cmd, Command::Error(_)) && !client.authenticates_sender() {
+            if matches!(cmd, Command::Error(_)) && !client.authenticates(&route) {
                 continue;
             }
             let (outgoing, progress) =

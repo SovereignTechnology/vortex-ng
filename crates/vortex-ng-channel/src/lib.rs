@@ -10,6 +10,7 @@
 //! lines it has verified. How a peer is reached on the channel is the channel's business: it hands the
 //! driver an opaque [`Channel::Route`] with each message, and the driver gives the route back to answer.
 
+pub mod set;
 pub mod socks;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
@@ -97,13 +98,26 @@ pub trait Channel: Send + Sync {
     /// This channel's nick.
     fn nick(&self) -> &str;
 
-    /// The `hostid` this channel signs and verifies private lines with (JMP-0001).
-    fn hostid(&self) -> &str;
+    /// The nick this channel uses toward the peer reached by `route` (what a fidelity-bond proof from that
+    /// peer is made out to). One nick per channel, so normally [`Channel::nick`]; a set of channels can use
+    /// a different nick on each.
+    fn nick_on(&self, route: &Self::Route) -> &str {
+        let _ = route;
+        self.nick()
+    }
 
-    /// Whether a private line's sender and recipient are authenticated by the channel itself, beyond the
-    /// line's own signature (which covers neither the command nor the recipient). Where they are not, a line
-    /// seen once can be delivered again to anyone, so a driver must not act on a lone `!error`.
-    fn authenticates_sender(&self) -> bool;
+    /// Which channel `route` leads through, for keeping per-channel state (a rate limit) apart. `0` for a
+    /// single channel.
+    fn channel_of(&self, route: &Self::Route) -> usize {
+        let _ = route;
+        0
+    }
+
+    /// Whether a private line that came by `route` had its sender and recipient authenticated by the
+    /// channel itself, beyond the line's own signature (which covers neither the command nor the
+    /// recipient). Where they are not, a line seen once can be delivered again to anyone, so a driver must
+    /// not act on a lone `!error`.
+    fn authenticates(&self, route: &Self::Route) -> bool;
 
     /// Start receiving private messages, and also offers and public messages as asked.
     fn listen(

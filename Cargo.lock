@@ -5756,6 +5756,7 @@ dependencies = [
  "rustix",
  "tokio",
  "vortex-ng-chain",
+ "vortex-ng-channel",
  "vortex-ng-core",
  "vortex-ng-maker",
  "vortex-ng-node",

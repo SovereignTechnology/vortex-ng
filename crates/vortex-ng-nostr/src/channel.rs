@@ -62,12 +62,8 @@ impl Channel for NickClient {
         self.keys().nick()
     }
 
-    fn hostid(&self) -> &str {
-        NOSTR_HOSTID
-    }
-
     // A gift wrap is encrypted to its recipient, and its seal is signed by the sender's nick key.
-    fn authenticates_sender(&self) -> bool {
+    fn authenticates(&self, _route: &NostrRoute) -> bool {
         true
     }
 

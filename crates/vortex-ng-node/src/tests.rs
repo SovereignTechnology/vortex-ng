@@ -386,21 +386,35 @@ fn bond_lookups_are_bounded_and_only_for_candidates() {
     // Every nick a candidate: the cap holds.
     let all: HashSet<String> = proofs.keys().cloned().collect();
     let chain = CountingChain::default();
-    let bonds = verify_bonds(&proofs, &all, "J5taker", &chain, 1_800_000_000, &cfg);
+    let bonds = verify_bonds(
+        &proofs,
+        &all,
+        |_| "J5taker".into(),
+        &chain,
+        1_800_000_000,
+        &cfg,
+    );
     assert!(bonds.is_empty(), "no such UTXOs");
     assert_eq!(chain.tips.load(SeqCst), 1, "the tip is read once");
     assert_eq!(chain.utxos.load(SeqCst), MAX_BOND_LOOKUPS);
     // A hundred candidates: a lookup for each of them and for nobody else.
     let some: HashSet<String> = all.iter().take(100).cloned().collect();
     let chain = CountingChain::default();
-    verify_bonds(&proofs, &some, "J5taker", &chain, 1_800_000_000, &cfg);
+    verify_bonds(
+        &proofs,
+        &some,
+        |_| "J5taker".into(),
+        &chain,
+        1_800_000_000,
+        &cfg,
+    );
     assert_eq!(chain.utxos.load(SeqCst), 100);
     // No candidates: no lookups at all.
     let chain = CountingChain::default();
     verify_bonds(
         &proofs,
         &HashSet::new(),
-        "J5taker",
+        |_| "J5taker".into(),
         &chain,
         1_800_000_000,
         &cfg,
@@ -426,4 +440,53 @@ async fn blocking_work_leaves_the_other_tasks_running() {
 #[tokio::test(flavor = "current_thread")]
 async fn blocking_work_just_runs_on_a_current_thread_runtime() {
     assert_eq!(blocking(|| 7), 7);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_maker_on_two_channels_is_reached_through_one() {
+    use vortex_ng_channel::set::ChannelSet;
+    use vortex_ng_channel::testing::{MockRoute, Sent, mock_channel};
+    use vortex_ng_core::nick::NickIdentity;
+
+    let (a, on_a) = mock_channel("J5takerOnA", true);
+    let (b, on_b) = mock_channel("J5takerOnB", false);
+    let mut set = ChannelSet::new(vec![Box::new(a), Box::new(b)]).unwrap();
+    let maker = NickIdentity::generate();
+    // Its private answer on channel B comes first. Its copy on channel A, and its public offers there, come
+    // later and change nothing.
+    on_b.deliver_private(
+        &maker,
+        "J5takerOnB",
+        "sw0absoffer",
+        "0 10000 100000000 0 500",
+        "b",
+    );
+    let later = on_a.clone();
+    let late_maker = maker.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        later.deliver_private(
+            &late_maker,
+            "J5takerOnA",
+            "sw0absoffer",
+            "0 10000 100000000 0 500",
+            "a",
+        );
+        later.deliver(Incoming::Offers {
+            nick: late_maker.nick().to_string(),
+            offers: Vec::new(),
+            route: MockRoute("a".into()),
+        });
+    });
+    let book = fetch_orderbook(&mut set, "regtest", Duration::from_millis(400))
+        .await
+        .unwrap();
+    assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
+    let route = book.route(maker.nick()).unwrap();
+    assert_eq!(set.channel_of(route), 1);
+    // A bond proof from it is checked against the nick it knows us by there.
+    assert_eq!(set.nick_on(route), "J5takerOnB");
+    for channel in [&on_a, &on_b] {
+        assert!(channel.sent().contains(&Sent::AskOrderbook));
+    }
 }

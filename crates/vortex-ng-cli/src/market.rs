@@ -5,6 +5,8 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use vortex_ng_chain::{Auth, CoreRpc};
+use vortex_ng_channel::Channel;
+use vortex_ng_channel::set::ChannelSet;
 use vortex_ng_core::bitcoin::{Address, Network, OutPoint, TxOut};
 use vortex_ng_core::bond::BondValueParams;
 use vortex_ng_core::offer::{CjFee, Offer, RelativeFee};
@@ -125,6 +127,24 @@ fn fee_text(offer: &Offer) -> String {
     }
 }
 
+/// The command's channels, as one set: today the Nostr relays.
+async fn channels(
+    network: &str,
+    relays: &[String],
+    outbound: &Outbound,
+) -> Result<ChannelSet, Failure> {
+    let nostr = NickClient::connect_via(
+        NickKeys::generate(),
+        network,
+        relays,
+        outbound,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(failed)?;
+    ChannelSet::new(vec![Box::new(nostr)]).map_err(failed)
+}
+
 /// `vortex-ng orderbook`: ask the makers on the relays what they offer.
 pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let mut valued = vec!["network", "relays", "pit", "wait", "proxy"];
@@ -144,22 +164,22 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     };
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
-    let (me, book) = runtime()?.block_on(async {
-        let mut client = NickClient::connect_via(
-            NickKeys::generate(),
-            channel,
-            &relays,
-            &outbound,
-            CONNECT_TIMEOUT,
-        )
-        .await
-        .map_err(failed)?;
+    let (us, book) = runtime()?.block_on(async {
+        let mut client = channels(channel, &relays, &outbound).await?;
         let book = fetch_orderbook(&mut client, channel, Duration::from_secs(wait.into()))
             .await
             .map_err(failed)?;
-        let me = client.keys().nick().to_string();
+        // The nick each maker knows us by (a bond proof is made out to it).
+        let us: std::collections::HashMap<String, String> = book
+            .offers
+            .iter()
+            .filter_map(|(nick, _)| {
+                let route = book.route(nick)?;
+                Some((nick.clone(), client.nick_on(route).to_string()))
+            })
+            .collect();
         client.shutdown().await;
-        Ok::<_, Failure>((me, book))
+        Ok::<_, Failure>((us, book))
     })?;
 
     let offers: Vec<&(String, Offer)> = book
@@ -182,7 +202,7 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     };
     let mut lookups = 0;
     let mut bond_of = |nick: &str| -> String {
-        let Some(proof) = book.proofs.get(nick) else {
+        let (Some(proof), Some(me)) = (book.proofs.get(nick), us.get(nick)) else {
             return "-".into();
         };
         let (Some(chain), Some(height)) = (&chain, height) else {
@@ -194,7 +214,7 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
         lookups += 1;
         match verify_bond(
             proof,
-            &me,
+            me,
             nick,
             chain,
             height,
@@ -299,18 +319,10 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     runtime()?.block_on(async {
-        let mut client = NickClient::connect_via(
-            NickKeys::generate(),
-            channel,
-            &relays,
-            &outbound,
-            CONNECT_TIMEOUT,
-        )
-        .await
-        .map_err(failed)?;
+        let mut client = channels(channel, &relays, &outbound).await?;
         println!(
             "maker {} in the {pit_name} pit on {}, {} relay(s)",
-            client.keys().nick(),
+            client.nick(),
             network_name(network),
             relays.len()
         );
@@ -565,15 +577,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let tx = runtime()?.block_on(async {
-        let mut client = NickClient::connect_via(
-            NickKeys::generate(),
-            channel,
-            &relays,
-            &outbound,
-            CONNECT_TIMEOUT,
-        )
-        .await
-        .map_err(failed)?;
+        let mut client = channels(channel, &relays, &outbound).await?;
         let gather = Duration::from_secs(wait.into());
         let round = run_taker(
             &mut taker,
