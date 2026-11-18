@@ -153,6 +153,11 @@ impl NickClient {
         &self.keys
     }
 
+    /// The channel's network name (the `network` tag of its events).
+    pub fn network(&self) -> &str {
+        &self.network
+    }
+
     /// The relays this nick reads on (advertised in its events and rumors).
     pub fn relays(&self) -> &[String] {
         &self.relays

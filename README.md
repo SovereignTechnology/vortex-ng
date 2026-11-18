@@ -38,6 +38,7 @@ unaudited: mainnet wallets are refused. Do not use it with real funds.**
 | crate | role |
 |---|---|
 | `vortex-ng-core` | Protocol logic with no I/O: codec, nicks, offers, PoDLE, bonds, per-pit rules |
+| `vortex-ng-channel` | The message-channel trait the drivers run over (Nostr today; onion directories and IRC next) |
 | `vortex-ng-nostr` | The Nostr message channel |
 | `vortex-ng-wallet` | JoinMarket-compatible wallet (mixdepths per pit, fidelity bonds) |
 | `vortex-ng-chain` | Chain backend over Core-compatible JSON-RPC (Bitcoin Core or rbitcoin) |

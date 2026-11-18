@@ -1,9 +1,9 @@
-//! Drives vortex-ng makers and takers over the Nostr message channel.
+//! Drives vortex-ng makers and takers over a message channel.
 //!
-//! The maker and taker crates are state machines with no I/O; this crate connects them to a
-//! [`NickClient`]: it turns verified private lines into commands, signs and sends their answers (JMP-0001
-//! lines with `hostid` `nostr-network`) to the peer's relays, publishes offers, and sends `!hp2` from a
-//! throwaway nick.
+//! The maker and taker crates are state machines with no I/O; this crate connects them to a [`Channel`]
+//! (`vortex-ng-channel`): it turns the channel's verified private lines into commands, hands their answers
+//! back to the channel to sign and send along the route the sender came by, announces offers, and has the
+//! channel publish `!hp2` unlinked from the maker's nick. The Nostr client (`NickClient`) is one channel.
 //!
 //! Chain lookups are synchronous (`ChainLookup`); a production daemon runs them on a blocking thread.
 
@@ -13,17 +13,15 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use vortex_ng_chain::ChainLookup;
+pub use vortex_ng_channel::{Channel, ChannelError, Incoming, Next};
 use vortex_ng_core::bitcoin::Transaction;
-use vortex_ng_core::bitcoin::secp256k1::Secp256k1;
 use vortex_ng_core::command::{Command, ENCRYPTED, Outgoing, parse_plaintext};
-use vortex_ng_core::line::{PrivMsg, sign_line};
+use vortex_ng_core::line::PrivMsg;
 use vortex_ng_core::offer::{Offer, Pit};
-use vortex_ng_core::protocol::{MAKER_CHANGE_THRESHOLD_SAT, NOSTR_HOSTID};
+use vortex_ng_core::protocol::MAKER_CHANGE_THRESHOLD_SAT;
 use vortex_ng_maker::Maker;
-use vortex_ng_nostr::ChannelError;
-use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
-use vortex_ng_nostr::event::{offer_deletion, offer_event, public_event};
-use vortex_ng_nostr::keys::{NickKeys, nostr_public};
+pub use vortex_ng_nostr::channel::{CONNECT_TIMEOUT, OFFER_TTL};
+use vortex_ng_nostr::client::unix_now;
 use vortex_ng_taker::{
     Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, select_makers,
     verify_bond,
@@ -31,10 +29,6 @@ use vortex_ng_taker::{
 use vortex_ng_wallet::PitWallet;
 use vortex_ng_wallet::sync::BlockSource;
 
-/// Lifetime of a maker's offer event, seconds.
-pub const OFFER_TTL: u64 = 1800;
-/// How long a relay connection may take.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A maker answers one nick's `!orderbook` at most once per this interval.
 pub const ORDERBOOK_NICK_INTERVAL: Duration = Duration::from_secs(5);
 /// A maker answers at most this many `!orderbook` requests a minute, from all nicks together.
@@ -88,7 +82,7 @@ fn verify_bonds(
 /// Why a driver stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeError {
-    /// The Nostr channel failed.
+    /// The message channel failed.
     Channel(ChannelError),
     /// The taker's round failed.
     Taker(TakerError),
@@ -126,6 +120,12 @@ impl From<ChannelError> for NodeError {
     }
 }
 
+impl From<vortex_ng_nostr::ChannelError> for NodeError {
+    fn from(e: vortex_ng_nostr::ChannelError) -> Self {
+        NodeError::Channel(e.into())
+    }
+}
+
 /// The Nostr channel's `network` tag value for a Bitcoin network.
 pub fn channel_network(network: vortex_ng_core::bitcoin::Network) -> &'static str {
     use vortex_ng_core::bitcoin::Network;
@@ -136,13 +136,6 @@ pub fn channel_network(network: vortex_ng_core::bitcoin::Network) -> &'static st
         Network::Regtest => "regtest",
         _ => "testnet",
     }
-}
-
-/// Where to reach a peer nick.
-#[derive(Clone, Debug)]
-struct Peer {
-    key: nostr::key::PublicKey,
-    relays: Vec<String>,
 }
 
 /// The commands a verified private line carries.
@@ -156,79 +149,35 @@ fn commands(msg: &PrivMsg) -> Vec<Command> {
     parse_plaintext(&format!("!{} {}", msg.command, msg.body)).unwrap_or_default()
 }
 
-async fn send(
-    client: &NickClient,
-    peers: &HashMap<String, Peer>,
-    to: &str,
-    command: &str,
-    body: &str,
-) -> Result<(), NodeError> {
-    let peer = peers
-        .get(to)
-        .ok_or(ChannelError::Invalid("no relays known for the recipient"))?;
-    let line = sign_line(
-        &Secp256k1::signing_only(),
-        client.keys().secret(),
-        to,
-        command,
-        body,
-        NOSTR_HOSTID,
-    )
-    .map_err(ChannelError::Line)?;
-    client.send_line(&peer.key, &peer.relays, &line).await?;
-    Ok(())
-}
-
-async fn deliver(
-    client: &NickClient,
-    network: &str,
-    peers: &HashMap<String, Peer>,
+/// Hand the state machines' answers to the channel: private lines to their recipients along the routes
+/// the drivers know, `!hp2` to the channel's unlinked publishing, transactions to the chain.
+async fn deliver<C: Channel>(
+    client: &C,
+    peers: &HashMap<String, C::Route>,
     chain: &impl ChainLookup,
     outgoing: Vec<Outgoing>,
 ) -> Result<(), NodeError> {
     for out in outgoing {
         match out {
             Outgoing::Private { to, command, body } => {
-                send(client, peers, &to, &command, &body).await?
+                let route = peers
+                    .get(&to)
+                    .ok_or(ChannelError::Invalid("no route known for the recipient"))?;
+                client.send_private(route, &to, &command, &body).await?
             }
             // A taker asked us to broadcast the round we signed for it (`!push`). A failure is its
             // problem to notice (it watches for the transaction and has other makers to ask).
             Outgoing::Broadcast(tx) => {
                 let _ = blocking(|| chain.broadcast(&tx));
             }
-            Outgoing::PublicEphemeral(content) => {
-                // A fresh nick on its own connection, closed afterwards (the draft's !hp2 rule), reaching
-                // the relays the way ours does but on a path of its own: never directly when we are behind
-                // a proxy.
-                let throwaway = client
-                    .sibling(NickKeys::generate(), CONNECT_TIMEOUT)
-                    .await?;
-                let relays: Vec<&str> = client.relays().iter().map(String::as_str).collect();
-                let event = public_event(throwaway.keys(), network, &content, &relays, unix_now())?;
-                let result = throwaway.publish(&event).await;
-                throwaway.shutdown().await;
-                result?;
-            }
+            Outgoing::PublicEphemeral(content) => client.publish_unlinked(&content).await?,
         }
     }
     Ok(())
 }
 
-fn remember(
-    peers: &mut HashMap<String, Peer>,
-    nick: &str,
-    key: &vortex_ng_core::bitcoin::secp256k1::PublicKey,
-    relays: &[String],
-) {
-    if let Ok(key) = nostr_public(key) {
-        peers.insert(
-            nick.to_string(),
-            Peer {
-                key,
-                relays: relays.to_vec(),
-            },
-        );
-    }
+fn remember<R: Clone>(peers: &mut HashMap<String, R>, nick: &str, route: &R) {
+    peers.insert(nick.to_string(), route.clone());
 }
 
 /// The maker's `!orderbook` rate limits (the Nostr draft's SHOULD): each answer costs a proof and a gift
@@ -269,74 +218,58 @@ impl OrderbookLimiter {
     }
 }
 
-/// Publish `!orderbook` from the taker's nick.
-async fn ask_orderbook(client: &NickClient, network: &str) -> Result<(), NodeError> {
-    let relays: Vec<&str> = client.relays().iter().map(String::as_str).collect();
-    let event = public_event(client.keys(), network, "!orderbook", &relays, unix_now())?;
-    client.publish(&event).await?;
-    Ok(())
-}
-
-/// Run `maker` on `client` until `until`: publish its offers, answer `!orderbook` with its offers, and run
-/// sessions for the takers that fill them.
-pub async fn run_maker(
+/// Run `maker` on `client` until `until`: announce its offers, answer `!orderbook` with its offers, and run
+/// sessions for the takers that fill them. `network` is the channel's own network name; the channel uses
+/// the one it was opened with.
+pub async fn run_maker<C: Channel>(
     maker: &mut Maker,
-    client: &mut NickClient,
+    client: &mut C,
     chain: &impl ChainLookup,
     network: &str,
     until: Instant,
 ) -> Result<(), NodeError> {
+    let _ = network;
     blocking(|| maker.refresh_bond(chain, unix_now()))
         .map_err(|e| NodeError::Maker(e.to_string()))?;
-    let me = client.keys().nick().to_string();
+    let me = client.nick().to_string();
     let mut limiter = OrderbookLimiter::new();
-    client
-        .subscribe(unix_now().saturating_sub(60), false, true)
-        .await?;
-    let relays: Vec<&str> = client.relays().iter().map(String::as_str).collect();
-    let pit = maker.pit();
-    let event = offer_event(
-        client.keys(),
-        network,
-        pit,
-        maker.offers(),
-        &[],
-        &relays,
-        unix_now(),
-        OFFER_TTL,
-    )?;
-    client.publish(&event).await?;
-    let mut peers: HashMap<String, Peer> = HashMap::new();
+    client.listen(false, true).await?;
+    client.announce_offers(maker.pit(), maker.offers()).await?;
+    let mut peers: HashMap<String, C::Route> = HashMap::new();
     while let Some(left) = until.checked_duration_since(Instant::now()) {
-        let Some(incoming) = client.next(left).await else {
+        let Next::Message(incoming) = client.receive(left).await else {
             break;
         };
         let outgoing = maker_step(maker, chain, &mut peers, &mut limiter, &me, incoming);
         // A failed send to one taker must not stop the maker.
-        let _ = deliver(client, network, &peers, chain, outgoing).await;
+        let _ = deliver(client, &peers, chain, outgoing).await;
     }
     Ok(())
 }
 
 /// What a maker does with one message from the channel: the answers to send.
-fn maker_step(
+fn maker_step<R: Clone>(
     maker: &mut Maker,
     chain: &impl ChainLookup,
-    peers: &mut HashMap<String, Peer>,
+    peers: &mut HashMap<String, R>,
     limiter: &mut OrderbookLimiter,
     me: &str,
-    incoming: Incoming,
+    incoming: Incoming<R>,
 ) -> Vec<Outgoing> {
     match incoming {
-        Incoming::Public(author, cmds) => {
-            remember(peers, &author.nick, &author.key, &author.relays);
+        Incoming::Public {
+            nick,
+            commands,
+            route,
+        } => {
+            remember(peers, &nick, &route);
             let mut out = Vec::new();
-            for cmd in cmds {
+            for cmd in commands {
                 match cmd {
-                    Command::Orderbook if limiter.allow(&author.nick, Instant::now()) => {
+                    Command::Orderbook if limiter.allow(&nick, Instant::now()) => {
                         // A failed refresh keeps the current certificate while it lasts.
                         let _ = blocking(|| maker.refresh_bond(chain, unix_now()));
-                        out.extend(maker.on_orderbook(&author.nick, me));
+                        out.extend(maker.on_orderbook(&nick, me));
                     }
                     Command::Hp2(c) => maker.on_hp2(c),
                     _ => {}
@@ -344,15 +277,15 @@ fn maker_step(
             }
             out
         }
-        Incoming::Private(msg, reply_relays) => {
-            remember(peers, &msg.from, &msg.key, &reply_relays);
+        Incoming::Private { msg, route } => {
+            remember(peers, &msg.from, &route);
             let mut out = Vec::new();
             for cmd in commands(&msg) {
                 out.extend(blocking(|| maker.handle(&msg.from, cmd, chain, unix_now())));
             }
             out
         }
-        Incoming::Offers(..) => Vec::new(),
+        Incoming::Offers { .. } => Vec::new(),
     }
 }
 
@@ -435,27 +368,25 @@ pub enum MakerReport {
 /// Unlike [`run_maker`], which serves fixed offers for one sitting, this keeps a maker fit to stay up:
 /// every `service.upkeep` it brings the wallet up to the chain's tip (so coins received in a round are
 /// offered once confirmed, and a round's spent coins are forgotten), refreshes the bond certificate, sizes
-/// its one offer to the wallet (`service.policy`), and publishes the offer event when the offer changed or
-/// half its lifetime has passed. When there is nothing to offer, the announced event is withdrawn with a
-/// deletion. Upkeep failures (the node is away, a relay refused) are reported and retried; they do not
-/// stop the maker.
-pub async fn serve_maker<C: ChainLookup + BlockSource>(
+/// its one offer to the wallet (`service.policy`), and announces the offer when it changed or half its
+/// lifetime ([`OFFER_TTL`]) has passed. When there is nothing to offer, the announced offer is withdrawn.
+/// Upkeep failures (the node is away, a relay refused) are reported and retried; they do not stop the
+/// maker. `network` is the channel's own network name; the channel uses the one it was opened with.
+pub async fn serve_maker<B: ChainLookup + BlockSource, C: Channel>(
     maker: &mut Maker,
-    client: &mut NickClient,
-    chain: &C,
+    client: &mut C,
+    chain: &B,
     network: &str,
     service: &MakerService,
     until: Option<Instant>,
     report: &mut dyn FnMut(MakerReport),
 ) -> Result<(), NodeError> {
-    let me = client.keys().nick().to_string();
+    let _ = network;
+    let me = client.nick().to_string();
     let pit = maker.pit();
     let mut limiter = OrderbookLimiter::new();
-    client
-        .subscribe(unix_now().saturating_sub(60), false, true)
-        .await?;
-    let relays: Vec<String> = client.relays().to_vec();
-    let mut peers: HashMap<String, Peer> = HashMap::new();
+    client.listen(false, true).await?;
+    let mut peers: HashMap<String, C::Route> = HashMap::new();
     // What is announced now, and when it was last published.
     let mut announced: Option<(Option<Offer>, Instant)> = None;
     let mut next_upkeep = Instant::now();
@@ -492,27 +423,11 @@ pub async fn serve_maker<C: ChainLookup + BlockSource>(
                         maker
                             .set_offers(offer.iter().cloned().collect())
                             .map_err(|e| NodeError::Maker(e.to_string()))?;
-                        let relay_refs: Vec<&str> = relays.iter().map(String::as_str).collect();
-                        let event = match (&offer, &announced) {
-                            (Some(_), _) => Some(offer_event(
-                                client.keys(),
-                                network,
-                                pit,
-                                maker.offers(),
-                                &[],
-                                &relay_refs,
-                                unix_now(),
-                                OFFER_TTL,
-                            )?),
+                        let published = match (&offer, &announced) {
+                            (Some(_), _) => client.announce_offers(pit, maker.offers()).await,
                             // Nothing to offer any more: withdraw what was announced.
-                            (None, Some((Some(_), _))) => {
-                                Some(offer_deletion(client.keys(), network, pit, unix_now())?)
-                            }
-                            (None, _) => None,
-                        };
-                        let published = match &event {
-                            Some(event) => client.publish(event).await,
-                            None => Ok(()),
+                            (None, Some((Some(_), _))) => client.withdraw_offers(pit).await,
+                            (None, _) => Ok(()),
                         };
                         match published {
                             Ok(()) => {
@@ -534,60 +449,71 @@ pub async fn serve_maker<C: ChainLookup + BlockSource>(
         if let Some(until) = until {
             wait = wait.min(until.saturating_duration_since(Instant::now()));
         }
-        let asked = Instant::now();
-        let Some(incoming) = client.next(wait).await else {
-            // A timeout is the next upkeep's turn. Anything sooner means the client has no live stream:
-            // pause rather than spin.
-            if asked.elapsed() < wait.min(Duration::from_millis(50)) {
+        let incoming = match client.receive(wait).await {
+            Next::Message(incoming) => incoming,
+            // The next upkeep's turn.
+            Next::Timeout => continue,
+            // No live stream: pause rather than spin.
+            Next::Closed => {
                 tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
             }
-            continue;
         };
         let outgoing = maker_step(maker, chain, &mut peers, &mut limiter, &me, incoming);
         // A failed send to one taker must not stop the maker.
-        let _ = deliver(client, network, &peers, chain, outgoing).await;
+        let _ = deliver(client, &peers, chain, outgoing).await;
     }
 }
 
-/// What makers answered to one `!orderbook` request.
-#[derive(Debug, Default)]
-pub struct Orderbook {
+/// What makers answered to one `!orderbook` request. `R` is the channel's [`Channel::Route`].
+#[derive(Debug)]
+pub struct Orderbook<R> {
     /// Every offer received, with its maker's nick, in arrival order.
     pub offers: Vec<(String, Offer)>,
     /// Each answering maker's `!tbond` proof, not yet verified (see [`verify_bond`]).
     pub proofs: HashMap<String, String>,
-    peers: HashMap<String, Peer>,
+    peers: HashMap<String, R>,
+}
+
+impl<R> Default for Orderbook<R> {
+    fn default() -> Self {
+        Orderbook {
+            offers: Vec::new(),
+            proofs: HashMap::new(),
+            peers: HashMap::new(),
+        }
+    }
 }
 
 /// Ask for the orderbook and gather the makers' private answers for `gather`: offers and `!tbond` proofs.
-/// Offer events serve only to discover makers that missed the request (it is then asked again).
-pub async fn fetch_orderbook(
-    client: &mut NickClient,
+/// Publicly announced offers serve only to discover makers that missed the request (it is then asked
+/// again). `network` is the channel's own network name; the channel uses the one it was opened with.
+pub async fn fetch_orderbook<C: Channel>(
+    client: &mut C,
     network: &str,
     gather: Duration,
-) -> Result<Orderbook, NodeError> {
-    client
-        .subscribe(unix_now().saturating_sub(60), true, false)
-        .await?;
-    ask_orderbook(client, network).await?;
+) -> Result<Orderbook<C::Route>, NodeError> {
+    let _ = network;
+    client.listen(true, false).await?;
+    client.ask_orderbook().await?;
     let mut asked = Instant::now();
     let mut book = Orderbook::default();
     let mut per_nick: HashMap<String, usize> = HashMap::new();
     let gather_until = Instant::now() + gather;
     while let Some(left) = gather_until.checked_duration_since(Instant::now()) {
-        match client.next(left).await {
-            Some(Incoming::Offers(author, _)) => {
-                if book.peers.contains_key(&author.nick) || book.peers.len() < MAX_ANSWERING_NICKS {
-                    remember(&mut book.peers, &author.nick, &author.key, &author.relays);
+        match client.receive(left).await {
+            Next::Message(Incoming::Offers { nick, route, .. }) => {
+                if book.peers.contains_key(&nick) || book.peers.len() < MAX_ANSWERING_NICKS {
+                    remember(&mut book.peers, &nick, &route);
                 }
-                // The events are a discovery cache (the draft): a maker that has not answered may have
-                // subscribed after our request, so ask again.
-                if !per_nick.contains_key(&author.nick) && asked.elapsed() >= REASK_INTERVAL {
-                    ask_orderbook(client, network).await?;
+                // Public offers are a discovery cache (the draft): a maker that has not answered may have
+                // started listening after our request, so ask again.
+                if !per_nick.contains_key(&nick) && asked.elapsed() >= REASK_INTERVAL {
+                    client.ask_orderbook().await?;
                     asked = Instant::now();
                 }
             }
-            Some(Incoming::Private(msg, reply_relays)) => {
+            Next::Message(Incoming::Private { msg, route }) => {
                 if !per_nick.contains_key(&msg.from) && per_nick.len() >= MAX_ANSWERING_NICKS {
                     continue;
                 }
@@ -609,11 +535,11 @@ pub async fn fetch_orderbook(
                     }
                 }
                 if per_nick.contains_key(&msg.from) {
-                    remember(&mut book.peers, &msg.from, &msg.key, &reply_relays);
+                    remember(&mut book.peers, &msg.from, &route);
                 }
             }
-            Some(_) => {}
-            None => break,
+            Next::Message(Incoming::Public { .. }) => {}
+            Next::Timeout | Next::Closed => break,
         }
     }
     Ok(book)
@@ -623,17 +549,17 @@ pub async fn fetch_orderbook(
 /// `!tbond` proofs; offer events serve only to discover makers that missed the request) for `gather`,
 /// verify the bonds, pick makers, run the round, and return the fully signed transaction (signed last,
 /// after every maker; channel funding hooks in before `Taker::finish`).
-pub async fn run_taker(
+pub async fn run_taker<C: Channel>(
     taker: &mut Taker,
     wallet: &PitWallet,
-    client: &mut NickClient,
+    client: &mut C,
     chain: &impl ChainLookup,
     cfg: &TakerConfig,
     gather: Duration,
     until: Instant,
 ) -> Result<Transaction, NodeError> {
     let network = channel_network(cfg.network);
-    let me = client.keys().nick().to_string();
+    let me = client.nick().to_string();
     let Orderbook {
         offers,
         proofs,
@@ -644,21 +570,21 @@ pub async fn run_taker(
     let chosen = select_makers(&offers, &bonds, cfg);
     let in_round: HashSet<String> = chosen.iter().map(|(nick, _)| nick.clone()).collect();
     let outgoing = taker.start(chosen).map_err(NodeError::Taker)?;
-    deliver(client, network, &peers, chain, outgoing).await?;
+    deliver(client, &peers, chain, outgoing).await?;
     while let Some(left) = until.checked_duration_since(Instant::now()) {
-        let Some(Incoming::Private(msg, reply_relays)) = client.next(left).await else {
+        let Next::Message(Incoming::Private { msg, route }) = client.receive(left).await else {
             continue;
         };
-        // Anyone who sees our key on a gift wrap can write to us: only the round's makers are heard, so an
-        // outsider cannot abort the round.
+        // Anyone who can reach our nick can write to us: only the round's makers are heard, so an outsider
+        // cannot abort the round.
         if !in_round.contains(&msg.from) {
             continue;
         }
-        remember(&mut peers, &msg.from, &msg.key, &reply_relays);
+        remember(&mut peers, &msg.from, &route);
         for cmd in commands(&msg) {
             let (outgoing, progress) =
                 blocking(|| taker.handle(&msg.from, cmd, chain)).map_err(NodeError::Taker)?;
-            deliver(client, network, &peers, chain, outgoing).await?;
+            deliver(client, &peers, chain, outgoing).await?;
             if progress == Progress::MakersSigned {
                 return taker.finish(wallet).map_err(NodeError::Taker);
             }

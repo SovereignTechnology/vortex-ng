@@ -11,13 +11,18 @@ use vortex_ng_chain::Utxo;
 use vortex_ng_core::bitcoin::block::{Header, Version as BlockVersion};
 use vortex_ng_core::bitcoin::blockdata::constants::genesis_block;
 use vortex_ng_core::bitcoin::hashes::Hash;
+use vortex_ng_core::bitcoin::secp256k1::Secp256k1;
 use vortex_ng_core::bitcoin::transaction::Version;
 use vortex_ng_core::bitcoin::{
     Amount, Block, CompactTarget, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxMerkleNode,
     TxOut, Txid, Witness, absolute,
 };
+use vortex_ng_core::line::sign_line;
 use vortex_ng_core::offer::Pit;
+use vortex_ng_core::protocol::NOSTR_HOSTID;
 use vortex_ng_maker::MakerConfig;
+use vortex_ng_nostr::client::NickClient;
+use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_taker::podle_for;
 use vortex_ng_wallet::Seed;
 

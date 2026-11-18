@@ -5739,6 +5739,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-ng-channel"
+version = "0.0.1"
+dependencies = [
+ "vortex-ng-core",
+]
+
+[[package]]
 name = "vortex-ng-cli"
 version = "0.0.1"
 dependencies = [
@@ -5809,6 +5816,7 @@ dependencies = [
  "tokio-tungstenite",
  "vortex-ng-autct",
  "vortex-ng-chain",
+ "vortex-ng-channel",
  "vortex-ng-core",
  "vortex-ng-joinstr",
  "vortex-ng-maker",
@@ -5827,6 +5835,7 @@ dependencies = [
  "nostr-sdk",
  "tokio",
  "tor-rtcompat",
+ "vortex-ng-channel",
  "vortex-ng-core",
 ]
 

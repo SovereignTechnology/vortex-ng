@@ -1,6 +1,6 @@
 [package]
 name = "vortex-ng-node"
-description = "Drives vortex-ng makers and takers over the Nostr channel"
+description = "Drives vortex-ng makers and takers over a message channel"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 vortex-ng-core = { workspace = true }
+vortex-ng-channel = { workspace = true }
 vortex-ng-chain = { workspace = true }
 vortex-ng-autct = { workspace = true }
 vortex-ng-joinstr = { workspace = true }
