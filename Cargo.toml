@@ -4,6 +4,7 @@ members = [
     "crates/vortex-ng-autct",
     "crates/vortex-ng-channel",
     "crates/vortex-ng-core",
+    "crates/vortex-ng-irc",
     "crates/vortex-ng-joinstr",
     "crates/vortex-ng-nostr",
     "crates/vortex-ng-onion",
@@ -28,6 +29,7 @@ publish = false
 
 [workspace.dependencies]
 vortex-ng-core = { path = "crates/vortex-ng-core" }
+vortex-ng-irc = { path = "crates/vortex-ng-irc" }
 vortex-ng-autct = { path = "crates/vortex-ng-autct" }
 vortex-ng-channel = { path = "crates/vortex-ng-channel" }
 vortex-ng-joinstr = { path = "crates/vortex-ng-joinstr" }

@@ -5776,6 +5776,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-ng-irc"
+version = "0.0.1"
+dependencies = [
+ "vortex-ng-core",
+]
+
+[[package]]
 name = "vortex-ng-joinstr"
 version = "0.0.1"
 dependencies = [
