@@ -223,18 +223,20 @@ enum Role {
 }
 
 /// The command's channels, as one set: Nostr relays and onion directory nodes, as given.
+/// The channels a command uses, and a label for each, in the set's order (what `channel_of` indexes).
 async fn channels(
     network: &str,
     meeting: &Meeting,
     outbound: &Outbound,
     role: Role,
-) -> Result<ChannelSet, Failure> {
+) -> Result<(ChannelSet, Vec<String>), Failure> {
     let maker = NickIdentity::generate();
     let identity = || match role {
         Role::Maker => maker.clone(),
         Role::Taker => NickIdentity::generate(),
     };
     let mut set: Vec<Box<dyn DynChannel>> = Vec::new();
+    let mut labels = Vec::new();
     if !meeting.relays.is_empty() {
         let keys = NickKeys::from_identity(identity()).map_err(failed)?;
         let nostr =
@@ -242,6 +244,7 @@ async fn channels(
                 .await
                 .map_err(failed)?;
         set.push(Box::new(nostr));
+        labels.push("nostr".to_string());
     }
     if !meeting.directories.is_empty() {
         let config = OnionConfig {
@@ -253,6 +256,7 @@ async fn channels(
             .await
             .map_err(failed)?;
         set.push(Box::new(onion));
+        labels.push("onion".to_string());
     }
     // The signature domains of all the channels must stay apart: a line signed for one must never verify on
     // another (IRC's is the server's NETWORK name; see vortex_ng_irc::codec::Hostid).
@@ -281,8 +285,9 @@ async fn channels(
         }
         domains.push(domain);
         set.push(Box::new(irc));
+        labels.push(format!("irc {}:{}", server.host, server.port));
     }
-    ChannelSet::new(set).map_err(failed)
+    Ok((ChannelSet::new(set).map_err(failed)?, labels))
 }
 
 /// `vortex-ng orderbook`: ask the makers on the relays what they offer.
@@ -313,8 +318,8 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     };
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
-    let (us, book) = runtime()?.block_on(async {
-        let mut client = channels(channel, &meeting, &outbound, Role::Taker).await?;
+    let (us, seen_on, book) = runtime()?.block_on(async {
+        let (mut client, labels) = channels(channel, &meeting, &outbound, Role::Taker).await?;
         let book = fetch_orderbook(&mut client, channel, Duration::from_secs(wait.into()))
             .await
             .map_err(failed)?;
@@ -327,8 +332,18 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
                 Some((nick.clone(), client.nick_on(route).to_string()))
             })
             .collect();
+        // The channel each maker answered on.
+        let seen_on: std::collections::HashMap<String, String> = book
+            .offers
+            .iter()
+            .filter_map(|(nick, _)| {
+                let route = book.route(nick)?;
+                let label = labels.get(client.channel_of(route))?;
+                Some((nick.clone(), label.clone()))
+            })
+            .collect();
         client.shutdown().await;
-        Ok::<_, Failure>((us, book))
+        Ok::<_, Failure>((us, seen_on, book))
     })?;
 
     let offers: Vec<&(String, Offer)> = book
@@ -375,8 +390,8 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
         }
     };
     println!(
-        "{:<18} {:<12} {:>12} {:>14} {:>7} {:>10}  bond",
-        "maker", "offer", "min (sat)", "max (sat)", "txfee", "fee"
+        "{:<18} {:<12} {:>12} {:>14} {:>7} {:>10}  {:<12} channel",
+        "maker", "offer", "min (sat)", "max (sat)", "txfee", "fee", "bond"
     );
     let mut bonds: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for (nick, offer) in offers {
@@ -385,14 +400,15 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
             bonds.insert(nick, bond);
         }
         println!(
-            "{:<18} {:<12} {:>12} {:>14} {:>7} {:>10}  {}",
+            "{:<18} {:<12} {:>12} {:>14} {:>7} {:>10}  {:<12} {}",
             nick,
             offer.offer_type.command(),
             offer.minsize,
             offer.maxsize,
             offer.txfee,
             fee_text(offer),
-            bonds.get(nick.as_str()).map_or("-", String::as_str)
+            bonds.get(nick.as_str()).map_or("-", String::as_str),
+            seen_on.get(nick.as_str()).map_or("-", String::as_str)
         );
     }
     Ok(())
@@ -471,7 +487,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     runtime()?.block_on(async {
-        let mut client = channels(channel, &meeting, &outbound, Role::Maker).await?;
+        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Maker).await?;
         println!(
             "maker {} in the {pit_name} pit on {}, {}",
             client.nick(),
@@ -732,7 +748,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let tx = runtime()?.block_on(async {
-        let mut client = channels(channel, &meeting, &outbound, Role::Taker).await?;
+        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Taker).await?;
         let gather = Duration::from_secs(wait.into());
         let round = run_taker(
             &mut taker,

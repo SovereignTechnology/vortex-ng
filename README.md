@@ -80,6 +80,18 @@ the last two are regtest only in this pre-release (ADR 0007). On several channel
 all of them and a taker a different nick on each; a peer stays on the channel it first spoke on. An IRC server
 whose signature domain (its `NETWORK` name) could be mistaken for another channel's is refused.
 
+What each channel shows, and to whom (ADR 0007 has the reasons):
+
+| channel | its operator sees | others on it see |
+|---|---|---|
+| Nostr relays | the recipient key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
+| onion directory nodes (vortex-ng never serves an onion yet, so they relay its private messages) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
+| an IRC server | everything a directory node sees, in its own logs | the same as on the directories |
+
+A maker's single nick, and the nick key its private lines carry, link its presence on all its channels, as in
+JoinMarket. A taker's nicks differ per channel. Outside regtest the onion directories and IRC will need a Tor
+daemon's SOCKS port (`--proxy`).
+
 `node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
 `--rpc-password-file <file>`): a Bitcoin Core compatible node on the wallet's network.
 
@@ -100,7 +112,8 @@ whose signature domain (its `NETWORK` name) could be mistaken for another channe
   (`--yes` skips the question). The transaction is checked with the node before it is broadcast.
 - Every PoDLE commitment sent is first written to `<wallet>.podle` (the public value makers broadcast, one
   per line): a commitment is spent even by a round that fails, and each coin has three.
-- `orderbook` lists what the makers on the relays answer, and verifies their fidelity bonds when given a node.
+- `orderbook` lists what the makers answer, with the channel each answered on, and verifies their fidelity
+  bonds when given a node.
 - `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
   username and password, such as a Tor daemon's SOCKS port (`127.0.0.1:9050`). Every nick then reaches the
   relays under credentials of its own, so Tor gives it circuits of its own: a maker and the throwaway nick it
