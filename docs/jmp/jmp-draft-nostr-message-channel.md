@@ -92,7 +92,9 @@ Every key used on this channel is new and used for nothing else:
   long-lived identity.
 - Each gift wrap is signed by its own one-time random key (NIP-59), never reused.
 - A nick key MUST NOT be the user's own Nostr identity, MUST NOT be derived from wallet keys, and MUST NOT be
-  used anywhere else.
+  used anywhere outside JoinMarket's message channels. A maker MAY use the same nick on JoinMarket's other
+  channels (onion directories, IRC), as JoinMarket does; that links its presence on all of them. A taker
+  SHOULD use a different nick on each channel.
 - A nick key MUST NOT publish any event this specification does not define: no kind 0 profile, no kind 3
   follows, no kind 10002 relay list, no NIP-05 name. Where a nick reads its private messages travels only in
   `relay` tags.
@@ -323,8 +325,9 @@ event and its answers.
 ## Backward Compatibility
 
 Peers that do not implement this channel are unaffected: the channel is additive, uses its own `hostid`, and
-changes nothing in the CoinJoin protocol. A peer MAY run this channel beside onion channels with the same nick,
-as JoinMarket's message channel collection allows; a session stays on the channel it started on.
+changes nothing in the CoinJoin protocol. A maker MAY run this channel beside JoinMarket's other channels with
+the same nick, as JoinMarket's message channel collection allows; a taker SHOULD use a different nick on each
+channel. A session stays on the channel it started on.
 
 This is how JoinMarket moved from IRC to onion directories: for a while both ran side by side, and reference
 JoinMarket's default configuration still runs both. The same path works here. During the transition, makers

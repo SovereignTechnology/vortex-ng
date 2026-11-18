@@ -4,7 +4,8 @@ Date: 2026-11-09
 
 ## Status
 
-Accepted (the wire format itself is the draft `docs/jmp/jmp-draft-nostr-message-channel.md`)
+Accepted (the wire format itself is the draft `docs/jmp/jmp-draft-nostr-message-channel.md`); its last consequence
+("all-Rust, no C tor, no onion service") is superseded by ADR 0007 for the onion and IRC channels.
 
 ## Context
 

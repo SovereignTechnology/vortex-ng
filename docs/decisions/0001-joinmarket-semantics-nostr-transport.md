@@ -4,7 +4,8 @@ Date: 2026-11-09
 
 ## Status
 
-Accepted
+Accepted; amended by ADR 0007 (2026-11-18), which adds JoinMarket's onion directories and IRC beside Nostr
+and supersedes "No IRC, no onion directories, no direct peer sockets" below.
 
 ## Context
 

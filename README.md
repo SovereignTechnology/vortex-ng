@@ -1,13 +1,17 @@
 # vortex-ng
 
-JoinMarket's coinjoin protocol, over Nostr only, with Lightning channel opens, in Rust.
+JoinMarket's coinjoin protocol over Nostr, beside JoinMarket's own onion directories and IRC, with Lightning
+channel opens, in Rust.
 
 vortex-ng is the successor to [LnVortex](https://github.com/ln-vortex/ln-vortex) (archived 2022), rebuilt
 around JoinMarket's maker/taker market instead of a central coordinator:
 
 - **JoinMarket semantics, Nostr transport.** The protocol layer (commands, NaCl sessions, PoDLE, fidelity
   bonds, per-pit transaction rules, maker and taker checks) follows JMP-0001 and the JMP extensions exactly.
-  Only the message channel changes: Nostr relays instead of IRC or onion directories. No coordinator.
+  The message channel is Nostr relays. No coordinator.
+- **Beside JoinMarket's own channels (in progress, ADR 0007).** The onion directory nodes and IRC that
+  joinmarket-clientserver and JoinMarket-NG use, at the same time as Nostr, so vortex-ng shares their market;
+  then a bridge for clients without Tor. Tracked in issue #33.
 - **Three pits.** `sw0` (P2WPKH, JMP-0001), `tr0` (taproot, JMP-0010), and `wsh0` (P2WSH 2-of-2, shaped
   exactly like a Lightning funding output; draft in this repo).
 - **Lightning channel opens inside the coinjoin.** A taker's equal-amount output can be the funding output of
@@ -16,7 +20,8 @@ around JoinMarket's maker/taker market instead of a central coordinator:
 - **Upstreamable by construction.** Every protocol piece JoinMarket lacks is written as a JMP draft
   (`docs/jmp/`) for [joinmarket-ng](https://github.com/joinmarket-ng/joinmarket-ng) to adopt.
 
-**Status: milestone M0 (bootstrap and specifications). Nothing here moves coins yet. Do not use it on mainnet.**
+**Status: pre-release. CoinJoins work on regtest, over Nostr, and interoperate there with JoinMarket-NG. It is
+unaudited: mainnet wallets are refused. Do not use it with real funds.**
 
 ## Documents
 

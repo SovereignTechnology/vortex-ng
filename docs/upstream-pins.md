@@ -11,7 +11,8 @@ references and test vectors, and record the reason below.
 | `joinmarket-ng/joinmarket-ng` main | `c3312cb4ede6de89bd36a1d5b26786905ffc210f` (release 0.43.0) | 2026-11-05 | `sw0` behaviour and test vectors |
 | `joinmarket-ng/joinmarket-ng` PR #643 head (`feat/taproot-pit-ring-market`, draft) | `606765ba3efa3bcda9f3c5b271da684ac48a3c8a` | 2026-10-27 | `tr0` and rings as implemented; where code and JMP drafts differ, both are noted in our specs |
 | `joinmarket-ng/joinmarket-ng` branch `nostr` (offer PoC) | `f9a99b342e6011b594c7a6c152ea1cf05fd6bc0d` | 2025-12-06 | kind 31402 offer events |
-| `JoinMarket-Org/joinmarket-clientserver` release | `v0.9.12` | 2026-04-21 | the reference implementation's behaviour |
+| `JoinMarket-Org/joinmarket-clientserver` release | `v0.9.12` (`77a426c504cbf6fa56ba0316dfd8da63a76d2bbf`) | 2026-04-20 | the reference implementation's behaviour, and the onion and IRC channels' wire format (ADR 0007); announced as its final release, the repository to be archived |
+| `joinmarket-ng/joinmarket-ng` main, `directory_server/` and `jmcore` directory client | `c3312cb4ede6de89bd36a1d5b26786905ffc210f` (release 0.43.0) | 2026-11-05 | the onion directory channel as JoinMarket-NG runs it: handshake features, nick authentication (JMP-0005), ping 798/799, directory limits |
 
 ## joinstr (ADR 0006)
 
@@ -38,3 +39,9 @@ references and test vectors, and record the reason below.
 - 2026-11-09: initial pins (M0).
 - 2026-11-15: joinstr pins (ADR 0006).
 - 2026-11-16: aut-ct pinned beside autct-api: the server's own types are the reference, the Python client library lags them.
+- 2026-11-18: joinmarket-clientserver's tag resolved to its commit; it is now also the reference for the onion and IRC
+  channels (ADR 0007). Its message-channel code (`src/jmdaemon/message_channel.py`, `irc.py`, `onionmc.py`,
+  `protocol.py`, `jmclient/client_protocol.py`) is byte-identical to 0.9.11's; `daemon_protocol.py` adds a canonical-hex
+  check on `!hp2` commitments. v0.9.12's defaults: five directory nodes (all five also in JoinMarket-NG's defaults)
+  and the hackint IRC server over Tor; Darkscience and ILITA were removed. JoinMarket-NG's directory server pinned
+  as the second onion reference.
