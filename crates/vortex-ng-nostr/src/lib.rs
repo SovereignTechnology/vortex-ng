@@ -12,11 +12,11 @@ pub mod event;
 pub mod keys;
 pub mod pool;
 pub mod private;
-pub mod socks;
+pub use vortex_ng_channel::socks;
 #[cfg(any(test, feature = "test-util"))]
-pub mod testing;
+pub use vortex_ng_channel::testing;
 #[cfg(feature = "tor")]
-pub mod tor;
+pub use vortex_ng_channel::tor;
 
 pub use nostr;
 

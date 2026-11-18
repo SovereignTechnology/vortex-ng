@@ -1,7 +1,8 @@
 //! Per-nick Tor through arti (feature `tor`).
 //!
 //! One bootstrapped [`TorClient`] per process; each nick gets [`TorClient::isolated_client`], so its streams
-//! never share a circuit with another nick's, behind its own [`crate::socks::SocksShim`]. Host names go to
+//! never share a circuit with another nick's, behind its own [`crate::socks::SocksShim`] or as its own
+//! [`crate::socks::NickConnector`]. Host names go to
 //! arti unresolved: DNS happens at the exit.
 
 use std::io;

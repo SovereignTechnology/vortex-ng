@@ -13,3 +13,12 @@ workspace = true
 
 [dependencies]
 vortex-ng-core = { workspace = true }
+tokio = { workspace = true }
+arti-client = { workspace = true, optional = true }
+tor-rtcompat = { workspace = true, optional = true }
+
+[features]
+# In-process Tor (arti): one isolated client per nick.
+tor = ["dep:arti-client", "dep:tor-rtcompat"]
+# Test helpers for other crates' tests (`vortex_ng_channel::testing`). Never needed to run vortex-ng.
+test-util = []

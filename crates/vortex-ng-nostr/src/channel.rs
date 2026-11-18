@@ -188,3 +188,139 @@ impl Channel for NickClient {
         NickClient::shutdown(self).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use nostr_sdk::prelude::MockRelay;
+    use vortex_ng_core::command::Command;
+
+    use crate::client::{Incoming, NickClient, unix_now};
+    use crate::event::public_event;
+    use crate::keys::NickKeys;
+    use crate::socks::{DirectConnector, Outbound, SocksShim};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_nick_and_its_sibling_has_a_path_of_its_own() {
+        use crate::testing::AuthSocks;
+
+        let relay = MockRelay::run().await.unwrap();
+        // A name only the proxy can resolve: nothing reaches this relay directly.
+        let port = relay
+            .url()
+            .await
+            .to_string()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .trim_end_matches('/')
+            .to_string();
+        let relays = vec![format!("ws://relay.test:{port}")];
+        let proxy = AuthSocks::start().await.unwrap();
+        let outbound = Outbound::IsolatingProxy(proxy.addr());
+        assert!(!outbound.is_direct() && Outbound::default().is_direct());
+        let wait = Duration::from_secs(10);
+
+        let mut maker =
+            NickClient::connect_via(NickKeys::generate(), "regtest", &relays, &outbound, wait)
+                .await
+                .unwrap();
+        let taker =
+            NickClient::connect_via(NickKeys::generate(), "regtest", &relays, &outbound, wait)
+                .await
+                .unwrap();
+        // The nick a maker sends `!hp2` from.
+        let throwaway = maker.sibling(NickKeys::generate(), wait).await.unwrap();
+        maker.subscribe(unix_now() - 60, false, true).await.unwrap();
+        let deadline = std::time::Instant::now() + wait;
+        let mut heard = Vec::new();
+        while heard.len() < 2 {
+            for from in [&taker, &throwaway] {
+                let event = public_event(
+                    from.keys(),
+                    "regtest",
+                    "!orderbook",
+                    &[relays[0].as_str()],
+                    unix_now(),
+                )
+                .unwrap();
+                from.publish(&event).await.unwrap();
+            }
+            while let Some(Incoming::Public(author, _)) =
+                maker.next(Duration::from_millis(1100)).await
+            {
+                if !heard.contains(&author.nick) {
+                    heard.push(author.nick);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing through the proxy"
+            );
+        }
+        // Three nicks, three sets of credentials; every connection was for the relay, by its name.
+        assert_eq!(proxy.usernames().len(), 3);
+        assert!(
+            proxy
+                .seen()
+                .iter()
+                .all(|(_, to)| *to == format!("relay.test:{port}"))
+        );
+
+        // The other ways out: a direct path has no proxy; a given address is used as it is.
+        let direct = Outbound::Direct.path().await.unwrap();
+        assert!(direct.proxy().is_none() && !direct.is_own());
+        let fixed = Outbound::Proxy(proxy.addr()).path().await.unwrap();
+        assert!(fixed.proxy() == Some(proxy.addr()) && !fixed.is_own());
+        let own = outbound.path().await.unwrap();
+        assert!(own.is_own() && own.proxy() != Some(proxy.addr()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_nick_client_reaches_its_relay_through_the_shim() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let shim = SocksShim::start(DirectConnector).await.unwrap();
+        let wait = Duration::from_secs(10);
+        let relays = vec![url.clone()];
+        let mut maker = NickClient::connect(
+            NickKeys::generate(),
+            "regtest",
+            &relays,
+            Some(shim.addr()),
+            wait,
+        )
+        .await
+        .unwrap();
+        let taker = NickClient::connect(NickKeys::generate(), "regtest", &relays, None, wait)
+            .await
+            .unwrap();
+        maker.subscribe(unix_now() - 60, false, true).await.unwrap();
+        // An ephemeral event reaches only the subscriptions the relay already has, and `subscribe` returns
+        // once the request is sent, not once the relay has it. So ask until it arrives: a new second each
+        // time, hence a new event.
+        let deadline = std::time::Instant::now() + wait;
+        let commands = loop {
+            let event = public_event(
+                taker.keys(),
+                "regtest",
+                "!orderbook",
+                &[url.as_str()],
+                unix_now(),
+            )
+            .unwrap();
+            taker.publish(&event).await.unwrap();
+            if let Some(Incoming::Public(_, commands)) =
+                maker.next(Duration::from_millis(1100)).await
+            {
+                break commands;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing through the proxy"
+            );
+        };
+        assert_eq!(commands, vec![Command::Orderbook]);
+    }
+}

@@ -10,6 +10,12 @@
 //! lines it has verified. How a peer is reached on the channel is the channel's business: it hands the
 //! driver an opaque [`Channel::Route`] with each message, and the driver gives the route back to answer.
 
+pub mod socks;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
+#[cfg(feature = "tor")]
+pub mod tor;
+
 use std::future::Future;
 use std::time::Duration;
 

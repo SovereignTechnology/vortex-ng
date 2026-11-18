@@ -2,23 +2,21 @@
 //! (rust-nostr's). The two libraries use different secp256k1 versions; the key crosses as bytes.
 
 use vortex_ng_core::bitcoin::hex::DisplayHex;
-use vortex_ng_core::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-use vortex_ng_core::nick::{nick_from_pubkey, random_nick_key};
+use vortex_ng_core::bitcoin::secp256k1::{PublicKey, SecretKey};
+use vortex_ng_core::nick::{NickIdentity, random_nick_key};
 
 use crate::ChannelError;
 
-/// A nick and its key pair.
+/// A nick and its key pair, with the key also as Nostr keys.
 pub struct NickKeys {
-    secret: SecretKey,
-    public: PublicKey,
-    nick: String,
+    identity: NickIdentity,
     nostr: nostr::key::Keys,
 }
 
 impl std::fmt::Debug for NickKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NickKeys")
-            .field("nick", &self.nick)
+            .field("nick", &self.identity.nick())
             .finish_non_exhaustive()
     }
 }
@@ -36,35 +34,42 @@ impl NickKeys {
 
     /// The nick of an existing key.
     pub fn from_secret(secret: SecretKey) -> Result<NickKeys, ChannelError> {
-        let public = PublicKey::from_secret_key(&Secp256k1::new(), &secret);
-        let nostr_secret = nostr::key::SecretKey::from_slice(&secret.secret_bytes())
+        NickKeys::from_identity(NickIdentity::from_secret(secret))
+    }
+
+    /// The Nostr view of a nick.
+    pub fn from_identity(identity: NickIdentity) -> Result<NickKeys, ChannelError> {
+        let nostr_secret = nostr::key::SecretKey::from_slice(&identity.secret().secret_bytes())
             .map_err(|e| ChannelError::Crypto(e.to_string()))?;
         Ok(NickKeys {
-            secret,
-            public,
-            nick: nick_from_pubkey(&public),
+            identity,
             nostr: nostr::key::Keys::new(nostr_secret),
         })
     }
 
+    /// The nick, as other channels see it.
+    pub fn identity(&self) -> &NickIdentity {
+        &self.identity
+    }
+
     /// The JoinMarket nick.
     pub fn nick(&self) -> &str {
-        &self.nick
+        self.identity.nick()
     }
 
     /// The nick key's secret, for signing JMP-0001 lines.
     pub fn secret(&self) -> &SecretKey {
-        &self.secret
+        self.identity.secret()
     }
 
     /// The compressed nick public key.
     pub fn public(&self) -> &PublicKey {
-        &self.public
+        self.identity.public()
     }
 
     /// Lowercase hex of the compressed key: the `jmpk` tag.
     pub fn jmpk_hex(&self) -> String {
-        self.public.serialize().to_lower_hex_string()
+        self.public().serialize().to_lower_hex_string()
     }
 
     /// The same key as Nostr keys.
@@ -81,6 +86,8 @@ pub fn nostr_public(public: &PublicKey) -> Result<nostr::key::PublicKey, Channel
 
 #[cfg(test)]
 mod tests {
+    use vortex_ng_core::nick::nick_from_pubkey;
+
     use super::*;
 
     #[test]

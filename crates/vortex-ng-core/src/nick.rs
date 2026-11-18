@@ -28,6 +28,55 @@ pub fn random_nick_key() -> bitcoin::secp256k1::SecretKey {
     }
 }
 
+/// A nick and its key, the same on every message channel.
+#[derive(Clone)]
+pub struct NickIdentity {
+    secret: bitcoin::secp256k1::SecretKey,
+    public: PublicKey,
+    nick: String,
+}
+
+impl std::fmt::Debug for NickIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NickIdentity")
+            .field("nick", &self.nick)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NickIdentity {
+    /// A fresh nick.
+    pub fn generate() -> NickIdentity {
+        NickIdentity::from_secret(random_nick_key())
+    }
+
+    /// The nick of an existing key.
+    pub fn from_secret(secret: bitcoin::secp256k1::SecretKey) -> NickIdentity {
+        let public =
+            PublicKey::from_secret_key(&bitcoin::secp256k1::Secp256k1::signing_only(), &secret);
+        NickIdentity {
+            secret,
+            nick: nick_from_pubkey(&public),
+            public,
+        }
+    }
+
+    /// The nick.
+    pub fn nick(&self) -> &str {
+        &self.nick
+    }
+
+    /// The nick key's secret, for signing JMP-0001 lines. Never printed.
+    pub fn secret(&self) -> &bitcoin::secp256k1::SecretKey {
+        &self.secret
+    }
+
+    /// The compressed nick key.
+    pub fn public(&self) -> &PublicKey {
+        &self.public
+    }
+}
+
 /// The nick a peer with the ephemeral key `pubkey` uses.
 pub fn nick_from_pubkey(pubkey: &PublicKey) -> String {
     let mut encoded = hash_part(pubkey);

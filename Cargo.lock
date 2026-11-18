@@ -5742,6 +5742,9 @@ dependencies = [
 name = "vortex-ng-channel"
 version = "0.0.1"
 dependencies = [
+ "arti-client",
+ "tokio",
+ "tor-rtcompat",
  "vortex-ng-core",
 ]
 
@@ -5829,12 +5832,10 @@ dependencies = [
 name = "vortex-ng-nostr"
 version = "0.0.1"
 dependencies = [
- "arti-client",
  "futures",
  "nostr",
  "nostr-sdk",
  "tokio",
- "tor-rtcompat",
  "vortex-ng-channel",
  "vortex-ng-core",
 ]
