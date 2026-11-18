@@ -22,7 +22,7 @@ use vortex_ng_node::{
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_nostr::socks::Outbound;
-use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy};
+use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy, Serve};
 use vortex_ng_taker::{
     Coin, DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, TakerError, choose_coins, podle_for,
     verify_bond,
@@ -257,6 +257,12 @@ async fn channels(
                 PeerPolicy::Local
             } else {
                 PeerPolicy::Onion
+            },
+            // A maker serves on regtest (loopback, as test setups without Tor do), so that takers can talk
+            // to it directly; outside regtest it will publish an onion through Tor's control port.
+            serve: match role {
+                Role::Maker if network == "regtest" => Serve::Loopback,
+                _ => Serve::None,
             },
         };
         let onion = OnionChannel::connect(identity(), config, outbound)

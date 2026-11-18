@@ -15,6 +15,7 @@ fn config(directories: &[&TestDirectory], network: &str) -> OnionConfig {
         network: network.to_string(),
         timeout: Duration::from_secs(5),
         peers: PeerPolicy::Relay,
+        serve: Serve::None,
     }
 }
 
@@ -399,4 +400,125 @@ async fn without_a_direct_way_lines_go_by_the_directory() {
             .any(|(_, kind, line)| *kind == PRIVMSG && line.contains("!fill ")))
         .await
     );
+}
+
+/// A maker that serves on loopback, connected to `directory`.
+async fn serving_maker(directory: &TestDirectory, identity: NickIdentity) -> OnionChannel {
+    let mut cfg = config(&[directory], "regtest");
+    cfg.serve = Serve::Loopback;
+    OnionChannel::connect(identity, cfg, &Outbound::Direct)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_serving_maker_is_reached_directly_both_ways() {
+    let directory = TestDirectory::start("regtest", None).await;
+    let identity = NickIdentity::generate();
+    let mut maker = serving_maker(&directory, identity.clone()).await;
+    maker.listen(false, true).await.unwrap();
+    let location = maker.location().expect("a location").to_string();
+    assert!(location.starts_with("127.0.0.1:"));
+    let (mut taker, route) = taker_with_route(&directory, &identity, Some(location)).await;
+    settled(&[&directory], 2).await;
+    taker
+        .prepare(&[(identity.nick().to_string(), route.clone())])
+        .await;
+    assert!(eventually(|| maker.direct() == 1 && taker.direct() == 1).await);
+
+    // The taker's line reaches the maker on the connection, and the maker answers on it.
+    taker
+        .send_private(&route, identity.nick(), "fill", "0 50000 abc")
+        .await
+        .unwrap();
+    let Next::Message(Incoming::Private { msg, route: back }) = maker.receive(WAIT).await else {
+        panic!("the fill")
+    };
+    assert_eq!(
+        (msg.from.as_str(), msg.command.as_str()),
+        (taker.nick(), "fill")
+    );
+    maker
+        .send_private(&back, taker.nick(), "pubkey", &"ab".repeat(32))
+        .await
+        .unwrap();
+    let Next::Message(Incoming::Private { msg, .. }) = taker.receive(WAIT).await else {
+        panic!("the answer")
+    };
+    assert_eq!(
+        (msg.from.as_str(), msg.command.as_str()),
+        (identity.nick(), "pubkey")
+    );
+    // The directory saw neither.
+    assert!(
+        !directory
+            .received()
+            .iter()
+            .any(|(_, _, line)| line.contains("!fill ") || line.contains("!pubkey "))
+    );
+}
+
+#[tokio::test]
+async fn inbound_peers_are_held_to_their_handshake() {
+    use tokio::net::TcpStream;
+
+    let directory = TestDirectory::start("regtest", None).await;
+    let identity = NickIdentity::generate();
+    let mut maker = serving_maker(&directory, identity.clone()).await;
+    maker.listen(false, true).await.unwrap();
+    let location = maker.location().unwrap().to_string();
+    async fn say(stream: &mut TcpStream, kind: u64, line: &str) {
+        let encoded = encode(kind, line).unwrap();
+        stream.write_all(encoded.as_bytes()).await.unwrap();
+    }
+    // Another network, and our own nick: refused.
+    let stranger = NickIdentity::generate();
+    for hello in [
+        wire::client_handshake(stranger.nick(), "signet", &[], None),
+        wire::client_handshake(identity.nick(), "regtest", &[], None),
+    ] {
+        let mut conn = TcpStream::connect(&location).await.unwrap();
+        say(&mut conn, HANDSHAKE, &hello).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(maker.direct(), 0);
+    }
+    // A valid handshake: a link, which carries only its own nick's lines.
+    let mut conn = TcpStream::connect(&location).await.unwrap();
+    say(
+        &mut conn,
+        HANDSHAKE,
+        &wire::client_handshake(stranger.nick(), "regtest", &[], None),
+    )
+    .await;
+    assert!(eventually(|| maker.direct() == 1).await);
+    let secp = Secp256k1::signing_only();
+    let other = NickIdentity::generate();
+    let foreign = sign_line(
+        &secp,
+        other.secret(),
+        identity.nick(),
+        "fill",
+        "0 50000 abc",
+        ONION_HOSTID,
+    )
+    .unwrap();
+    let own = sign_line(
+        &secp,
+        stranger.secret(),
+        identity.nick(),
+        "fill",
+        "0 50000 abc",
+        ONION_HOSTID,
+    )
+    .unwrap();
+    say(&mut conn, PRIVMSG, &foreign).await;
+    say(&mut conn, PRIVMSG, &own).await;
+    let Next::Message(Incoming::Private { msg, .. }) = maker.receive(WAIT).await else {
+        panic!("the peer's own line")
+    };
+    assert_eq!(msg.from, stranger.nick());
+    assert!(matches!(
+        maker.receive(Duration::from_millis(300)).await,
+        Next::Timeout
+    ));
 }

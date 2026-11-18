@@ -12,20 +12,28 @@
 //! request). When a taker has chosen its makers ([`Channel::prepare`]), the channel connects to each one that
 //! serves an onion, on a way out of its own (its own Tor circuit), says its handshake, and from then on sends
 //! that maker's private lines there and reads the maker's answers there; the directory no longer sees them. A
-//! connection that fails or drops leaves the lines to the directories. Nothing is ever accepted inbound.
+//! connection that fails or drops leaves the lines to the directories.
+//!
+//! Serving (a maker's, issue #46, [`Serve`]): the channel listens on `127.0.0.1` and says where in its
+//! handshakes, so directories name it in peer lists and takers can connect to it. On regtest the loopback
+//! address itself is the location (as joinmarket-clientserver's testing mode does); otherwise it is published
+//! as an ephemeral onion through Tor's control port ([`control`]). An inbound peer gets 10 s to say a valid
+//! handshake, then may send private lines in its own nick only, at a bounded rate; at most 32 connections
+//! are open and 16 handshakes pending at once. This is the project's only inbound listener (ADR 0007).
 //!
 //! Each directory has a task that connects (through the nick's own [`NickConnector`], so a Tor daemon gives
 //! this nick circuits of its own), does the handshake (and JoinMarket-NG's nick authentication, JMP-0005,
 //! when the directory's identity is known and it offers it), answers pings, forwards what arrives, and
 //! reconnects with back-off when the connection drops. A line delivered by several directories is seen once.
 
+pub mod control;
 pub mod wire;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +41,7 @@ use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use vortex_ng_channel::socks::{BoxedStream, NickConnector, Outbound};
@@ -49,7 +58,7 @@ use vortex_ng_core::sigmsg;
 
 use crate::wire::{
     DN_HANDSHAKE, GETPEERLIST, HANDSHAKE, NICK_AUTH_CHALLENGE, NICK_AUTH_PROOF, NICK_AUTH_RESULT,
-    PEERLIST, PING, PONG, PRIVMSG, PUBMSG, encode, parse_peerlist, public_line,
+    PEERLIST, PING, PONG, PRIVMSG, PUBMSG, encode, parse_peerlist, public_line, read_client_hello,
     read_directory_hello, read_peer_hello, read_public_line,
 };
 
@@ -81,6 +90,12 @@ const PEER_HELLO_WAIT: Duration = Duration::from_secs(2);
 const LOCATION_WAIT: Duration = Duration::from_secs(3);
 /// The longest `prepare` takes, at most `config.timeout`.
 const PREPARE_LIMIT: Duration = Duration::from_secs(30);
+/// How long an inbound peer has to say its handshake.
+const INBOUND_HELLO: Duration = Duration::from_secs(10);
+/// Most inbound connections still in their handshake.
+const MAX_PENDING_INBOUND: usize = 16;
+/// Most lines a direct connection may carry per minute before it is closed.
+const MAX_LINK_LINES_PER_MINUTE: u32 = 600;
 
 fn transport(e: impl std::fmt::Display) -> ChannelError {
     ChannelError::Transport(format!("onion directory: {e}"))
@@ -143,6 +158,19 @@ pub struct OnionConfig {
     pub timeout: Duration,
     /// Direct connections to makers.
     pub peers: PeerPolicy,
+    /// Whether to serve, so that takers can connect directly.
+    pub serve: Serve,
+}
+
+/// Whether, and how, a maker serves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Serve {
+    /// Not at all: `NOT-SERVING-ONION`.
+    None,
+    /// On a loopback port that is itself the location: regtest setups without Tor only.
+    Loopback,
+    /// On a loopback port published as an ephemeral onion through Tor's control port.
+    Tor(control::TorControl),
 }
 
 /// Where a line came from.
@@ -200,6 +228,10 @@ struct Shared {
     locations: Mutex<HashMap<String, (String, u16, Instant)>>,
     /// Open direct connections: nick -> writer.
     links: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    /// The tasks of the direct connections.
+    link_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Where we serve, if we do.
+    location: Option<String>,
 }
 
 impl Shared {
@@ -240,6 +272,23 @@ impl Shared {
         let links = self.links.lock().ok()?;
         links.get(nick).filter(|w| !w.is_closed()).cloned()
     }
+
+    /// How many direct connections are open.
+    fn link_count(&self) -> usize {
+        self.links.lock().map(|l| l.len()).unwrap_or(MAX_LINKS)
+    }
+
+    /// Close every direct connection.
+    fn close_links(&self) {
+        if let Ok(mut links) = self.links.lock() {
+            links.clear();
+        }
+        if let Ok(mut tasks) = self.link_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
 }
 
 /// One nick on JoinMarket's onion directories. See the crate documentation.
@@ -252,6 +301,8 @@ pub struct OnionChannel {
     wants: AtomicU8,
     announced: Mutex<HashMap<Pit, Vec<u64>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The onion service, while we serve through Tor.
+    _service: Option<control::OnionService>,
 }
 
 impl std::fmt::Debug for OnionChannel {
@@ -271,6 +322,7 @@ impl Drop for OnionChannel {
                 task.abort();
             }
         }
+        self.shared.close_links();
     }
 }
 
@@ -369,6 +421,7 @@ async fn open(
     directory: &Directory,
     identity: &NickIdentity,
     network: &str,
+    location: Option<&str>,
 ) -> Result<(Reader, Writer), String> {
     let stream = connector
         .connect(&directory.host, directory.port)
@@ -380,7 +433,7 @@ async fn open(
     if directory.id.is_some() {
         features.push("nick_auth");
     }
-    let handshake = wire::client_handshake(identity.nick(), network, &features);
+    let handshake = wire::client_handshake(identity.nick(), network, &features, location);
     write_line(&mut write, HANDSHAKE, &handshake).await?;
     let (kind, line) = read_line(&mut reader).await?;
     if kind != DN_HANDSHAKE && kind != HANDSHAKE {
@@ -410,6 +463,7 @@ async fn session(
             directory,
             &shared.identity,
             &shared.config.network,
+            shared.location.as_deref(),
         ),
     )
     .await
@@ -501,6 +555,24 @@ impl OnionChannel {
         }
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX);
         let timeout = config.timeout;
+        // Serving: a loopback listener, and where takers find it.
+        let (listener, location, service) = match &config.serve {
+            Serve::None => (None, None, None),
+            serve => {
+                let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .map_err(transport)?;
+                let port = listener.local_addr().map_err(transport)?.port();
+                match serve {
+                    Serve::Tor(control) => {
+                        let service = control::publish(control, port).await.map_err(transport)?;
+                        let location = format!("{}:{}", service.host, control::ONION_PORT);
+                        (Some(listener), Some(location), Some(service))
+                    }
+                    _ => (Some(listener), Some(format!("127.0.0.1:{port}")), None),
+                }
+            }
+        };
         let shared = Arc::new(Shared {
             identity,
             writers: (0..count).map(|_| Mutex::new(None)).collect(),
@@ -510,11 +582,16 @@ impl OnionChannel {
             stop: AtomicBool::new(false),
             locations: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
+            link_tasks: Mutex::new(Vec::new()),
+            location,
         });
         let (ready_tx, mut ready_rx) = mpsc::channel(count);
-        let tasks = (0..count)
+        let mut tasks: Vec<JoinHandle<()>> = (0..count)
             .map(|i| tokio::spawn(supervise(Arc::clone(&shared), i, ready_tx.clone())))
             .collect();
+        if let Some(listener) = listener {
+            tasks.push(tokio::spawn(accept_peers(Arc::clone(&shared), listener)));
+        }
         let channel = OnionChannel {
             shared,
             outbound: outbound.clone(),
@@ -523,6 +600,7 @@ impl OnionChannel {
             wants: AtomicU8::new(0),
             announced: Mutex::new(HashMap::new()),
             tasks: Mutex::new(tasks),
+            _service: service,
         };
         let deadline = tokio::time::Instant::now() + timeout + Duration::from_secs(1);
         let mut failures = Vec::new();
@@ -568,6 +646,16 @@ impl OnionChannel {
             }
         }
         result
+    }
+
+    /// Where this nick serves, if it does (`host:port`).
+    pub fn location(&self) -> Option<&str> {
+        self.shared.location.as_deref()
+    }
+
+    /// How many direct connections are open now.
+    pub fn direct(&self) -> usize {
+        self.shared.link_count()
     }
 
     /// How many directories are connected now.
@@ -720,13 +808,7 @@ impl Channel for OnionChannel {
             let Some((host, port)) = self.shared.location(nick) else {
                 continue;
             };
-            let open_links = self
-                .shared
-                .links
-                .lock()
-                .map(|l| l.len())
-                .unwrap_or(MAX_LINKS);
-            if open_links + attempts.len() >= MAX_LINKS {
+            if self.shared.link_count() + attempts.len() >= MAX_LINKS {
                 break;
             }
             let shared = Arc::clone(&self.shared);
@@ -754,10 +836,7 @@ impl Channel for OnionChannel {
             let Ok(Some((nick, reader, writer, first))) = attempt.await else {
                 continue;
             };
-            let task = start_link(Arc::clone(&self.shared), nick, reader, writer, first);
-            if let Ok(mut tasks) = self.tasks.lock() {
-                tasks.extend(task);
-            }
+            start_link(Arc::clone(&self.shared), nick, reader, writer, first);
         }
     }
 
@@ -804,7 +883,7 @@ impl Channel for OnionChannel {
             tasks.push(tokio::spawn(async move {
                 let sent = async {
                     let (_reader, mut writer) =
-                        open(&connector, &directory, &throwaway, &network).await?;
+                        open(&connector, &directory, &throwaway, &network, None).await?;
                     write_line(&mut writer, PUBMSG, &public).await?;
                     let _ = writer.shutdown().await;
                     Ok::<(), String>(())
@@ -860,8 +939,47 @@ impl Channel for OnionChannel {
                 *writer = None;
             }
         }
-        if let Ok(mut links) = self.shared.links.lock() {
-            links.clear();
+        self.shared.close_links();
+    }
+}
+
+/// Take inbound direct connections until the channel stops.
+async fn accept_peers(shared: Arc<Shared>, listener: TcpListener) {
+    let pending = Arc::new(AtomicUsize::new(0));
+    while let Ok((conn, _)) = listener.accept().await {
+        if shared.stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if shared.link_count() >= MAX_LINKS || pending.load(Ordering::SeqCst) >= MAX_PENDING_INBOUND
+        {
+            drop(conn);
+            continue;
+        }
+        pending.fetch_add(1, Ordering::SeqCst);
+        let (shared, pending) = (Arc::clone(&shared), Arc::clone(&pending));
+        let task_shared = Arc::clone(&shared);
+        let task = tokio::spawn(async move {
+            let shared = task_shared;
+            let stream: BoxedStream = Box::new(conn);
+            let (read, writer) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read);
+            let hello = tokio::time::timeout(INBOUND_HELLO, read_line(&mut reader)).await;
+            pending.fetch_sub(1, Ordering::SeqCst);
+            let Ok(Ok((HANDSHAKE, line))) = hello else {
+                return;
+            };
+            let Ok(nick) = read_client_hello(&line, &shared.config.network) else {
+                return;
+            };
+            // Our own nick, or a peer already connected: the first connection stays.
+            if nick == shared.identity.nick() || shared.link(&nick).is_some() {
+                return;
+            }
+            start_link(Arc::clone(&shared), nick, reader, writer, None);
+        });
+        if let Ok(mut tasks) = shared.link_tasks.lock() {
+            tasks.retain(|t| !t.is_finished());
+            tasks.push(task);
         }
     }
 }
@@ -881,7 +999,7 @@ async fn open_peer(
         .map_err(|e| e.to_string())?;
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
-    let handshake = wire::client_handshake(identity.nick(), network, &[]);
+    let handshake = wire::client_handshake(identity.nick(), network, &[], None);
     write_line(&mut write, HANDSHAKE, &handshake).await?;
     // JoinMarket-NG answers with a handshake of its own; joinmarket-clientserver accepts silently.
     let first = match tokio::time::timeout(PEER_HELLO_WAIT, read_line(&mut reader)).await {
@@ -897,14 +1015,14 @@ async fn open_peer(
 }
 
 /// Keep a direct connection to `nick`: its writer goes into the shared links, its reader hands that peer's
-/// private lines on. The connection is forgotten when it drops.
+/// private lines on, at most [`MAX_LINK_LINES_PER_MINUTE`]. The connection is forgotten when it drops.
 fn start_link(
     shared: Arc<Shared>,
     nick: String,
     mut reader: Reader,
     mut writer: Writer,
     first: Option<(u64, String)>,
-) -> Vec<JoinHandle<()>> {
+) {
     let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOX);
     if let Ok(mut links) = shared.links.lock() {
         links.insert(nick.clone(), out_tx.clone());
@@ -917,8 +1035,11 @@ fn start_link(
         }
         let _ = writer.shutdown().await;
     });
+    let task_shared = Arc::clone(&shared);
     let read_task = tokio::spawn(async move {
+        let shared = task_shared;
         let mut next = first;
+        let (mut window, mut lines) = (Instant::now(), 0u32);
         loop {
             let (kind, line) = match next.take() {
                 Some(item) => item,
@@ -927,6 +1048,13 @@ fn start_link(
                     Err(_) => break,
                 },
             };
+            if window.elapsed() >= Duration::from_secs(60) {
+                (window, lines) = (Instant::now(), 0);
+            }
+            lines += 1;
+            if lines > MAX_LINK_LINES_PER_MINUTE {
+                break;
+            }
             match kind {
                 PRIVMSG => {
                     if shared
@@ -953,7 +1081,11 @@ fn start_link(
             links.remove(&nick);
         }
     });
-    vec![write_task, read_task]
+    if let Ok(mut tasks) = shared.link_tasks.lock() {
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(write_task);
+        tasks.push(read_task);
+    }
 }
 
 #[cfg(test)]

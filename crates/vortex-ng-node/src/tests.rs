@@ -505,6 +505,7 @@ async fn a_whole_coinjoin_through_an_onion_directory() {
         network: "regtest".into(),
         timeout: Duration::from_secs(5),
         peers: vortex_ng_onion::PeerPolicy::Relay,
+        serve: vortex_ng_onion::Serve::None,
     };
     let pit = Pit::Sw0;
     let mut utxos = HashMap::new();
@@ -784,6 +785,7 @@ async fn one_maker_on_three_channels_serves_a_taker_on_each() {
         network: "regtest".into(),
         timeout: Duration::from_secs(5),
         peers: vortex_ng_onion::PeerPolicy::Relay,
+        serve: vortex_ng_onion::Serve::None,
     };
     let irc_config = IrcConfig {
         server: irc.server(),
@@ -958,4 +960,143 @@ async fn one_maker_on_three_channels_serves_a_taker_on_each() {
     }
     assert!(!maker.is_finished(), "the maker kept serving");
     maker.abort();
+}
+
+/// A whole round where the directory only introduces: two makers serve (on loopback, as on regtest), the
+/// directory's peer list says where, and the taker talks to each over a direct connection (#45, #46). None of
+/// the taker's private lines goes through the directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_coinjoin_over_direct_connections() {
+    use vortex_ng_channel::set::{ChannelSet, DynChannel};
+    use vortex_ng_channel::socks::Outbound;
+    use vortex_ng_core::nick::NickIdentity;
+    use vortex_ng_onion::testing::TestDirectory;
+    use vortex_ng_onion::{OnionChannel, OnionConfig, PeerPolicy, Serve};
+
+    let directory = TestDirectory::start("regtest", None).await;
+    let config = |peers, serve| OnionConfig {
+        directories: vec![directory.directory()],
+        network: "regtest".into(),
+        timeout: Duration::from_secs(5),
+        peers,
+        serve,
+    };
+    let pit = Pit::Sw0;
+    let mut utxos = HashMap::new();
+    let maker_wallets: Vec<PitWallet> = (0..2u8)
+        .map(|i| {
+            let bond = Some(1_000_000 + u64::from(i));
+            funded(
+                pit,
+                &format!("direct-maker{i}"),
+                500_000,
+                bond,
+                80 + i,
+                &mut utxos,
+            )
+        })
+        .collect();
+    let mut taker_wallet = funded(pit, "direct-taker", 600_000, None, 90, &mut utxos);
+    let chain = SharedChain(Arc::new(utxos));
+    let until = Instant::now() + Duration::from_secs(90);
+
+    let mut handles = Vec::new();
+    let mut entries = Vec::new();
+    for (i, wallet) in maker_wallets.into_iter().enumerate() {
+        let mut channel = OnionChannel::connect(
+            NickIdentity::generate(),
+            config(PeerPolicy::Relay, Serve::Loopback),
+            &Outbound::Direct,
+        )
+        .await
+        .unwrap();
+        entries.push(format!(
+            "{};{}",
+            channel.nick(),
+            channel.location().unwrap()
+        ));
+        let chain = chain.clone();
+        handles.push(tokio::spawn(async move {
+            let offer =
+                Offer::parse("sw0absoffer", &format!("{i} 10000 10000000 100 500")).unwrap();
+            let mut maker = Maker::new(MakerConfig::new(vec![offer]), wallet).unwrap();
+            run_maker(&mut maker, &mut channel, &chain, "regtest", until).await
+        }));
+    }
+    // The directory names the makers when asked (JoinMarket-NG's way).
+    directory.set_peerlist(&entries);
+    for _ in 0..100 {
+        if directory.nicks().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let utxo = taker_wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+    let cfg = TakerConfig {
+        pit,
+        network: Network::Regtest,
+        amount: AMOUNT,
+        makers: 2,
+        max_cjfee: 1_000,
+        fee_rate_sat_per_kwu: 2_500,
+        max_maker_utxos: 20,
+        bondless_makers_allowance: vortex_ng_taker::DEFAULT_BONDLESS_ALLOWANCE,
+        bondless_require_zero_fee: true,
+        bond_params: Default::default(),
+    };
+    let cj = taker_wallet
+        .next_receive_address(1)
+        .unwrap()
+        .script_pubkey();
+    let change = taker_wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(
+        cfg.clone(),
+        0,
+        vec![(utxo.outpoint, utxo.txout.clone())],
+        podle,
+        cj,
+        change,
+    )
+    .unwrap();
+    let onion = OnionChannel::connect(
+        NickIdentity::generate(),
+        config(PeerPolicy::Local, Serve::None),
+        &Outbound::Direct,
+    )
+    .await
+    .unwrap();
+    let taker_nick = onion.nick().to_string();
+    let channels: Vec<Box<dyn DynChannel>> = vec![Box::new(onion)];
+    let mut client = ChannelSet::new(channels).unwrap();
+    let tx = run_taker(
+        &mut taker,
+        &taker_wallet,
+        &mut client,
+        &chain,
+        &cfg,
+        Duration::from_secs(3),
+        until,
+    )
+    .await
+    .unwrap();
+    assert_eq!(tx.input.len(), 3);
+    assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+    // The directory carried the taker's `!orderbook` and nothing private from it.
+    let from_taker: Vec<u64> = directory
+        .received()
+        .iter()
+        .filter(|(from, _, _)| *from == taker_nick)
+        .map(|(_, kind, _)| *kind)
+        .collect();
+    assert!(from_taker.contains(&vortex_ng_onion::wire::PUBMSG));
+    assert!(
+        !from_taker.contains(&vortex_ng_onion::wire::PRIVMSG),
+        "{from_taker:?}"
+    );
+    for handle in handles {
+        handle.abort();
+    }
 }

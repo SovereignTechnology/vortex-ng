@@ -42,7 +42,7 @@ use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{CONNECT_TIMEOUT, run_maker, run_taker};
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
-use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy};
+use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy, Serve};
 use vortex_ng_taker::{DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, podle_for};
 use vortex_ng_wallet::{MIXDEPTHS, PitWallet, Seed};
 
@@ -147,7 +147,8 @@ fn sink() -> vortex_ng_core::bitcoin::Address {
 }
 
 /// A channel for a new nick: on the IRC server or the directory when one is given, else on the relay at `url`.
-async fn meet(harness: &Harness, url: &str) -> ChannelSet {
+/// A maker (`serve`) on the directory serves on loopback, so the other side's taker can connect to it.
+async fn meet(harness: &Harness, url: &str, serve: bool) -> ChannelSet {
     let channel: Box<dyn vortex_ng_channel::set::DynChannel> =
         match (&harness.irc, &harness.directory) {
             (Some(server), _) => {
@@ -175,6 +176,7 @@ async fn meet(harness: &Harness, url: &str) -> ChannelSet {
                         // The reference's makers serve on loopback in its testing mode: a taker reaches
                         // them directly once the directory names them.
                         peers: PeerPolicy::Local,
+                        serve: if serve { Serve::Loopback } else { Serve::None },
                     },
                     &Outbound::Direct,
                 )
@@ -199,7 +201,7 @@ async fn meet(harness: &Harness, url: &str) -> ChannelSet {
 /// Wait until `count` different makers answer `!orderbook` on the directory or IRC server (asked every five
 /// seconds).
 async fn wait_for_answering_makers(harness: &Harness, count: usize, limit: Duration) {
-    let mut observer = meet(harness, "").await;
+    let mut observer = meet(harness, "", false).await;
     observer.listen(true, false).await.unwrap();
     let until = Instant::now() + limit;
     let mut seen = HashSet::new();
@@ -329,7 +331,7 @@ async fn taker_with_joinmarket_ng_makers() {
         change,
     )
     .unwrap();
-    let mut client = meet(&harness, &url).await;
+    let mut client = meet(&harness, &url, false).await;
     println!("taker nick {}", client.nick());
     let tx = run_taker(
         &mut taker,
@@ -444,7 +446,7 @@ async fn makers_with_joinmarket_ng_taker() {
     };
     for (i, w) in wallets.into_iter().enumerate() {
         let rpc = harness.rpc();
-        let mut client = meet(&harness, &url).await;
+        let mut client = meet(&harness, &url, true).await;
         handles.push(tokio::spawn(async move {
             let offer =
                 Offer::parse(offer_type, &format!("{i} 10000 100000000 {TXFEE} {CJFEE}")).unwrap();

@@ -74,9 +74,14 @@ pub fn decode(raw: &str) -> Result<(u64, String), WireError> {
     Ok((kind, line.to_string()))
 }
 
-/// The handshake a peer that serves no onion sends to a directory (the inner JSON, as sent: a nick
-/// authentication proof covers these exact bytes).
-pub fn client_handshake(nick: &str, network: &str, features: &[&str]) -> String {
+/// The handshake a peer sends to a directory or to another peer (the inner JSON, as sent: a nick
+/// authentication proof covers these exact bytes), with where it serves, or `NOT-SERVING-ONION`.
+pub fn client_handshake(
+    nick: &str,
+    network: &str,
+    features: &[&str],
+    location: Option<&str>,
+) -> String {
     let features: Map<String, Value> = features
         .iter()
         .map(|f| (f.to_string(), Value::Bool(true)))
@@ -84,7 +89,7 @@ pub fn client_handshake(nick: &str, network: &str, features: &[&str]) -> String 
     json!({
         "app-name": APP_NAME,
         "directory": false,
-        "location-string": NOT_SERVING_ONION,
+        "location-string": location.unwrap_or(NOT_SERVING_ONION),
         "proto-ver": JM_VERSION,
         "features": features,
         "nick": nick,
@@ -250,6 +255,34 @@ pub fn parse_peerlist(line: &str, local: bool) -> Vec<PeerEntry> {
         .collect()
 }
 
+/// Check the handshake a peer opens a direct connection to us with: JoinMarket, not a directory, protocol
+/// version 5, our network, a plain nick. Returns the nick.
+pub fn read_client_hello(line: &str, network: &str) -> Result<String, WireError> {
+    let value: Value =
+        serde_json::from_str(line).map_err(|_| WireError("handshake is not JSON"))?;
+    let object = value
+        .as_object()
+        .ok_or(WireError("handshake is not an object"))?;
+    if object.get("app-name").and_then(Value::as_str) != Some(APP_NAME) {
+        return Err(WireError("not JoinMarket"));
+    }
+    if object.get("directory").and_then(Value::as_bool) != Some(false) {
+        return Err(WireError("not a peer"));
+    }
+    if object.get("network").and_then(Value::as_str) != Some(network) {
+        return Err(WireError("the peer is on another network"));
+    }
+    if object.get("proto-ver").and_then(Value::as_u64) != Some(u64::from(JM_VERSION)) {
+        return Err(WireError("no common protocol version"));
+    }
+    let nick = object
+        .get("nick")
+        .and_then(Value::as_str)
+        .filter(|nick| plain_nick(nick))
+        .ok_or(WireError("not a JoinMarket nick"))?;
+    Ok(nick.to_string())
+}
+
 /// Check a peer's answer to our handshake on a direct connection (JoinMarket-NG sends one; joinmarket-clientserver
 /// accepts silently): JoinMarket, not a directory, protocol version 5, the same network.
 pub fn read_peer_hello(line: &str, network: &str) -> Result<(), WireError> {
@@ -322,7 +355,7 @@ mod tests {
 
     #[test]
     fn handshakes() {
-        let ours = client_handshake("J5abcdefghijklmn", "regtest", &["ping"]);
+        let ours = client_handshake("J5abcdefghijklmn", "regtest", &["ping"], None);
         let value: Value = serde_json::from_str(&ours).unwrap();
         assert_eq!(value["location-string"], NOT_SERVING_ONION);
         assert_eq!(value["proto-ver"], 5);
@@ -425,5 +458,30 @@ mod tests {
             .is_err()
         );
         assert!(read_peer_hello("[]", "regtest").is_err());
+    }
+
+    #[test]
+    fn an_inbound_handshake_is_checked() {
+        let served = client_handshake("J5abcdefghijklmn", "regtest", &[], Some("127.0.0.1:18082"));
+        assert!(served.contains("127.0.0.1:18082"));
+        assert_eq!(
+            read_client_hello(&served, "regtest").unwrap(),
+            "J5abcdefghijklmn"
+        );
+        let theirs = client_handshake("J5abcdefghijklmn", "regtest", &[], None);
+        assert_eq!(
+            read_client_hello(&theirs, "regtest").unwrap(),
+            "J5abcdefghijklmn"
+        );
+        assert!(read_client_hello(&theirs, "signet").is_err());
+        for bad in [
+            theirs.replace(r#""directory":false"#, r#""directory":true"#),
+            theirs.replace(r#""proto-ver":5"#, r#""proto-ver":4"#),
+            theirs.replace("J5abcdefghijklmn", "J5 spaced nick"),
+            theirs.replace(r#""app-name":"joinmarket""#, r#""app-name":"other""#),
+            "{}".to_string(),
+        ] {
+            assert!(read_client_hello(&bad, "regtest").is_err(), "{bad}");
+        }
     }
 }
