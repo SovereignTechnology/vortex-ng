@@ -491,6 +491,14 @@ async fn inbound_peers_are_held_to_their_handshake() {
     )
     .await;
     assert!(eventually(|| maker.direct() == 1).await);
+    // The peer gets our handshake back, with where we serve.
+    let mut reader = BufReader::new(&mut conn);
+    let (kind, hello) = tokio::time::timeout(WAIT, read_line(&mut reader))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kind, HANDSHAKE);
+    assert!(hello.contains(identity.nick()) && hello.contains(&location));
     let secp = Secp256k1::signing_only();
     let other = NickIdentity::generate();
     let foreign = sign_line(

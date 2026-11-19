@@ -18,8 +18,10 @@
 //! handshakes, so directories name it in peer lists and takers can connect to it. On regtest the loopback
 //! address itself is the location (as joinmarket-clientserver's testing mode does); otherwise it is published
 //! as an ephemeral onion through Tor's control port ([`control`]). An inbound peer gets 10 s to say a valid
-//! handshake, then may send private lines in its own nick only, at a bounded rate; at most 32 connections
-//! are open and 16 handshakes pending at once. This is the project's only inbound listener (ADR 0007).
+//! handshake and gets ours back (joinmarket-clientserver counts a peer as handshaked only once it has had
+//! the peer's handshake, whichever side connected), then may send private lines in its own nick only, at a
+//! bounded rate; at most 32 connections are open and 16 handshakes pending at once. This is the project's
+//! only inbound listener (ADR 0007).
 //!
 //! Each directory has a task that connects (through the nick's own [`NickConnector`], so a Tor daemon gives
 //! this nick circuits of its own), does the handshake (and JoinMarket-NG's nick authentication, JMP-0005,
@@ -961,7 +963,7 @@ async fn accept_peers(shared: Arc<Shared>, listener: TcpListener) {
         let task = tokio::spawn(async move {
             let shared = task_shared;
             let stream: BoxedStream = Box::new(conn);
-            let (read, writer) = tokio::io::split(stream);
+            let (read, mut writer) = tokio::io::split(stream);
             let mut reader = BufReader::new(read);
             let hello = tokio::time::timeout(INBOUND_HELLO, read_line(&mut reader)).await;
             pending.fetch_sub(1, Ordering::SeqCst);
@@ -973,6 +975,15 @@ async fn accept_peers(shared: Arc<Shared>, listener: TcpListener) {
             };
             // Our own nick, or a peer already connected: the first connection stays.
             if nick == shared.identity.nick() || shared.link(&nick).is_some() {
+                return;
+            }
+            let ours = wire::client_handshake(
+                shared.identity.nick(),
+                &shared.config.network,
+                &[],
+                shared.location.as_deref(),
+            );
+            if write_line(&mut writer, HANDSHAKE, &ours).await.is_err() {
                 return;
             }
             start_link(Arc::clone(&shared), nick, reader, writer, None);

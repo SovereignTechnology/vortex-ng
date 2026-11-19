@@ -127,14 +127,15 @@ start_bot() {
   bot_pid=$!
   pids+=("$bot_pid")
 }
-# Fund a bot once it has named its address: one coin of 1 BTC, two confirmations.
+# Fund a bot once it has named its address: one coin of 1 BTC, six confirmations (a maker wants five on a
+# taker's commitment coin: JoinMarket's taker_utxo_age).
 fund_bot() {
   local name=$1 address
   for _ in $(seq 1 180); do [ -s "$work/bots/$name.address" ] && break; sleep 1; done
   address=$(head -1 "$work/bots/$name.address" 2>/dev/null || true)
   case "$address" in bcrt1*) ;; *) echo "$name named no regtest address"; show "$logs/$name.log" 40; return 1 ;; esac
   cli -rpcwallet=funder sendtoaddress "$address" 1.0 >/dev/null
-  cli generatetoaddress 2 "$funder" >/dev/null
+  cli generatetoaddress 6 "$funder" >/dev/null
   touch "$work/bots/$name.funded"
 }
 
