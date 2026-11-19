@@ -258,12 +258,10 @@ async fn channels(
             } else {
                 PeerPolicy::Onion
             },
-            // A maker serves on regtest (loopback, as test setups without Tor do), so that takers can talk
-            // to it directly; outside regtest it will publish an onion through Tor's control port.
-            serve: match role {
-                Role::Maker if network == "regtest" => Serve::Loopback,
-                _ => Serve::None,
-            },
+            // Not yet: serving needs an onion published through Tor's control port, which the commands do not
+            // take yet. A loopback location is only for joinmarket-clientserver's regtest testing mode:
+            // JoinMarket-NG's directories refuse a location that is not a v3 onion.
+            serve: Serve::None,
         };
         let onion = OnionChannel::connect(identity(), config, outbound)
             .await

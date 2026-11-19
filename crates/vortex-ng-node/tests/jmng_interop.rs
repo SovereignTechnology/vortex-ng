@@ -74,6 +74,8 @@ struct Harness {
     onion_network: String,
     /// `VORTEX_NG_INTEROP_IRC`: meet on this IRC server instead.
     irc: Option<IrcServer>,
+    /// `VORTEX_NG_INTEROP_SERVE=loopback`: makers on the directory serve on loopback.
+    serve_loopback: bool,
 }
 
 impl Harness {
@@ -105,6 +107,7 @@ impl Harness {
                 }),
             onion_network: std::env::var("VORTEX_NG_INTEROP_ONION_NETWORK")
                 .unwrap_or_else(|_| "regtest".into()),
+            serve_loopback: std::env::var("VORTEX_NG_INTEROP_SERVE").is_ok_and(|v| v == "loopback"),
             irc: std::env::var("VORTEX_NG_INTEROP_IRC").ok().map(|text| {
                 let mut server = IrcServer::parse(&text).expect("an IRC server host:port");
                 server.expected_network = std::env::var("VORTEX_NG_INTEROP_IRC_NETWORK").ok();
@@ -147,7 +150,9 @@ fn sink() -> vortex_ng_core::bitcoin::Address {
 }
 
 /// A channel for a new nick: on the IRC server or the directory when one is given, else on the relay at `url`.
-/// A maker (`serve`) on the directory serves on loopback, so the other side's taker can connect to it.
+/// A maker (`serve`) on the directory serves on loopback when `VORTEX_NG_INTEROP_SERVE=loopback`, so the
+/// other side's taker can connect to it: joinmarket-clientserver's regtest testing mode only, since
+/// JoinMarket-NG's directories refuse a location that is not a v3 onion.
 async fn meet(harness: &Harness, url: &str, serve: bool) -> ChannelSet {
     let channel: Box<dyn vortex_ng_channel::set::DynChannel> =
         match (&harness.irc, &harness.directory) {
@@ -176,7 +181,11 @@ async fn meet(harness: &Harness, url: &str, serve: bool) -> ChannelSet {
                         // The reference's makers serve on loopback in its testing mode: a taker reaches
                         // them directly once the directory names them.
                         peers: PeerPolicy::Local,
-                        serve: if serve { Serve::Loopback } else { Serve::None },
+                        serve: if serve && harness.serve_loopback {
+                            Serve::Loopback
+                        } else {
+                            Serve::None
+                        },
                     },
                     &Outbound::Direct,
                 )

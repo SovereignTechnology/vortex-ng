@@ -146,7 +146,9 @@ if [ "$CHANNEL" = onion ]; then
   for _ in $(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null && break; sleep 1; done
   (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null || { show "$logs/directory.log" 40; exit 26; }
   echo "the reference's directory node on 127.0.0.1:$DIRECTORY_PORT"
-  meet_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" VORTEX_NG_INTEROP_ONION_NETWORK=testnet)
+  # Our makers serve on loopback, as the reference's do in its testing mode, so its taker connects directly.
+  meet_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" VORTEX_NG_INTEROP_ONION_NETWORK=testnet
+    VORTEX_NG_INTEROP_SERVE=loopback)
 else
   if [ "$IRCD" = ngircd ]; then
     cat >"$work/ngircd.conf" <<EOF
