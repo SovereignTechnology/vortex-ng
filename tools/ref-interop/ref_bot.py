@@ -6,6 +6,7 @@ Everything else comes from the environment run.sh sets:
 
     REF_RPC_PORT, REF_COOKIE    Bitcoin Core's RPC port and cookie file
     REF_WALLET                  the Core watch-only wallet this bot imports its addresses into (created by run.sh)
+    REF_MINE_TO                 where the reference's regtest interface would mine to (see the shim below)
     REF_SEED                    the bot's wallet entropy (32 hex characters); not used by the directory
     REF_CHANNEL                 onion or irc
     REF_DIRECTORY               onion: the directory node, 127.0.0.1:<port>
@@ -107,6 +108,27 @@ def config_text() -> str:
     return "\n".join(lines) + "\n"
 
 
+def regtest_without_mining_wallet() -> None:
+    """A harness shim. The reference's regtest interface asks its Core wallet for a new address when it starts,
+    to mine to when it ticks the chain forward itself (`tick_forward_chain`). Its own tests run it with a legacy
+    Core wallet; Core 32 has none, and a watch-only descriptor wallet (which its address imports need) has no keys
+    to give an address from. This bot never ticks the chain (`tick_forward_chain_interval` stays -1), so the
+    constructor is the reference's own minus that call, with the address the harness mines to instead.
+    """
+    import jmclient.blockchaininterface as interfaces
+
+    def init(self, jsonRpc, wallet_name):
+        interfaces.BitcoinCoreInterface.__init__(self, jsonRpc, "regtest", wallet_name)
+        self.pushtx_failure_prob = 0
+        self.tick_forward_chain_interval = -1
+        self.absurd_fees = False
+        self.simulating = False
+        self.shutdown_signal = False
+        self.destn_addr = os.environ["REF_MINE_TO"]
+
+    interfaces.RegtestBitcoinCoreInterface.__init__ = init
+
+
 def wait_for(path: Path, seconds: int) -> None:
     for _ in range(seconds):
         if path.exists():
@@ -137,6 +159,7 @@ def main() -> int:
     from jmclient.support import random_under_max_order_choose
 
     log = get_log()
+    regtest_without_mining_wallet()
     load_program_config(config_path=str(data), bs="regtest")
     host = jm_single().config.get("DAEMON", "daemon_host")
     port = jm_single().config.getint("DAEMON", "daemon_port")

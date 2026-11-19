@@ -120,7 +120,7 @@ start_bot() {
   local role=$1 name=$2 index=$3; shift 3
   local seed
   seed=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  env "$@" REF_RPC_PORT="$PORT" REF_COOKIE="$cookie" REF_WALLET="jm-$name" REF_SEED="$seed" REF_CHANNEL="$CHANNEL" \
+  env "$@" REF_RPC_PORT="$PORT" REF_COOKIE="$cookie" REF_WALLET="jm-$name" REF_MINE_TO="$funder" REF_SEED="$seed" REF_CHANNEL="$CHANNEL" \
     REF_DIRECTORY="127.0.0.1:$DIRECTORY_PORT" REF_SERVE_PORT=$((DIRECTORY_PORT + index)) REF_INDEX="$index" \
     REF_IRC="127.0.0.1:$IRC_PORT" \
     python3 "$here/ref_bot.py" "$role" "$name" "$work/bots/$name" "$work/bots" >"$logs/$name.log" 2>&1 &
@@ -170,7 +170,8 @@ EOF
     fetch https://github.com/JoinMarket-Org/miniircd/archive/master.tar.gz "$MINIIRCD_SHA256" "$work/miniircd.tar.gz"
     mkdir -p "$work/miniircd"
     tar -xzf "$work/miniircd.tar.gz" -C "$work/miniircd" --strip-components=1
-    python3 "$work/miniircd/miniircd" --listen=127.0.0.1 --ports="$IRC_PORT" >"$logs/ircd.log" 2>&1 &
+    # It refuses to run as root without dropping to another account after binding.
+    python3 "$work/miniircd/miniircd" --listen=127.0.0.1 --ports="$IRC_PORT" --setuid=nobody >"$logs/ircd.log" 2>&1 &
     meet_env=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT")
   fi
   pids+=($!)
