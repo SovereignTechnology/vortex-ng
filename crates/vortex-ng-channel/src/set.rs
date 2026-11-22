@@ -3,10 +3,11 @@
 //! The rules (ADR 0007) are this project's, not a copy of joinmarket-clientserver's message channel
 //! collection:
 //!
-//! - A peer nick is tied to the channel its first private line arrived on. Its private lines on any other
-//!   channel are dropped while the tie lasts ([`PIN_TTL`] since its last private line), so a session never
-//!   crosses channels and a line copied onto another channel is never seen. Public lines pass from every
-//!   channel.
+//! - A peer nick is tied to the channel a round with it runs on: where its `!fill` arrived (a maker) or where
+//!   we sent it ours (a taker). Only a `!fill` ties, because any other signed line can be delivered onto a
+//!   channel by someone who saw it, and a tie made that way would steer the peer's round there. While the tie
+//!   lasts ([`PIN_TTL`] since its last private line) the nick's private lines on any other channel are
+//!   dropped, so a session never crosses channels. Public lines pass from every channel.
 //! - Each channel signs and verifies with its own `hostid`; the set never moves a line between channels.
 //! - A maker gives every channel the same nick; a taker gives each channel a nick of its own
 //!   ([`Channel::nick_on`] tells which one a peer knows).
@@ -17,7 +18,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -211,7 +212,7 @@ pub struct ChannelSet {
     channels: Vec<Box<dyn DynChannel>>,
     closed: Vec<bool>,
     /// Peer nick -> (channel, last private line).
-    pins: HashMap<String, (usize, Instant)>,
+    pins: Mutex<HashMap<String, (usize, Instant)>>,
     pin_ttl: Duration,
 }
 
@@ -219,7 +220,7 @@ impl std::fmt::Debug for ChannelSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelSet")
             .field("channels", &self.channels.len())
-            .field("pins", &self.pins.len())
+            .field("pins", &self.pins.lock().map_or(0, |pins| pins.len()))
             .finish()
     }
 }
@@ -233,7 +234,7 @@ impl ChannelSet {
         Ok(ChannelSet {
             closed: vec![false; channels.len()],
             channels,
-            pins: HashMap::new(),
+            pins: Mutex::new(HashMap::new()),
             pin_ttl: PIN_TTL,
         })
     }
@@ -254,25 +255,44 @@ impl ChannelSet {
         self.channels.is_empty()
     }
 
-    /// Whether a private line from `nick` on `channel` belongs there: it does unless the nick is tied to
-    /// another channel. It ties the nick to `channel` when it is free.
-    fn admit(&mut self, nick: &str, channel: usize) -> bool {
+    /// Whether a private line with `command` from `nick` on `channel` belongs there: it does unless the nick
+    /// is tied to another channel. A line on the nick's channel keeps the tie fresh; a `!fill` makes one.
+    fn admit(&self, nick: &str, channel: usize, command: &str) -> bool {
         let now = Instant::now();
-        if let Some((pinned, at)) = self.pins.get(nick)
-            && *pinned != channel
+        let Ok(mut pins) = self.pins.lock() else {
+            return true;
+        };
+        if let Some((pinned, at)) = pins.get_mut(nick)
             && now.duration_since(*at) < self.pin_ttl
         {
-            return false;
+            if *pinned != channel {
+                return false;
+            }
+            *at = now;
+            return true;
         }
-        if self.pins.len() >= MAX_PINS && !self.pins.contains_key(nick) {
+        if command == "fill" {
+            self.tie(&mut pins, nick, channel, now);
+        }
+        true
+    }
+
+    /// Tie `nick` to `channel`. When the table is full of live ties, the nick goes untied.
+    fn tie(
+        &self,
+        pins: &mut HashMap<String, (usize, Instant)>,
+        nick: &str,
+        channel: usize,
+        now: Instant,
+    ) {
+        if pins.len() >= MAX_PINS && !pins.contains_key(nick) {
             let ttl = self.pin_ttl;
-            self.pins.retain(|_, (_, at)| now.duration_since(*at) < ttl);
-            if self.pins.len() >= MAX_PINS {
-                return true;
+            pins.retain(|_, (_, at)| now.duration_since(*at) < ttl);
+            if pins.len() >= MAX_PINS {
+                return;
             }
         }
-        self.pins.insert(nick.to_string(), (channel, now));
-        true
+        pins.insert(nick.to_string(), (channel, now));
     }
 
     /// Run `op` on every open channel; `Ok` if one succeeded, else the last error.
@@ -334,6 +354,12 @@ impl Channel for ChannelSet {
             .channels
             .get(route.channel)
             .ok_or(ChannelError::Invalid("no such channel"))?;
+        // Our `!fill` starts a round with this peer on this channel.
+        if command == "fill"
+            && let Ok(mut pins) = self.pins.lock()
+        {
+            self.tie(&mut pins, to, route.channel, Instant::now());
+        }
         channel
             .erased_send_private(&route.route, to, command, body)
             .await
@@ -406,7 +432,7 @@ impl Channel for ChannelSet {
             let set_route = |route: AnyRoute| SetRoute { channel, route };
             let message = match incoming {
                 Incoming::Private { msg, route } => {
-                    if !self.admit(&msg.from, channel) {
+                    if !self.admit(&msg.from, channel, &msg.command) {
                         continue;
                     }
                     Incoming::Private {
@@ -499,6 +525,29 @@ mod tests {
         assert_eq!(private_from(&mut set).await, Some((me.clone(), 0)));
         h1.deliver_private(&taker, "J5maker", "fill", "0 1000 key third", "b");
         assert_eq!(private_from(&mut set).await, None);
+    }
+
+    #[tokio::test]
+    async fn only_a_fill_ties_a_peer_to_a_channel() {
+        let (mut set, [h0, h1]) = two(["J5takerA", "J5takerB"], [false, false]);
+        let maker = NickIdentity::generate();
+        let me = maker.nick().to_string();
+        // A maker's signed answer delivered on one channel does not take it off the other.
+        h0.deliver_private(&maker, "J5takerA", "sw0absoffer", "0 1 2 3 4", "a");
+        assert_eq!(private_from(&mut set).await, Some((me.clone(), 0)));
+        h1.deliver_private(&maker, "J5takerB", "sw0absoffer", "0 1 2 3 4", "b");
+        let Next::Message(Incoming::Private { route, .. }) = set.receive(WAIT).await else {
+            panic!("the answer on the other channel")
+        };
+        assert_eq!(set.channel_of(&route), 1);
+        // Our `!fill` there ties it there.
+        set.send_private(&route, &me, "fill", "0 1 k c")
+            .await
+            .unwrap();
+        h0.deliver_private(&maker, "J5takerA", "pubkey", "aa", "a");
+        assert_eq!(private_from(&mut set).await, None);
+        h1.deliver_private(&maker, "J5takerB", "pubkey", "bb", "b");
+        assert_eq!(private_from(&mut set).await, Some((me, 1)));
     }
 
     #[tokio::test]

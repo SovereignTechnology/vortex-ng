@@ -31,8 +31,11 @@ use vortex_ng_wallet::sync::BlockSource;
 
 /// A maker answers one nick's `!orderbook` at most once per this interval.
 pub const ORDERBOOK_NICK_INTERVAL: Duration = Duration::from_secs(5);
-/// A maker answers at most this many `!orderbook` requests a minute, from all nicks together.
+/// A maker answers at most this many `!orderbook` requests a minute on each channel, from all nicks together.
 pub const ORDERBOOK_ANSWERS_PER_MINUTE: u32 = 120;
+/// Most peers a maker remembers a route for. Past it, those without a session are forgotten: any nick can
+/// write to a maker for free.
+pub const MAX_KNOWN_PEERS: usize = 10_000;
 /// A taker asks again (`!orderbook`) at most this often while it discovers makers that have not answered.
 pub const REASK_INTERVAL: Duration = Duration::from_secs(1);
 /// Most maker nicks a taker hears offers from in one gathering, and most offers it keeps per nick.
@@ -192,10 +195,22 @@ fn remember<R: Clone>(peers: &mut HashMap<String, R>, nick: &str, route: &R, pri
 
 /// The maker's `!orderbook` rate limits (the Nostr draft's SHOULD): each answer costs a proof and a gift
 /// wrap per offer.
+///
+/// `!orderbook` is unsigned and free to send from fresh nicks. Each channel has its own budget, so a flood on
+/// one leaves the others alone. Within a channel, once more was asked in the last minute than the budget
+/// covers, each request is answered with the matching chance, so a flood cannot spend the budget in the
+/// minute's first seconds and leave real takers with nothing.
 struct OrderbookLimiter {
-    last: HashMap<String, Instant>,
+    last: HashMap<(usize, String), Instant>,
     window: Instant,
-    count: u32,
+    channels: HashMap<usize, OrderbookBudget>,
+}
+
+#[derive(Default)]
+struct OrderbookBudget {
+    answered: u32,
+    asked: u32,
+    asked_before: u32,
 }
 
 impl OrderbookLimiter {
@@ -203,27 +218,47 @@ impl OrderbookLimiter {
         OrderbookLimiter {
             last: HashMap::new(),
             window: Instant::now(),
-            count: 0,
+            channels: HashMap::new(),
         }
     }
 
-    fn allow(&mut self, nick: &str, now: Instant) -> bool {
+    fn allow(&mut self, channel: usize, nick: &str, now: Instant) -> bool {
+        let draw = u32::from_be_bytes(vortex_ng_core::tx::random_bytes::<4>());
+        self.allow_with(channel, nick, now, draw)
+    }
+
+    /// [`Self::allow`] with the random draw given.
+    fn allow_with(&mut self, channel: usize, nick: &str, now: Instant, draw: u32) -> bool {
         if now.duration_since(self.window) >= Duration::from_secs(60) {
             self.window = now;
-            self.count = 0;
+            for budget in self.channels.values_mut() {
+                budget.asked_before = budget.asked;
+                budget.asked = 0;
+                budget.answered = 0;
+            }
             self.last
                 .retain(|_, t| now.duration_since(*t) < ORDERBOOK_NICK_INTERVAL);
         }
-        if self.count >= ORDERBOOK_ANSWERS_PER_MINUTE
-            || self
-                .last
-                .get(nick)
-                .is_some_and(|t| now.duration_since(*t) < ORDERBOOK_NICK_INTERVAL)
+        let key = (channel, nick.to_string());
+        if self
+            .last
+            .get(&key)
+            .is_some_and(|t| now.duration_since(*t) < ORDERBOOK_NICK_INTERVAL)
         {
             return false;
         }
-        self.last.insert(nick.to_string(), now);
-        self.count += 1;
+        let budget = self.channels.entry(channel).or_default();
+        budget.asked = budget.asked.saturating_add(1);
+        if budget.answered >= ORDERBOOK_ANSWERS_PER_MINUTE {
+            return false;
+        }
+        if budget.asked_before > ORDERBOOK_ANSWERS_PER_MINUTE
+            && draw % budget.asked_before >= ORDERBOOK_ANSWERS_PER_MINUTE
+        {
+            return false;
+        }
+        budget.answered += 1;
+        self.last.insert(key, now);
         true
     }
 }
@@ -275,19 +310,23 @@ fn maker_step<C: Channel>(
     me: &str,
     incoming: Incoming<C::Route>,
 ) -> Vec<Outgoing> {
+    if peers.len() >= MAX_KNOWN_PEERS {
+        peers.retain(|nick, _| maker.in_session(nick));
+    }
     match incoming {
         Incoming::Public {
             nick,
             commands,
             route,
         } => {
-            remember(peers, &nick, &route, false);
             // Rate-limited per channel and nick: a taker asking on two channels is two askers.
-            let asker = format!("{}:{nick}", client.channel_of(&route));
+            let channel = client.channel_of(&route);
             let mut out = Vec::new();
             for cmd in commands {
                 match cmd {
-                    Command::Orderbook if limiter.allow(&asker, Instant::now()) => {
+                    Command::Orderbook if limiter.allow(channel, &nick, Instant::now()) => {
+                        // Only a nick we answer is remembered.
+                        remember(peers, &nick, &route, false);
                         // A failed refresh keeps the current certificate while it lasts.
                         let _ = blocking(|| maker.refresh_bond(chain, unix_now()));
                         out.extend(maker.on_orderbook(&nick, me));
@@ -299,7 +338,9 @@ fn maker_step<C: Channel>(
             out
         }
         Incoming::Private { msg, route } => {
-            remember(peers, &msg.from, &route, true);
+            // A session keeps the route it started on: its lines can be delivered again by another way.
+            let settled = maker.in_session(&msg.from);
+            remember(peers, &msg.from, &route, !settled);
             let mut out = Vec::new();
             for cmd in commands(&msg) {
                 out.extend(blocking(|| maker.handle(&msg.from, cmd, chain, unix_now())));
@@ -535,6 +576,8 @@ pub async fn fetch_orderbook<C: Channel>(
     let mut asked = Instant::now();
     let mut book = Orderbook::default();
     let mut per_nick: HashMap<String, usize> = HashMap::new();
+    // The channel each maker first answered on: its route, whatever is delivered later or elsewhere.
+    let mut answered_on: HashMap<String, usize> = HashMap::new();
     let gather_until = Instant::now() + gather;
     while let Some(left) = gather_until.checked_duration_since(Instant::now()) {
         match client.receive(left).await {
@@ -553,6 +596,11 @@ pub async fn fetch_orderbook<C: Channel>(
                 if !per_nick.contains_key(&msg.from) && per_nick.len() >= MAX_ANSWERING_NICKS {
                     continue;
                 }
+                let channel = client.channel_of(&route);
+                if answered_on.get(&msg.from).is_some_and(|c| *c != channel) {
+                    continue;
+                }
+                let first = !answered_on.contains_key(&msg.from);
                 // Only a nick that answers with offers is remembered, and its `!tbond` kept: senders of
                 // anything else cannot grow the taker's state.
                 for cmd in commands(&msg) {
@@ -563,6 +611,7 @@ pub async fn fetch_orderbook<C: Channel>(
                                 *count += 1;
                                 book.offers.push((msg.from.clone(), offer));
                             }
+                            answered_on.entry(msg.from.clone()).or_insert(channel);
                         }
                         Command::Tbond(proof) if per_nick.contains_key(&msg.from) => {
                             book.proofs.entry(msg.from.clone()).or_insert(proof);
@@ -570,7 +619,7 @@ pub async fn fetch_orderbook<C: Channel>(
                         _ => {}
                     }
                 }
-                if per_nick.contains_key(&msg.from) {
+                if first && per_nick.contains_key(&msg.from) {
                     remember(&mut book.peers, &msg.from, &route, true);
                 }
             }
@@ -598,7 +647,7 @@ pub async fn run_taker<C: Channel>(
     let Orderbook {
         offers,
         proofs,
-        mut peers,
+        peers,
     } = fetch_orderbook(client, network, gather).await?;
     let candidates = candidate_nicks(&offers, cfg);
     // Each maker made its proof out to the nick it knows us by, on the channel it answered on.
@@ -626,7 +675,8 @@ pub async fn run_taker<C: Channel>(
         if !in_round.contains(&msg.from) {
             continue;
         }
-        remember(&mut peers, &msg.from, &route, true);
+        // The route stays the one the maker answered the orderbook on: a line delivered again through
+        // another directory or channel must not move the round's replies there.
         for cmd in commands(&msg) {
             // Where anyone could have delivered it, a lone `!error` says nothing about the maker: the round's
             // deadline decides.

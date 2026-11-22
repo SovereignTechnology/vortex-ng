@@ -1118,3 +1118,24 @@ async fn a_whole_coinjoin_over_direct_connections() {
         handle.abort();
     }
 }
+
+#[test]
+fn a_flood_of_orderbook_requests_leaves_room_for_real_takers() {
+    let start = Instant::now();
+    let mut limiter = OrderbookLimiter::new();
+    // A flood on channel 0 spends that channel's budget, and only that channel's.
+    let flood = ORDERBOOK_ANSWERS_PER_MINUTE * 10;
+    let answered = (0..flood)
+        .filter(|i| limiter.allow_with(0, &format!("J5flood{i}"), start, 0))
+        .count();
+    assert_eq!(answered, ORDERBOOK_ANSWERS_PER_MINUTE as usize);
+    assert!(!limiter.allow_with(0, "J5real", start, 0));
+    assert!(limiter.allow_with(1, "J5real", start, 0));
+    // Next minute the chance follows the flood seen: a losing draw is refused, a winning one is answered,
+    // and the budget is not gone.
+    let next = start + Duration::from_secs(61);
+    assert!(!limiter.allow_with(0, "J5loser", next, ORDERBOOK_ANSWERS_PER_MINUTE));
+    assert!(limiter.allow_with(0, "J5winner", next, 0));
+    // A nick is answered once per interval.
+    assert!(!limiter.allow_with(0, "J5winner", next, 0));
+}
