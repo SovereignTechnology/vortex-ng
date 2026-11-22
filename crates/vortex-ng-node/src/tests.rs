@@ -366,10 +366,10 @@ fn bond_lookups_are_bounded_and_only_for_candidates() {
     use vortex_ng_core::bitcoin::secp256k1::{Secp256k1, SecretKey};
     use vortex_ng_core::bond::BondTemplate;
     let secp = Secp256k1::new();
-    // 600 nicks, each with a proof signed by a key of its own (valid signatures) for an outpoint that does
-    // not exist: the signature alone must not buy a lookup for all of them.
+    // More nicks than the cap, each with a proof signed by a key of its own (valid signatures) for an outpoint
+    // that does not exist: the signature alone must not buy a lookup for all of them.
     let mut proofs = HashMap::new();
-    for i in 0..600u32 {
+    for i in 0..(MAX_BOND_LOOKUPS as u32 + 100) {
         let nick = format!("J5fake{i}");
         let key = SecretKey::from_slice(&[(i % 250 + 1) as u8; 32]).unwrap();
         let outpoint = OutPoint {
@@ -1123,24 +1123,90 @@ async fn a_whole_coinjoin_over_direct_connections() {
 fn a_flood_of_orderbook_requests_leaves_room_for_real_takers() {
     let start = Instant::now();
     let mut limiter = OrderbookLimiter::new();
-    // A flood on channel 0 spends that channel's budget, and only that channel's.
-    let flood = ORDERBOOK_ANSWERS_PER_MINUTE * 10;
-    let answered = (0..flood)
-        .filter(|i| limiter.allow_with(0, &format!("J5flood{i}"), start, 0))
+    // A burst on channel 0 spends that channel's bucket, and only that channel's.
+    let answered = (0..ORDERBOOK_BURST * 10)
+        .filter(|i| limiter.allow(0, &format!("J5flood{i}"), start))
         .count();
-    assert_eq!(answered, ORDERBOOK_ANSWERS_PER_MINUTE as usize);
-    assert!(!limiter.allow_with(0, "J5real", start, 0));
-    assert!(limiter.allow_with(1, "J5real", start, 0));
-    // Next minute the chance follows the flood seen: a losing draw is refused, a winning one is answered,
-    // and the budget is not gone.
-    let next = start + Duration::from_secs(61);
-    assert!(!limiter.allow_with(0, "J5loser", next, ORDERBOOK_ANSWERS_PER_MINUTE));
-    assert!(limiter.allow_with(0, "J5winner", next, 0));
+    assert_eq!(answered, ORDERBOOK_BURST as usize);
+    assert!(!limiter.allow(0, "J5real", start));
+    assert!(limiter.allow(1, "J5real", start));
+    // The budget comes back over time, so a burst at the start of a minute cannot spend the minute.
+    let soon = start + Duration::from_secs(1);
+    assert!(limiter.allow(0, "J5real", soon));
+    assert!(limiter.allow(0, "J5second", soon));
+    assert!(!limiter.allow(0, "J5third", soon));
     // A nick is answered once per interval.
-    assert!(!limiter.allow_with(0, "J5winner", next, 0));
-    // After a quiet stretch the old flood counts for nothing: even the worst draw is answered.
-    let quiet = next + Duration::from_secs(125);
-    assert!(limiter.allow_with(0, "J5after", quiet, u32::MAX - 1));
+    let later = soon + Duration::from_secs(2);
+    assert!(!limiter.allow(0, "J5real", later));
+    // A quiet time refills the bucket, but no further than one burst.
+    let quiet = soon + Duration::from_secs(3_600);
+    let answered = (0..ORDERBOOK_BURST * 2)
+        .filter(|i| limiter.allow(0, &format!("J5after{i}"), quiet))
+        .count();
+    assert_eq!(answered, ORDERBOOK_BURST as usize);
+}
+
+#[test]
+fn a_line_of_thousands_of_commands_is_not_read() {
+    let msg = |body: String| PrivMsg {
+        from: "J5maker".into(),
+        to: "J5taker".into(),
+        command: "sw0absoffer".into(),
+        body,
+        key: *NickKeys::generate().identity().public(),
+    };
+    let flood = format!("0 10000 100000000 0 500{}", "!a".repeat(30_000));
+    assert!(commands(&msg(flood)).is_empty());
+    let answer = "0 10000 100000000 0 500!sw0absoffer 1 10000 100000000 0 500".to_string();
+    assert_eq!(commands(&msg(answer)).len(), 2);
+}
+
+#[test]
+fn past_the_cap_a_channel_keeps_a_sample_of_who_answered() {
+    let mut book: ChannelAnswers<u8> = ChannelAnswers::new();
+    for i in 0..MAX_ANSWERING_NICKS {
+        assert!(
+            book.place(&format!("J5first{i}"), &0, i as u64, 0)
+                .is_some()
+        );
+    }
+    // A later nick gets a place when its draw lands inside the table, and pushes one out.
+    let heard = MAX_ANSWERING_NICKS as u64 + 1;
+    assert!(book.place("J5late", &0, heard, 3).is_some());
+    assert_eq!(book.answers.len(), MAX_ANSWERING_NICKS);
+    assert!(book.answers.contains_key("J5late"));
+    // When it lands past the table it does not, and nothing moves.
+    let past = MAX_ANSWERING_NICKS as u64 + 1;
+    assert!(book.place("J5unlucky", &0, heard + 1, past).is_none());
+    assert!(!book.answers.contains_key("J5unlucky"));
+    assert_eq!(book.answers.len(), MAX_ANSWERING_NICKS);
+}
+
+#[tokio::test]
+async fn a_line_relabelled_on_one_channel_does_not_take_the_maker_off_another() {
+    use vortex_ng_channel::set::ChannelSet;
+    use vortex_ng_channel::testing::mock_channel;
+    use vortex_ng_core::nick::NickIdentity;
+
+    let (a, on_a) = mock_channel("J5takerOnA", false);
+    let (b, on_b) = mock_channel("J5takerOnB", false);
+    let mut set = ChannelSet::new(vec![Box::new(a), Box::new(b)]).unwrap();
+    let maker = NickIdentity::generate();
+    let body = "0 10000 100000000 0 500";
+    // First, on channel A, its sw0 offer shown as one of another pit. Then the real one on channel B.
+    on_a.deliver_private(&maker, "J5takerOnA", "tr0absoffer", body, "a");
+    let (later, late_maker) = (on_b.clone(), maker.clone());
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        later.deliver_private(&late_maker, "J5takerOnB", "sw0absoffer", body, "b");
+    });
+    let usable = |offer: &Offer| offer.offer_type.pit == Pit::Sw0;
+    let book = fetch_orderbook_for(&mut set, "regtest", Duration::from_millis(400), usable)
+        .await
+        .unwrap();
+    assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
+    assert_eq!(book.offers[0].1.offer_type.pit, Pit::Sw0);
+    assert_eq!(set.channel_of(book.route(maker.nick()).unwrap()), 1);
 }
 
 #[tokio::test]

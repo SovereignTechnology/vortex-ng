@@ -28,9 +28,11 @@ use vortex_ng_core::offer::{Offer, Pit};
 
 /// Most unlinked lines ([`Channel::publish_unlinked`]) a channel publishes at once.
 pub const MAX_UNLINKED: usize = 4;
+/// How long a task on the side may run before it is given up, so that stalled ones cannot keep every place.
+pub const SIDE_TASK_LIMIT: Duration = Duration::from_secs(120);
 
-/// Work a channel does on the side, at most a fixed number at once, so that a peer who stalls it cannot hold up
-/// the driver's loop and every round in it.
+/// Work a channel does on the side, at most a fixed number at once and each for at most [`SIDE_TASK_LIMIT`], so
+/// that a peer who stalls it cannot hold up the driver's loop and every round in it.
 #[derive(Clone, Debug)]
 pub struct SideTasks {
     running: Arc<AtomicUsize>,
@@ -68,7 +70,7 @@ impl SideTasks {
         let place = SidePlace(Arc::clone(&self.running));
         tokio::spawn(async move {
             let _place = place;
-            work.await;
+            let _ = tokio::time::timeout(SIDE_TASK_LIMIT, work).await;
         });
         Ok(())
     }

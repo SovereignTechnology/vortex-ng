@@ -25,28 +25,34 @@ use vortex_ng_maker::Maker;
 pub use vortex_ng_nostr::channel::{CONNECT_TIMEOUT, OFFER_TTL};
 use vortex_ng_nostr::client::unix_now;
 use vortex_ng_taker::{
-    Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, select_makers,
-    verify_bond,
+    Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, offer_fits,
+    select_makers, verify_bond,
 };
 use vortex_ng_wallet::PitWallet;
 use vortex_ng_wallet::sync::BlockSource;
 
 /// A maker answers one nick's `!orderbook` at most once per this interval.
 pub const ORDERBOOK_NICK_INTERVAL: Duration = Duration::from_secs(5);
-/// A maker answers at most this many `!orderbook` requests a minute on each channel, from all nicks together.
-pub const ORDERBOOK_ANSWERS_PER_MINUTE: u32 = 120;
+/// A maker answers `!orderbook` at this rate on each channel, from all nicks together.
+pub const ORDERBOOK_ANSWERS_PER_SECOND: u32 = 2;
+/// The most `!orderbook` requests a maker answers at once on a channel after a quiet time.
+pub const ORDERBOOK_BURST: u32 = 20;
+/// Most commands one private line may carry; a line with more is not one any maker or taker sends. (A maker's
+/// answer is at most [`MAX_OFFERS_PER_NICK`] offers and a `!tbond`.)
+pub const MAX_COMMANDS_PER_LINE: usize = 32;
 /// Most peers a maker remembers a route for. Past it, those without a session are forgotten: any nick can
 /// write to a maker for free.
 pub const MAX_KNOWN_PEERS: usize = 10_000;
 /// A taker asks again (`!orderbook`) at most this often while it discovers makers that have not answered.
 pub const REASK_INTERVAL: Duration = Duration::from_secs(1);
-/// Most maker nicks a taker hears offers from in one gathering, and most offers it keeps per nick.
+/// Most maker nicks a taker keeps answers from per channel in one gathering, and most offers it keeps per nick.
+/// Past this a random sample of the nicks is kept, so whoever answers first cannot fill the book.
 pub const MAX_ANSWERING_NICKS: usize = 1_000;
 /// See [`MAX_ANSWERING_NICKS`].
 pub const MAX_OFFERS_PER_NICK: usize = 16;
 /// Most bond proofs a taker checks against the chain per round (up to two lookups each). Anyone can sign a proof
 /// with a key of their own, so the signature alone does not earn a lookup.
-pub const MAX_BOND_LOOKUPS: usize = 256;
+pub const MAX_BOND_LOOKUPS: usize = 2_048;
 
 /// Run synchronous work that may block on the chain backend (`ChainLookup` is a blocking call, a JSON-RPC
 /// request for `CoreRpc`) without stalling the async runtime's other tasks: on a multi-threaded runtime the
@@ -152,6 +158,9 @@ fn commands(msg: &PrivMsg) -> Vec<Command> {
             ciphertext: msg.body.clone(),
         }];
     }
+    if msg.body.matches('!').count() >= MAX_COMMANDS_PER_LINE {
+        return Vec::new();
+    }
     parse_plaintext(&format!("!{} {}", msg.command, msg.body)).unwrap_or_default()
 }
 
@@ -211,49 +220,28 @@ fn remember<R: Clone>(peers: &mut HashMap<String, R>, nick: &str, route: &R, pri
 /// The maker's `!orderbook` rate limits (the Nostr draft's SHOULD): each answer costs a proof and a gift
 /// wrap per offer.
 ///
-/// `!orderbook` is unsigned and free to send from fresh nicks. Each channel has its own budget, so a flood on
-/// one leaves the others alone. Within a channel, once more was asked in the last minute than the budget
-/// covers, each request is answered with the matching chance, so a flood cannot spend the budget in the
-/// minute's first seconds and leave real takers with nothing.
+/// `!orderbook` is unsigned and free to send from fresh nicks. Each channel has its own token bucket, so a flood
+/// on one leaves the others alone, and within a channel a burst can spend only [`ORDERBOOK_BURST`] answers:
+/// the rest of the budget arrives over time, for whoever is asking then.
 struct OrderbookLimiter {
     last: HashMap<(usize, String), Instant>,
-    window: Instant,
-    channels: HashMap<usize, OrderbookBudget>,
-}
-
-#[derive(Default)]
-struct OrderbookBudget {
-    answered: u32,
-    asked: u32,
-    asked_before: u32,
+    swept: Instant,
+    /// Per channel: the answers available, and when that was worked out.
+    buckets: HashMap<usize, (f64, Instant)>,
 }
 
 impl OrderbookLimiter {
     fn new() -> OrderbookLimiter {
         OrderbookLimiter {
             last: HashMap::new(),
-            window: Instant::now(),
-            channels: HashMap::new(),
+            swept: Instant::now(),
+            buckets: HashMap::new(),
         }
     }
 
     fn allow(&mut self, channel: usize, nick: &str, now: Instant) -> bool {
-        let draw = u32::from_be_bytes(vortex_ng_core::tx::random_bytes::<4>());
-        self.allow_with(channel, nick, now, draw)
-    }
-
-    /// [`Self::allow`] with the random draw given.
-    fn allow_with(&mut self, channel: usize, nick: &str, now: Instant, draw: u32) -> bool {
-        let elapsed = now.duration_since(self.window);
-        if elapsed >= Duration::from_secs(60) {
-            self.window = now;
-            // After a quiet minute, a flood before it says nothing about the minute starting now.
-            let quiet = elapsed >= Duration::from_secs(120);
-            for budget in self.channels.values_mut() {
-                budget.asked_before = if quiet { 0 } else { budget.asked };
-                budget.asked = 0;
-                budget.answered = 0;
-            }
+        if now.duration_since(self.swept) >= Duration::from_secs(60) {
+            self.swept = now;
             self.last
                 .retain(|_, t| now.duration_since(*t) < ORDERBOOK_NICK_INTERVAL);
         }
@@ -265,17 +253,16 @@ impl OrderbookLimiter {
         {
             return false;
         }
-        let budget = self.channels.entry(channel).or_default();
-        budget.asked = budget.asked.saturating_add(1);
-        if budget.answered >= ORDERBOOK_ANSWERS_PER_MINUTE {
+        let burst = f64::from(ORDERBOOK_BURST);
+        let (tokens, at) = self.buckets.entry(channel).or_insert((burst, now));
+        let earned =
+            now.duration_since(*at).as_secs_f64() * f64::from(ORDERBOOK_ANSWERS_PER_SECOND);
+        *tokens = (*tokens + earned).min(burst);
+        *at = now;
+        if *tokens < 1.0 {
             return false;
         }
-        if budget.asked_before > ORDERBOOK_ANSWERS_PER_MINUTE
-            && draw % budget.asked_before >= ORDERBOOK_ANSWERS_PER_MINUTE
-        {
-            return false;
-        }
-        budget.answered += 1;
+        *tokens -= 1.0;
         self.last.insert(key, now);
         true
     }
@@ -581,6 +568,94 @@ impl<R> Default for Orderbook<R> {
     }
 }
 
+/// What one maker answered on one channel.
+struct Answer<R> {
+    route: R,
+    offers: Vec<Offer>,
+    /// The first `!tbond` proof made out to the nick the maker knows us by there.
+    proof: Option<String>,
+    /// When its first line came, in order of arrival.
+    arrived: u64,
+}
+
+/// The answers gathered on one channel: at most [`MAX_ANSWERING_NICKS`] nicks, a random sample of those heard
+/// once there are more.
+struct ChannelAnswers<R> {
+    answers: HashMap<String, Answer<R>>,
+    nicks_heard: u64,
+}
+
+impl<R: Clone> ChannelAnswers<R> {
+    fn new() -> ChannelAnswers<R> {
+        ChannelAnswers {
+            answers: HashMap::new(),
+            nicks_heard: 0,
+        }
+    }
+
+    /// The place for `nick`'s answer, if it has or gets one. `draw` is a random number.
+    fn place(&mut self, nick: &str, route: &R, arrived: u64, draw: u64) -> Option<&mut Answer<R>> {
+        if !self.answers.contains_key(nick) {
+            self.nicks_heard += 1;
+            if self.answers.len() >= MAX_ANSWERING_NICKS {
+                let at = draw % self.nicks_heard;
+                if at >= MAX_ANSWERING_NICKS as u64 {
+                    return None;
+                }
+                let out = self.answers.keys().nth(at as usize).cloned()?;
+                self.answers.remove(&out);
+            }
+            self.answers.insert(
+                nick.to_string(),
+                Answer {
+                    route: route.clone(),
+                    offers: Vec::new(),
+                    proof: None,
+                    arrived,
+                },
+            );
+        }
+        self.answers.get_mut(nick)
+    }
+}
+
+/// One answer per maker. The command of a signed line is not signed, so one channel can show a maker's line
+/// under another offer type; a maker heard on several channels is taken from the one where it has a `usable`
+/// offer, there with a bond proof made out to us if any has one, and then from the earliest.
+fn settle<R>(
+    channels: HashMap<usize, ChannelAnswers<R>>,
+    usable: impl Fn(&Offer) -> bool,
+) -> Orderbook<R> {
+    let rank = |answer: &Answer<R>| {
+        (
+            !answer.offers.iter().any(&usable),
+            answer.proof.is_none(),
+            answer.arrived,
+        )
+    };
+    let mut best: HashMap<String, Answer<R>> = HashMap::new();
+    for (nick, answer) in channels.into_values().flat_map(|c| c.answers) {
+        match best.get(&nick) {
+            Some(kept) if rank(kept) <= rank(&answer) => {}
+            _ => {
+                best.insert(nick, answer);
+            }
+        }
+    }
+    let mut makers: Vec<(String, Answer<R>)> = best.into_iter().collect();
+    makers.sort_by_key(|(_, answer)| answer.arrived);
+    let mut book = Orderbook::default();
+    for (nick, answer) in makers {
+        book.offers
+            .extend(answer.offers.into_iter().map(|offer| (nick.clone(), offer)));
+        if let Some(proof) = answer.proof {
+            book.proofs.insert(nick.clone(), proof);
+        }
+        book.peers.insert(nick, answer.route);
+    }
+    book
+}
+
 /// Ask for the orderbook and gather the makers' private answers for `gather`: offers and `!tbond` proofs.
 /// Publicly announced offers serve only to discover makers that missed the request (it is then asked
 /// again). `network` is the channel's own network name; the channel uses the one it was opened with.
@@ -589,74 +664,65 @@ pub async fn fetch_orderbook<C: Channel>(
     network: &str,
     gather: Duration,
 ) -> Result<Orderbook<C::Route>, NodeError> {
+    fetch_orderbook_for(client, network, gather, |_| true).await
+}
+
+/// [`fetch_orderbook`] for a taker that will only consider offers that are `usable`: a maker heard on several
+/// channels is taken from one where it has such an offer.
+pub async fn fetch_orderbook_for<C: Channel>(
+    client: &mut C,
+    network: &str,
+    gather: Duration,
+    usable: impl Fn(&Offer) -> bool,
+) -> Result<Orderbook<C::Route>, NodeError> {
     let _ = network;
     client.listen(true, false).await?;
     client.ask_orderbook().await?;
     let mut asked = Instant::now();
-    let mut book = Orderbook::default();
-    let mut per_nick: HashMap<String, usize> = HashMap::new();
-    // The channel each maker answered on, and whether that answer carried a bond proof made out to us. The
-    // first answer sets the route. Anyone can deliver a maker's old signed offer first, so a later answer with
-    // such a proof, which only the maker can have made, replaces one without.
-    let mut answered: HashMap<String, (usize, bool)> = HashMap::new();
+    // Kept per channel until the end: what one channel delivers first cannot take a maker off another.
+    let mut channels: HashMap<usize, ChannelAnswers<C::Route>> = HashMap::new();
+    let mut arrived = 0u64;
     let gather_until = Instant::now() + gather;
     while let Some(left) = gather_until.checked_duration_since(Instant::now()) {
         match client.receive(left).await {
-            Next::Message(Incoming::Offers { nick, route, .. }) => {
-                if book.peers.contains_key(&nick) || book.peers.len() < MAX_ANSWERING_NICKS {
-                    remember(&mut book.peers, &nick, &route, false);
-                }
+            Next::Message(Incoming::Offers { nick, .. }) => {
                 // Public offers are a discovery cache (the draft): a maker that has not answered may have
                 // started listening after our request, so ask again.
-                if !per_nick.contains_key(&nick) && asked.elapsed() >= REASK_INTERVAL {
+                let answered = channels.values().any(|c| c.answers.contains_key(&nick));
+                if !answered && asked.elapsed() >= REASK_INTERVAL {
                     client.ask_orderbook().await?;
                     asked = Instant::now();
                 }
             }
             Next::Message(Incoming::Private { msg, route }) => {
-                if !per_nick.contains_key(&msg.from) && per_nick.len() >= MAX_ANSWERING_NICKS {
-                    continue;
-                }
-                let channel = client.channel_of(&route);
                 let line = commands(&msg);
-                let has_offer = line.iter().any(|c| matches!(c, Command::Offer(_)));
-                let proof = line.iter().find_map(|c| match c {
-                    Command::Tbond(proof) => Some(proof.clone()),
-                    _ => None,
-                });
-                let proven = proof
-                    .as_deref()
-                    .is_some_and(|p| proof_for_us(p, client.nick_on(&route), &msg.from));
-                match answered.get(&msg.from).copied() {
-                    // The first answer with a proof for us: what came before it may have been a replay.
-                    Some((_, false)) if proven && has_offer => {
-                        book.offers.retain(|(nick, _)| *nick != msg.from);
-                        per_nick.remove(&msg.from);
-                        answered.remove(&msg.from);
-                    }
-                    Some((on, was_proven)) if on != channel || (was_proven && !proven) => continue,
-                    _ => {}
-                }
-                let first = !answered.contains_key(&msg.from);
-                // Only a nick that answers with offers is remembered, and only a proof made out to us
-                // kept: senders of anything else cannot grow the taker's state.
+                let answers = channels
+                    .entry(client.channel_of(&route))
+                    .or_insert_with(ChannelAnswers::new);
+                // Only a nick that answers with offers gets a place: senders of anything else cannot grow
+                // the taker's state.
+                let answer = if line.iter().any(|c| matches!(c, Command::Offer(_))) {
+                    arrived += 1;
+                    let draw = u64::from_be_bytes(vortex_ng_core::tx::random_bytes::<8>());
+                    answers.place(&msg.from, &route, arrived, draw)
+                } else {
+                    answers.answers.get_mut(&msg.from)
+                };
+                let Some(answer) = answer else {
+                    continue;
+                };
                 for cmd in line {
-                    if let Command::Offer(offer) = cmd {
-                        let count = per_nick.entry(msg.from.clone()).or_default();
-                        if *count < MAX_OFFERS_PER_NICK {
-                            *count += 1;
-                            book.offers.push((msg.from.clone(), offer));
+                    match cmd {
+                        Command::Offer(offer) if answer.offers.len() < MAX_OFFERS_PER_NICK => {
+                            answer.offers.push(offer);
                         }
-                        answered.entry(msg.from.clone()).or_insert((channel, false));
-                    }
-                }
-                if let Some(entry) = answered.get_mut(&msg.from) {
-                    entry.1 |= proven;
-                    if let (true, Some(proof)) = (proven, proof) {
-                        book.proofs.entry(msg.from.clone()).or_insert(proof);
-                    }
-                    if first {
-                        remember(&mut book.peers, &msg.from, &route, true);
+                        Command::Tbond(proof)
+                            if answer.proof.is_none()
+                                && proof_for_us(&proof, client.nick_on(&route), &msg.from) =>
+                        {
+                            answer.proof = Some(proof);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -664,7 +730,7 @@ pub async fn fetch_orderbook<C: Channel>(
             Next::Timeout | Next::Closed => break,
         }
     }
-    Ok(book)
+    Ok(settle(channels, usable))
 }
 
 /// Run one CoinJoin as the taker: ask for the orderbook, gather the makers' private answers (offers and
@@ -685,7 +751,7 @@ pub async fn run_taker<C: Channel>(
         offers,
         proofs,
         peers,
-    } = fetch_orderbook(client, network, gather).await?;
+    } = fetch_orderbook_for(client, network, gather, |offer| offer_fits(offer, cfg)).await?;
     let candidates = candidate_nicks(&offers, cfg);
     // Each maker made its proof out to the nick it knows us by, on the channel it answered on.
     let me = |maker: &str| match peers.get(maker) {
@@ -701,8 +767,10 @@ pub async fn run_taker<C: Channel>(
         .filter_map(|(nick, _)| Some((nick.clone(), peers.get(nick)?.clone())))
         .collect();
     client.prepare(&ready).await;
-    let outgoing = taker.start(chosen).map_err(NodeError::Taker)?;
-    deliver(client, &peers, chain, outgoing).await?;
+    // One at a time: if a `!fill` cannot go the round is over, and the makers after it need not hear of it.
+    for fill in taker.start(chosen).map_err(NodeError::Taker)? {
+        deliver(client, &peers, chain, vec![fill]).await?;
+    }
     while let Some(left) = until.checked_duration_since(Instant::now()) {
         let Next::Message(Incoming::Private { msg, route }) = client.receive(left).await else {
             continue;

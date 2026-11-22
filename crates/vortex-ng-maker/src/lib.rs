@@ -125,6 +125,9 @@ pub struct Maker {
     sessions: HashMap<String, Stage>,
     /// When each session's `!fill` arrived.
     started: HashMap<String, u64>,
+    /// The second sessions past their time were last forgotten: within one second there is nothing new to
+    /// forget, and a flood of commands must not pay for a walk over the whole table each.
+    pruned_at: Option<u64>,
     used_commitments: Commitments,
     /// When we announced commitments handed to us privately, within the last window.
     hp2_relayed: std::collections::VecDeque<u64>,
@@ -232,6 +235,7 @@ impl Maker {
             wallet,
             sessions: HashMap::new(),
             started: HashMap::new(),
+            pruned_at: None,
             used_commitments: Commitments::default(),
             hp2_relayed: std::collections::VecDeque::new(),
             bond: None,
@@ -366,13 +370,16 @@ impl Maker {
         now: u64,
     ) -> Vec<Outgoing> {
         // Forget sessions past their time before anything else, so they never count against the cap.
-        let (sessions, started) = (&mut self.sessions, &mut self.started);
-        sessions.retain(|nick, stage| {
-            started
-                .get(nick)
-                .is_some_and(|at| now.saturating_sub(*at) <= stage.time_limit())
-        });
-        started.retain(|nick, _| sessions.contains_key(nick));
+        if self.pruned_at != Some(now) {
+            self.pruned_at = Some(now);
+            let (sessions, started) = (&mut self.sessions, &mut self.started);
+            sessions.retain(|nick, stage| {
+                started
+                    .get(nick)
+                    .is_some_and(|at| now.saturating_sub(*at) <= stage.time_limit())
+            });
+            started.retain(|nick, _| sessions.contains_key(nick));
+        }
         let result = match command {
             // `!orderbook` is a public command (JMP-0001); the transport answers it with `on_orderbook`.
             Command::Orderbook => return Vec::new(),

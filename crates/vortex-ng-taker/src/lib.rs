@@ -153,15 +153,9 @@ fn ranked_offers<'a>(
 ) -> Vec<(&'a str, u64, &'a Offer)> {
     let mut best: BTreeMap<&str, (u64, &Offer)> = BTreeMap::new();
     for (nick, offer) in offers {
-        if offer.offer_type.pit != cfg.pit {
-            continue;
-        }
-        let Some(fee) = offer.fee_for(cfg.amount) else {
+        let Some(fee) = usable_fee(offer, cfg) else {
             continue;
         };
-        if fee > cfg.max_cjfee || fee < offer.txfee {
-            continue;
-        }
         let entry = best.entry(nick.as_str()).or_insert((fee, offer));
         if fee < entry.0 {
             *entry = (fee, offer);
@@ -173,6 +167,21 @@ fn ranked_offers<'a>(
         .collect();
     ranked.sort_by_key(|(_, fee, _)| *fee);
     ranked
+}
+
+/// The fee `offer` asks for this round, if the taker would consider it: of the pit, covering the amount, within
+/// the fee limit.
+fn usable_fee(offer: &Offer, cfg: &TakerConfig) -> Option<u64> {
+    if offer.offer_type.pit != cfg.pit {
+        return None;
+    }
+    let fee = offer.fee_for(cfg.amount)?;
+    (fee <= cfg.max_cjfee && fee >= offer.txfee).then_some(fee)
+}
+
+/// Whether the taker would consider `offer` for this round.
+pub fn offer_fits(offer: &Offer, cfg: &TakerConfig) -> bool {
+    usable_fee(offer, cfg).is_some()
 }
 
 /// The nicks with an offer the taker would consider. Only these are worth a bond lookup.

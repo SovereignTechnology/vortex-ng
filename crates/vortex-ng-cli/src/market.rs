@@ -17,7 +17,7 @@ use vortex_ng_irc::{IrcChannel, IrcConfig, IrcServer};
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{
     CONNECT_TIMEOUT, MAX_BOND_LOOKUPS, MakerReport, MakerService, NodeError, OfferFee, OfferPolicy,
-    channel_network, fetch_orderbook, run_taker, serve_maker,
+    channel_network, fetch_orderbook_for, run_taker, serve_maker,
 };
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
@@ -331,7 +331,9 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let channel = channel_network(network);
     let (us, seen_on, book) = runtime()?.block_on(async {
         let (mut client, labels) = channels(channel, &meeting, &outbound, Role::Taker).await?;
-        let book = fetch_orderbook(&mut client, channel, Duration::from_secs(wait.into()))
+        let usable = |offer: &Offer| only.is_none_or(|pit| offer.offer_type.pit == pit);
+        let gather = Duration::from_secs(wait.into());
+        let book = fetch_orderbook_for(&mut client, channel, gather, usable)
             .await
             .map_err(failed)?;
         // The nick each maker knows us by (a bond proof is made out to it).
