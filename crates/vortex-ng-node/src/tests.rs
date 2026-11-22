@@ -1210,6 +1210,32 @@ async fn a_line_relabelled_on_one_channel_does_not_take_the_maker_off_another() 
 }
 
 #[tokio::test]
+async fn offers_a_taker_cannot_use_do_not_take_the_place_of_one_it_can() {
+    use vortex_ng_channel::testing::mock_channel;
+    use vortex_ng_core::nick::NickIdentity;
+
+    let (mut channel, handle) = mock_channel("J5taker", false);
+    let maker = NickIdentity::generate();
+    // On the one channel: enough of its lines shown under another pit to fill its place, and copies of the
+    // real offer, before the real one.
+    for i in 0..MAX_OFFERS_PER_NICK {
+        let body = format!("{i} 10000 100000000 0 500");
+        handle.deliver_private(&maker, "J5taker", "tr0absoffer", &body, "a");
+    }
+    for _ in 0..2 {
+        let real = "99 10000 100000000 0 500";
+        handle.deliver_private(&maker, "J5taker", "sw0absoffer", real, "a");
+    }
+    let usable = |offer: &Offer| offer.offer_type.pit == Pit::Sw0;
+    let book = fetch_orderbook_for(&mut channel, "regtest", Duration::from_millis(300), usable)
+        .await
+        .unwrap();
+    assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
+    assert_eq!(book.offers[0].1.oid, 99);
+    assert!(book.route(maker.nick()).is_some());
+}
+
+#[tokio::test]
 async fn a_replayed_offer_does_not_cost_a_maker_its_bond_or_its_route() {
     use vortex_ng_channel::set::ChannelSet;
     use vortex_ng_channel::testing::mock_channel;

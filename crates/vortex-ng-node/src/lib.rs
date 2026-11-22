@@ -619,20 +619,10 @@ impl<R: Clone> ChannelAnswers<R> {
     }
 }
 
-/// One answer per maker. The command of a signed line is not signed, so one channel can show a maker's line
-/// under another offer type; a maker heard on several channels is taken from the one where it has a `usable`
-/// offer, there with a bond proof made out to us if any has one, and then from the earliest.
-fn settle<R>(
-    channels: HashMap<usize, ChannelAnswers<R>>,
-    usable: impl Fn(&Offer) -> bool,
-) -> Orderbook<R> {
-    let rank = |answer: &Answer<R>| {
-        (
-            !answer.offers.iter().any(&usable),
-            answer.proof.is_none(),
-            answer.arrived,
-        )
-    };
+/// One answer per maker. Every answer kept holds an offer the taker can use; a maker heard on several channels
+/// is taken from one where it showed a bond proof made out to us, if any, and then from the earliest.
+fn settle<R>(channels: HashMap<usize, ChannelAnswers<R>>) -> Orderbook<R> {
+    let rank = |answer: &Answer<R>| (answer.proof.is_none(), answer.arrived);
     let mut best: HashMap<String, Answer<R>> = HashMap::new();
     for (nick, answer) in channels.into_values().flat_map(|c| c.answers) {
         match best.get(&nick) {
@@ -667,8 +657,9 @@ pub async fn fetch_orderbook<C: Channel>(
     fetch_orderbook_for(client, network, gather, |_| true).await
 }
 
-/// [`fetch_orderbook`] for a taker that will only consider offers that are `usable`: a maker heard on several
-/// channels is taken from one where it has such an offer.
+/// [`fetch_orderbook`] for a taker that will only consider offers that are `usable`. Only those are kept, one per
+/// offer type and id. The command of a signed line is not signed, so anyone can show a maker's lines under an
+/// offer type it never offered; kept, they could use up the maker's place for offers before its real one came.
 pub async fn fetch_orderbook_for<C: Channel>(
     client: &mut C,
     network: &str,
@@ -699,9 +690,12 @@ pub async fn fetch_orderbook_for<C: Channel>(
                 let answers = channels
                     .entry(client.channel_of(&route))
                     .or_insert_with(ChannelAnswers::new);
-                // Only a nick that answers with offers gets a place: senders of anything else cannot grow
-                // the taker's state.
-                let answer = if line.iter().any(|c| matches!(c, Command::Offer(_))) {
+                // Only a nick that answers with an offer we can use gets a place: senders of anything else
+                // cannot grow the taker's state.
+                let has_usable = line
+                    .iter()
+                    .any(|c| matches!(c, Command::Offer(offer) if usable(offer)));
+                let answer = if has_usable {
                     arrived += 1;
                     let draw = u64::from_be_bytes(vortex_ng_core::tx::random_bytes::<8>());
                     answers.place(&msg.from, &route, arrived, draw)
@@ -713,7 +707,13 @@ pub async fn fetch_orderbook_for<C: Channel>(
                 };
                 for cmd in line {
                     match cmd {
-                        Command::Offer(offer) if answer.offers.len() < MAX_OFFERS_PER_NICK => {
+                        Command::Offer(offer)
+                            if usable(&offer)
+                                && answer.offers.len() < MAX_OFFERS_PER_NICK
+                                && !answer.offers.iter().any(|known| {
+                                    known.oid == offer.oid && known.offer_type == offer.offer_type
+                                }) =>
+                        {
                             answer.offers.push(offer);
                         }
                         Command::Tbond(proof)
@@ -730,7 +730,7 @@ pub async fn fetch_orderbook_for<C: Channel>(
             Next::Timeout | Next::Closed => break,
         }
     }
-    Ok(settle(channels, usable))
+    Ok(settle(channels))
 }
 
 /// Run one CoinJoin as the taker: ask for the orderbook, gather the makers' private answers (offers and
