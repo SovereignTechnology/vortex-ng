@@ -17,6 +17,10 @@ around JoinMarket's maker/taker market instead of a central coordinator:
 - **Lightning channel opens inside the coinjoin.** A taker's equal-amount output can be the funding output of
   a taproot channel (in `tr0`) or a regular channel (in `wsh0`); makers see an ordinary output of the pit's
   type. LND, Core Lightning and LDK can open; any implementation can be the peer.
+- **CoinJoin from a channel close.** A coin a Lightning channel close paid your wallet is recognised from
+  the transaction that created it (a mutual close, a force close, or the sweep of one), and
+  `coinjoin --from-closes` spends those coins and no others, so they are not merged with coins of another
+  history (ADR 0008). Closing is the moment a node's coins are easiest to link; this mixes them right after.
 - **Upstreamable by construction.** Every protocol piece JoinMarket lacks is written as a JMP draft
   (`docs/jmp/`) for [joinmarket-ng](https://github.com/joinmarket-ng/joinmarket-ng) to adopt.
 
@@ -53,7 +57,7 @@ rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Ecl
 
 ## Command line
 
-`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin` and `balance`.
+`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin`, `balance` and `coins`.
 
 ```
 vortex-ng wallet new          --wallet <file> --network <network> [--words 12|24] [--birthday <height>]
@@ -69,8 +73,9 @@ vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fra
 vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
                     [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                     [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
-                    [--allow-bondless-fees] [--yes]
+                    [--allow-bondless-fees] [--from-closes] [--yes]
 vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
+vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only] [--outpoints]
 ```
 
 `node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
@@ -91,6 +96,16 @@ vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
   and at least 2,000 sat unless `--max-maker-fee` says otherwise), takes makers without a fidelity bond only
   at a zero fee unless `--allow-bondless-fees`, shows what it is about to do and asks before sending anything
   (`--yes` skips the question). The transaction is checked with the node before it is broadcast.
+- **Channel closes.** Close a channel with one of the wallet's addresses as the delivery address (LND
+  `closechannel --delivery_addr`, Core Lightning `close <id> <timeout> <address>`; `wallet addresses` lists
+  them). `coins` then marks what the close paid, `coins --closes-only` shows only those, and
+  `coinjoin --from-closes` spends only those. Recognition reads the one transaction that created each coin
+  (BOLT 3's shapes), so it needs no node's help. It is evidence, not proof, and it sees only what a close or
+  a sweep pays this wallet *directly*: a force close that the node sweeps into its own wallet, and the coin
+  sent on from there, look like an ordinary payment. A taproot channel's mutual close is a lone key-path spend
+  and is not recognised either. Outpoints are printed only with `--outpoints`. Nothing watches for closes or
+  spends by itself. Spending straight from a Lightning node's own wallet, which covers force closes, is
+  designed in ADR 0008 and not built.
 - Every PoDLE commitment sent is first written to `<wallet>.podle` (the public value makers broadcast, one
   per line): a commitment is spent even by a round that fails, and each coin has three.
 - `orderbook` lists what the makers on the relays answer, and verifies their fidelity bonds when given a node.

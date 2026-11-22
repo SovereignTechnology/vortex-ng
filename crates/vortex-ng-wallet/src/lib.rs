@@ -21,6 +21,7 @@ use bdk_wallet::{KeychainKind, LocalOutput, Wallet};
 use vortex_ng_core::offer::Pit;
 
 pub mod bonds;
+pub mod close;
 pub mod file;
 pub mod keys;
 pub mod sign;

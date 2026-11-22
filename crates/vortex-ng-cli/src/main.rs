@@ -3,7 +3,8 @@
 //! The wallet commands create or restore a wallet file (a seed encrypted at rest, see
 //! `vortex_ng_wallet::file`) and read addresses out of it; `orderbook` asks the makers on a set of relays
 //! what they offer; `maker` offers the wallet's coins until stopped; `coinjoin` does one CoinJoin as the
-//! taker; `balance` shows what the wallet holds. Exit status 0 on success, 1 when the command
+//! taker; `balance` shows what the wallet holds; `coins` lists its coins and marks the ones a Lightning
+//! channel close paid it (`coinjoin --from-closes` spends only those). Exit status 0 on success, 1 when the command
 //! failed, 2 when it was not understood.
 
 mod args;
@@ -40,12 +41,22 @@ Usage:
   vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
                       [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                       [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
-                      [--allow-bondless-fees] [--yes]
+                      [--allow-bondless-fees] [--from-closes] [--yes]
   vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
+  vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only]
+                      [--outpoints]
   vortex-ng --version
 
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
+
+Channel closes: close a channel with one of the wallet's addresses as the delivery address (`vortex-ng wallet
+addresses` lists them; LND `closechannel --delivery_addr`, CLN `close <id> <timeout> <address>`). `coins` then
+marks what the close paid, and `coinjoin --from-closes` spends those coins and no others, so they are not
+merged with coins that have another history. Only the transaction that created a coin is read: a force close
+that the node sweeps into its own wallet, and the coin sent on from there, look like an ordinary payment and
+are not recognised (spending straight from the node's wallet is the planned answer). The recognition is
+evidence, not proof, and a mutual close of a taproot channel is not recognised.
 
 `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
 username and password, such as a Tor daemon's SOCKS port (127.0.0.1:9050). Every nick, a maker's throwaway
@@ -74,6 +85,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
         [command, rest @ ..] if command == "maker" => market::maker(rest),
         [command, rest @ ..] if command == "coinjoin" => market::coinjoin(rest),
         [command, rest @ ..] if command == "balance" => market::balance(rest),
+        [command, rest @ ..] if command == "coins" => market::coins(rest),
         [group] if group == "wallet" => Err(Failure::Usage("wallet: which command?".into())),
         [other, ..] => Err(Failure::Usage(format!("unknown command `{other}`"))),
     }
