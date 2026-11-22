@@ -122,12 +122,12 @@ fn is_refusal(out: &Outgoing) -> bool {
 /// server may: every line arrives twice, every line seen so far is delivered again after each step, and every
 /// line the taker sent also reaches the other maker. None of that may change the round.
 fn coinjoin_with(pit: Pit, noisy: bool) -> (Transaction, PitWallet) {
-    coinjoin_after(pit, noisy, false)
+    coinjoin_after(pit, noisy, 0)
 }
 
-/// As [`coinjoin_with`]. With `stale_pubkey`, a `!pubkey` of each maker from another exchange (a key the
-/// round does not use) reaches the taker before anything else.
-fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkey: bool) -> (Transaction, PitWallet) {
+/// As [`coinjoin_with`]. `stale_pubkeys` `!pubkey` lines of each maker from other exchanges (keys the round
+/// does not use) reach the taker before anything else.
+fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkeys: usize) -> (Transaction, PitWallet) {
     let mut chain = FakeChain::default();
     let mut makers: BTreeMap<String, Maker> = BTreeMap::new();
     for (i, nick) in ["J5makerA", "J5makerB"].iter().enumerate() {
@@ -184,7 +184,7 @@ fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkey: bool) -> (Transaction, Pi
         .into_iter()
         .map(|o| ("J5taker".to_string(), o))
         .collect();
-    if stale_pubkey {
+    for _ in 0..stale_pubkeys {
         for nick in makers.keys() {
             queue.push_front((
                 nick.clone(),
@@ -258,9 +258,12 @@ fn check(pit: Pit) {
 
 #[test]
 fn a_pubkey_from_another_exchange_does_not_end_the_round() {
-    let (tx, _) = coinjoin_after(Pit::Sw0, false, true);
-    assert_eq!(tx.input.len(), 3);
-    assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+    // As many as leave room for the real key, which then still wins.
+    for stale in [1, MAX_PUBKEY_CANDIDATES - 1] {
+        let (tx, _) = coinjoin_after(Pit::Sw0, false, stale);
+        assert_eq!(tx.input.len(), 3);
+        assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+    }
 }
 
 fn check_with(pit: Pit, noisy: bool) {

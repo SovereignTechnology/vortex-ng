@@ -343,23 +343,53 @@ fn sessions_expire_and_never_block_new_takers() {
         oid: 0,
         amount: AMOUNT,
         nacl_pubkey: NaclKeypair::generate().public_hex(),
-        commitment: [i as u8 + 1; 32],
+        commitment: numbered_commitment(i),
     };
-    // The table fills with takers that never continue.
-    for i in 0..MAX_SESSIONS {
+    // The table fills with takers that never continue. More of them than could ever finish a round fit, so
+    // a burst between a real taker's `!fill` and its `!auth` does not push it out.
+    for i in 0..MAX_WAITING_SESSIONS {
         let out = maker.handle(&format!("J5quiet{i}"), fill(i), &chain, NOW);
         assert_eq!(private(&out[0]).0, "pubkey", "fill {i}");
+        if i == MAX_SESSIONS {
+            assert!(maker.in_session("J5quiet0", NOW), "past the old limit");
+        }
     }
-    // A full table does not lock a new taker out: the oldest session waiting for `!auth` gives way.
-    let out = maker.handle("J5late", fill(200), &chain, NOW + 1);
+    // A full table does not lock a new taker out: one session waiting for `!auth` gives way.
+    let out = maker.handle("J5late", fill(MAX_WAITING_SESSIONS), &chain, NOW + 1);
     assert_eq!(private(&out[0]).0, "pubkey", "a new taker is served");
-    assert_eq!(maker.sessions.len(), MAX_SESSIONS);
-    assert!(maker.in_session("J5late"));
-    // Once they are out of time they are forgotten.
-    let out = maker.handle("J5later", fill(201), &chain, NOW + FILLED_TTL + 2);
+    assert_eq!(maker.sessions.len(), MAX_WAITING_SESSIONS);
+    assert!(maker.in_session("J5late", NOW + 1));
+    // Once they are out of time they no longer count as open, before anything has pruned them.
+    assert!(!maker.in_session("J5late", NOW + 1 + FILLED_TTL + 1));
+    let later = fill(MAX_WAITING_SESSIONS + 1);
+    let out = maker.handle("J5later", later, &chain, NOW + FILLED_TTL + 2);
     assert_eq!(private(&out[0]).0, "pubkey");
     assert_eq!(maker.sessions.len(), 1);
     assert_eq!(maker.started.len(), 1);
+}
+
+fn numbered_commitment(i: usize) -> [u8; 32] {
+    let mut commitment = [0x5a; 32];
+    commitment[..8].copy_from_slice(&(i as u64).to_be_bytes());
+    commitment
+}
+
+#[test]
+fn one_commitment_opens_one_session() {
+    let mut maker = funded_maker();
+    let (_, chain) = new_taker();
+    let fill = || Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: NaclKeypair::generate().public_hex(),
+        commitment: numbered_commitment(1),
+    };
+    let out = maker.handle("J5first", fill(), &chain, NOW);
+    assert_eq!(private(&out[0]).0, "pubkey");
+    // The same commitment under another nick gets nothing, and the first session is left alone.
+    assert!(maker.handle("J5copy", fill(), &chain, NOW).is_empty());
+    assert!(!maker.in_session("J5copy", NOW));
+    assert!(maker.in_session("J5first", NOW));
 }
 
 #[test]

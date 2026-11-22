@@ -18,11 +18,61 @@ pub mod testing;
 pub mod tor;
 
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use vortex_ng_core::command::Command;
 use vortex_ng_core::line::{LineError, PrivMsg};
 use vortex_ng_core::offer::{Offer, Pit};
+
+/// Most unlinked lines ([`Channel::publish_unlinked`]) a channel publishes at once.
+pub const MAX_UNLINKED: usize = 4;
+
+/// Work a channel does on the side, at most a fixed number at once, so that a peer who stalls it cannot hold up
+/// the driver's loop and every round in it.
+#[derive(Clone, Debug)]
+pub struct SideTasks {
+    running: Arc<AtomicUsize>,
+    max: usize,
+}
+
+/// A place among the running tasks, given back when the task ends or is aborted.
+struct SidePlace(Arc<AtomicUsize>);
+
+impl Drop for SidePlace {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl SideTasks {
+    /// Room for `max` tasks at once.
+    pub fn new(max: usize) -> SideTasks {
+        SideTasks {
+            running: Arc::new(AtomicUsize::new(0)),
+            max,
+        }
+    }
+
+    /// Start `work`, or refuse it when the room is taken.
+    pub fn spawn(
+        &self,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ChannelError> {
+        self.running
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < self.max).then_some(n + 1)
+            })
+            .map_err(|_| ChannelError::Transport("too many lines being published".into()))?;
+        let place = SidePlace(Arc::clone(&self.running));
+        tokio::spawn(async move {
+            let _place = place;
+            work.await;
+        });
+        Ok(())
+    }
+}
 
 /// Why a channel operation failed.
 #[derive(Debug, Clone, PartialEq, Eq)]

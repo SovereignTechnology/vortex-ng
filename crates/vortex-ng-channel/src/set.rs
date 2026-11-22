@@ -3,11 +3,12 @@
 //! The rules (ADR 0007) are this project's, not a copy of joinmarket-clientserver's message channel
 //! collection:
 //!
-//! - A peer nick is tied to the channel a round with it runs on: where its `!fill` arrived (a maker) or where
-//!   we sent it ours (a taker). Only a `!fill` ties, because any other signed line can be delivered onto a
-//!   channel by someone who saw it, and a tie made that way would steer the peer's round there. While the tie
-//!   lasts ([`PIN_TTL`] since its last private line) the nick's private lines on any other channel are
-//!   dropped, so a session never crosses channels. Public lines pass from every channel.
+//! - A peer nick is tied to the channel a round with it runs on: where we answered its `!fill` with our
+//!   `!pubkey` (a maker) or where we sent it ours (a taker). Only what we send ties. The command of a line is
+//!   not signed, so any signed line received can be a relabelled one, and a tie made from it would let
+//!   whoever delivered it steer the peer's round. While the tie lasts ([`PIN_TTL`] since its last private
+//!   line) the nick's private lines on any other channel are dropped, so a session never crosses channels.
+//!   Public lines pass from every channel.
 //! - Each channel signs and verifies with its own `hostid`; the set never moves a line between channels.
 //! - A maker gives every channel the same nick; a taker gives each channel a nick of its own
 //!   ([`Channel::nick_on`] tells which one a peer knows).
@@ -255,9 +256,9 @@ impl ChannelSet {
         self.channels.is_empty()
     }
 
-    /// Whether a private line with `command` from `nick` on `channel` belongs there: it does unless the nick
-    /// is tied to another channel. A line on the nick's channel keeps the tie fresh; a `!fill` makes one.
-    fn admit(&self, nick: &str, channel: usize, command: &str) -> bool {
+    /// Whether a private line from `nick` on `channel` belongs there: it does unless the nick is tied to
+    /// another channel. A line on the nick's channel keeps the tie fresh.
+    fn admit(&self, nick: &str, channel: usize) -> bool {
         let now = Instant::now();
         let Ok(mut pins) = self.pins.lock() else {
             return true;
@@ -269,10 +270,6 @@ impl ChannelSet {
                 return false;
             }
             *at = now;
-            return true;
-        }
-        if command == "fill" {
-            self.tie(&mut pins, nick, channel, now);
         }
         true
     }
@@ -354,8 +351,8 @@ impl Channel for ChannelSet {
             .channels
             .get(route.channel)
             .ok_or(ChannelError::Invalid("no such channel"))?;
-        // Our `!fill` starts a round with this peer on this channel.
-        if command == "fill"
+        // Our `!fill`, or our `!pubkey` answering one we accepted, starts a round with this peer here.
+        if matches!(command, "fill" | "pubkey")
             && let Ok(mut pins) = self.pins.lock()
         {
             self.tie(&mut pins, to, route.channel, Instant::now());
@@ -432,7 +429,7 @@ impl Channel for ChannelSet {
             let set_route = |route: AnyRoute| SetRoute { channel, route };
             let message = match incoming {
                 Incoming::Private { msg, route } => {
-                    if !self.admit(&msg.from, channel, &msg.command) {
+                    if !self.admit(&msg.from, channel) {
                         continue;
                     }
                     Incoming::Private {
@@ -496,13 +493,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_peer_stays_on_the_channel_it_first_spoke_on() {
+    async fn a_peer_stays_on_the_channel_we_answered_its_fill_on() {
         let (set, [h0, h1]) = two(["J5maker", "J5maker"], [true, false]);
         let mut set = set.with_pin_ttl(Duration::from_millis(400));
         let taker = NickIdentity::generate();
         let me = taker.nick().to_string();
         h1.deliver_private(&taker, "J5maker", "fill", "0 1000 key commitment", "b");
-        assert_eq!(private_from(&mut set).await, Some((me.clone(), 1)));
+        let Next::Message(Incoming::Private { route, .. }) = set.receive(WAIT).await else {
+            panic!("the fill")
+        };
+        assert_eq!(set.channel_of(&route), 1);
+        set.send_private(&route, &me, "pubkey", "aa").await.unwrap();
         // The same nick on the other channel: dropped while it is tied to channel 1.
         h0.deliver_private(&taker, "J5maker", "fill", "0 1000 key commitment", "a");
         assert_eq!(private_from(&mut set).await, None);
@@ -522,18 +523,25 @@ mod tests {
         // Once the tie has lapsed, the other channel may take the nick.
         tokio::time::sleep(Duration::from_millis(450)).await;
         h0.deliver_private(&taker, "J5maker", "fill", "0 1000 key other", "a");
-        assert_eq!(private_from(&mut set).await, Some((me.clone(), 0)));
+        let Next::Message(Incoming::Private { route, .. }) = set.receive(WAIT).await else {
+            panic!("the fill after the tie lapsed")
+        };
+        assert_eq!(set.channel_of(&route), 0);
+        set.send_private(&route, &me, "pubkey", "bb").await.unwrap();
         h1.deliver_private(&taker, "J5maker", "fill", "0 1000 key third", "b");
         assert_eq!(private_from(&mut set).await, None);
     }
 
     #[tokio::test]
-    async fn only_a_fill_ties_a_peer_to_a_channel() {
+    async fn only_what_we_send_ties_a_peer_to_a_channel() {
         let (mut set, [h0, h1]) = two(["J5takerA", "J5takerB"], [false, false]);
         let maker = NickIdentity::generate();
         let me = maker.nick().to_string();
-        // A maker's signed answer delivered on one channel does not take it off the other.
+        // A maker's signed answer delivered on one channel does not take it off the other, and neither does
+        // the same line relabelled as a `!fill`: the command is not signed.
         h0.deliver_private(&maker, "J5takerA", "sw0absoffer", "0 1 2 3 4", "a");
+        assert_eq!(private_from(&mut set).await, Some((me.clone(), 0)));
+        h0.deliver_private(&maker, "J5takerA", "fill", "0 1 2 3 4", "a");
         assert_eq!(private_from(&mut set).await, Some((me.clone(), 0)));
         h1.deliver_private(&maker, "J5takerB", "sw0absoffer", "0 1 2 3 4", "b");
         let Next::Message(Incoming::Private { route, .. }) = set.receive(WAIT).await else {

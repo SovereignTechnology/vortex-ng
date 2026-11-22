@@ -423,8 +423,9 @@ struct MakerSlot {
     io: Option<MakerIo>,
 }
 
-/// Most `!pubkey` keys tried per maker; the oldest gives way.
-pub const MAX_PUBKEY_CANDIDATES: usize = 8;
+/// Most `!pubkey` keys answered per maker. The first ones stay and later ones are ignored, so keys harvested
+/// from the maker and delivered after its real one cannot push that one out, and each costs at most one `!auth`.
+pub const MAX_PUBKEY_CANDIDATES: usize = 16;
 
 /// A taker running one CoinJoin.
 pub struct Taker {
@@ -582,7 +583,10 @@ impl Taker {
             .get_mut(from)
             .ok_or_else(|| err(from, "unknown"))?;
         let key = maker_nacl.to_ascii_lowercase();
-        if slot.session.is_some() || slot.candidates.iter().any(|(known, _)| *known == key) {
+        if slot.session.is_some()
+            || slot.candidates.len() >= MAX_PUBKEY_CANDIDATES
+            || slot.candidates.iter().any(|(known, _)| *known == key)
+        {
             return Ok(self.stray());
         }
         let session = self
@@ -592,9 +596,6 @@ impl Taker {
         let body = session
             .encrypt(&revelation)
             .map_err(|e| err(from, e.to_string()))?;
-        if slot.candidates.len() >= MAX_PUBKEY_CANDIDATES {
-            slot.candidates.remove(0);
-        }
         slot.candidates.push((key, session));
         Ok((
             vec![Outgoing::Private {

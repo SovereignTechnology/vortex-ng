@@ -108,6 +108,16 @@ enum Stage {
     Signed(Txid),
 }
 
+impl Stage {
+    /// Seconds a session at this stage may be open, counted from its `!fill`.
+    fn time_limit(&self) -> u64 {
+        match self {
+            Stage::Filled(_) => FILLED_TTL,
+            _ => SESSION_TTL,
+        }
+    }
+}
+
 /// A maker for one pit.
 pub struct Maker {
     config: MakerConfig,
@@ -130,14 +140,18 @@ impl std::fmt::Debug for Maker {
     }
 }
 
-/// Most sessions a maker keeps open at once; further fills are refused until some end.
+/// Most sessions a maker keeps open past `!auth`, each of which proved a coin; further ones are refused until
+/// some end.
 pub const MAX_SESSIONS: usize = 64;
+/// Most sessions waiting for their `!auth`. A `!fill` costs its sender nothing, so these have a table of their
+/// own, large enough that a burst of them does not push out a real taker between its `!fill` and its `!auth`.
+pub const MAX_WAITING_SESSIONS: usize = 4_096;
 /// Seconds a session may take from `!fill` to the end, signed rounds waiting for a `!push` included
 /// (joinmarket-ng's `session_timeout_sec` default). Older sessions are forgotten, so quiet takers and
 /// finished rounds cannot fill the table.
 pub const SESSION_TTL: u64 = 300;
 /// Seconds a session may wait between `!fill` and a valid `!auth`. A `!fill` proves nothing yet, so it must
-/// not hold a place for long, and when the table is full the oldest such session gives way to a new one.
+/// not hold a place for long, and when their table is full a random such session gives way to a new one.
 pub const FILLED_TTL: u64 = 60;
 
 /// Most PoDLE commitments remembered as used, of each kind (see [`Commitments`]); the oldest are forgotten
@@ -354,13 +368,9 @@ impl Maker {
         // Forget sessions past their time before anything else, so they never count against the cap.
         let (sessions, started) = (&mut self.sessions, &mut self.started);
         sessions.retain(|nick, stage| {
-            let limit = match stage {
-                Stage::Filled(_) => FILLED_TTL,
-                _ => SESSION_TTL,
-            };
             started
                 .get(nick)
-                .is_some_and(|at| now.saturating_sub(*at) <= limit)
+                .is_some_and(|at| now.saturating_sub(*at) <= stage.time_limit())
         });
         started.retain(|nick, _| sessions.contains_key(nick));
         let result = match command {
@@ -429,7 +439,15 @@ impl Maker {
         if self.used_commitments.contains(&commitment) {
             return Err(MakerError::Podle("commitment already used".into()));
         }
-        self.make_room()?;
+        // One commitment, one session: a copy under another nick would see our coins on the same proof.
+        if self
+            .sessions
+            .values()
+            .any(|stage| matches!(stage, Stage::Filled(f) if f.commitment == commitment))
+        {
+            return Err(MakerError::Stray("commitment held by another session"));
+        }
+        self.make_room();
         let ours = NaclKeypair::generate();
         let session = ours
             .session(taker_nacl)
@@ -452,28 +470,35 @@ impl Maker {
         Ok(vec![reply])
     }
 
-    /// Room for one more session: when the table is full, the oldest session still waiting for its `!auth`
-    /// gives way. Sessions past `!auth` proved a real coin and are never pushed out.
-    fn make_room(&mut self) -> Result<(), MakerError> {
-        if self.sessions.len() < MAX_SESSIONS {
-            return Ok(());
+    /// Room for one more session waiting for its `!auth`: when their table is full, a random one gives way, so
+    /// a burst of fills cannot aim at the real taker among them. Sessions past `!auth` are never pushed out.
+    fn make_room(&mut self) {
+        let waiting = |stage: &&Stage| matches!(stage, Stage::Filled(_));
+        let count = self.sessions.values().filter(waiting).count();
+        if count < MAX_WAITING_SESSIONS {
+            return;
         }
-        let oldest = self
+        let draw = u32::from_be_bytes(vortex_ng_core::tx::random_bytes::<4>()) as usize;
+        let chosen = self
             .sessions
             .iter()
             .filter(|(_, stage)| matches!(stage, Stage::Filled(_)))
-            .min_by_key(|(nick, _)| self.started.get(*nick).copied().unwrap_or(0))
-            .map(|(nick, _)| nick.clone())
-            .ok_or(MakerError::State("too many open sessions"))?;
-        self.sessions.remove(&oldest);
-        self.started.remove(&oldest);
-        Ok(())
+            .nth(draw % count)
+            .map(|(nick, _)| nick.clone());
+        if let Some(nick) = chosen {
+            self.sessions.remove(&nick);
+            self.started.remove(&nick);
+        }
     }
 
-    /// Whether `nick` has a session open. Its route must not move while it does: a line can be delivered
-    /// again through another channel or directory by anyone who saw it.
-    pub fn in_session(&self, nick: &str) -> bool {
-        self.sessions.contains_key(nick)
+    /// Whether `nick` has a session open at `now`. Its route must not move while it does: a line can be
+    /// delivered again through another channel or directory by anyone who saw it.
+    pub fn in_session(&self, nick: &str, now: u64) -> bool {
+        self.sessions.get(nick).is_some_and(|stage| {
+            self.started
+                .get(nick)
+                .is_some_and(|at| now.saturating_sub(*at) <= stage.time_limit())
+        })
     }
 
     fn on_auth(
@@ -494,9 +519,27 @@ impl Maker {
         // as this step's may end the session.
         let podle = Podle::parse_revelation(&revelation)
             .map_err(|_| MakerError::Stray("auth is not a revelation"))?;
+        let past_auth = self
+            .sessions
+            .values()
+            .filter(|stage| !matches!(stage, Stage::Filled(_)))
+            .count();
+        if past_auth >= MAX_SESSIONS {
+            return Err(MakerError::State("too many open sessions"));
+        }
         let Some(Stage::Filled(filled)) = self.sessions.remove(from) else {
             return Err(MakerError::Stray("auth out of place"));
         };
+        // A commitment shows our coins once. Only the ones we verified count here: one merely announced may
+        // be this very round's, from another of its makers.
+        if self
+            .used_commitments
+            .verified
+            .seen
+            .contains(&filled.commitment)
+        {
+            return Err(MakerError::Podle("commitment already used".into()));
+        }
         let secp = Secp256k1::new();
         podle
             .verify(&secp, &filled.commitment, &self.config.podle_indices)

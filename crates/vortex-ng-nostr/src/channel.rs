@@ -129,18 +129,20 @@ impl Channel for NickClient {
     async fn publish_unlinked(&self, line: &str) -> Result<(), ChannelError> {
         // A fresh nick on its own connection, closed afterwards (the draft's !hp2 rule), reaching the relays
         // the way ours does but on a path of its own: never directly when we are behind a proxy.
-        let throwaway = self.sibling(NickKeys::generate(), CONNECT_TIMEOUT).await?;
-        let event = public_event(
-            throwaway.keys(),
-            self.network(),
-            line,
-            &self.relay_refs(),
-            unix_now(),
-        )?;
-        let result = throwaway.publish(&event).await;
-        throwaway.shutdown().await;
-        result?;
-        Ok(())
+        // On the side: a relay that stalls it must not hold up the driver's loop.
+        let connecting = self.sibling_later(NickKeys::generate(), CONNECT_TIMEOUT);
+        let (network, relays) = (self.network().to_string(), self.relays().to_vec());
+        let line = line.to_string();
+        self.unlinked().spawn(async move {
+            let Ok(throwaway) = connecting.await else {
+                return;
+            };
+            let refs: Vec<&str> = relays.iter().map(String::as_str).collect();
+            if let Ok(event) = public_event(throwaway.keys(), &network, &line, &refs, unix_now()) {
+                let _ = throwaway.publish(&event).await;
+            }
+            throwaway.shutdown().await;
+        })
     }
 
     async fn receive(&mut self, wait: Duration) -> Next<NostrRoute> {

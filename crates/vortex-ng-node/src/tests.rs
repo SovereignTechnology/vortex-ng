@@ -1138,4 +1138,59 @@ fn a_flood_of_orderbook_requests_leaves_room_for_real_takers() {
     assert!(limiter.allow_with(0, "J5winner", next, 0));
     // A nick is answered once per interval.
     assert!(!limiter.allow_with(0, "J5winner", next, 0));
+    // After a quiet stretch the old flood counts for nothing: even the worst draw is answered.
+    let quiet = next + Duration::from_secs(125);
+    assert!(limiter.allow_with(0, "J5after", quiet, u32::MAX - 1));
+}
+
+#[tokio::test]
+async fn a_replayed_offer_does_not_cost_a_maker_its_bond_or_its_route() {
+    use vortex_ng_channel::set::ChannelSet;
+    use vortex_ng_channel::testing::mock_channel;
+    use vortex_ng_core::bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use vortex_ng_core::bond::BondTemplate;
+    use vortex_ng_core::nick::NickIdentity;
+
+    let secp = Secp256k1::new();
+    let key = SecretKey::from_slice(&[7; 32]).unwrap();
+    let outpoint = OutPoint {
+        txid: Txid::from_byte_array([9; 32]),
+        vout: 0,
+    };
+    let bond = BondTemplate::new(&secp, &key, outpoint, 1_893_456_000, 300);
+    let (a, on_a) = mock_channel("J5takerOnA", false);
+    let (b, on_b) = mock_channel("J5takerOnB", false);
+    let mut set = ChannelSet::new(vec![Box::new(a), Box::new(b)]).unwrap();
+    let maker = NickIdentity::generate();
+    let line = |taker: &str| {
+        let proof = bond.proof(&secp, taker, maker.nick()).to_base64().unwrap();
+        format!("0 10000 100000000 0 500!tbond {proof}")
+    };
+    // Its answer to somebody else, delivered first on channel A, even relabelled as a `!fill`.
+    on_a.deliver_private(&maker, "J5takerOnA", "fill", &line("J5someoneElse"), "a");
+    on_a.deliver_private(
+        &maker,
+        "J5takerOnA",
+        "sw0absoffer",
+        &line("J5someoneElse"),
+        "a",
+    );
+    // Its real answer, on channel B.
+    let (later, real_line) = (on_b.clone(), line("J5takerOnB"));
+    let late_maker = maker.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        later.deliver_private(&late_maker, "J5takerOnB", "sw0absoffer", &real_line, "b");
+    });
+    let book = fetch_orderbook(&mut set, "regtest", Duration::from_millis(400))
+        .await
+        .unwrap();
+    assert_eq!(book.offers.len(), 1, "the replay's offer is gone");
+    assert_eq!(set.channel_of(book.route(maker.nick()).unwrap()), 1);
+    let kept = BondProof::from_base64(&book.proofs[maker.nick()]).unwrap();
+    assert!(
+        kept.verify_signatures(&secp, "J5takerOnB", maker.nick())
+            .is_ok(),
+        "the proof made out to us"
+    );
 }

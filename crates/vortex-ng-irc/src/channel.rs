@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufR
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use vortex_ng_channel::socks::{NickConnector, Outbound};
-use vortex_ng_channel::{Channel, ChannelError, Incoming, Next};
+use vortex_ng_channel::{Channel, ChannelError, Incoming, MAX_UNLINKED, Next, SideTasks};
 use vortex_ng_core::bitcoin::secp256k1::Secp256k1;
 use vortex_ng_core::command::{Command, parse_plaintext};
 use vortex_ng_core::line::{sign_line, verify_line};
@@ -35,8 +35,8 @@ use crate::codec::{
 const INBOX: usize = 1_024;
 /// Lines waiting to be sent (a 40,000-byte private message is about 100).
 const OUTBOX: usize = 1_024;
-/// Lines of `!orderbook` answers waiting to be sent, about 40 s at the line rate. They go out only when no
-/// round's line is waiting, and past this they are dropped: anyone can ask for them, for free.
+/// Lines anyone can ask for (see [`is_free_to_ask`]) waiting to be sent, about 40 s at the line rate. They go
+/// out only when no round's line is waiting, and past this they are dropped.
 const BULK_QUEUE: usize = 32;
 #[cfg(test)]
 pub(crate) const BULK_QUEUE_FOR_TESTS: usize = BULK_QUEUE;
@@ -119,9 +119,11 @@ struct Writers {
     bulk: mpsc::Sender<String>,
 }
 
-/// Whether a private line is an answer to `!orderbook`.
-fn is_orderbook_answer(command: &str) -> bool {
-    command.ends_with("offer") || command == "tbond"
+/// Whether a private line is one anyone can get out of us for free: an answer to `!orderbook`, or a maker's
+/// first reply to a `!fill` (`!pubkey`, `!error`), which proves nothing yet. These wait behind the lines of
+/// rounds under way, in a small queue of their own.
+fn is_free_to_ask(command: &str) -> bool {
+    command.ends_with("offer") || matches!(command, "tbond" | "pubkey" | "error")
 }
 
 /// One nick on one IRC server's pit channel. See the module documentation.
@@ -133,6 +135,8 @@ pub struct IrcChannel {
     wants: AtomicU8,
     announced: Mutex<HashMap<Pit, Vec<u64>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Unlinked lines being published.
+    unlinked: SideTasks,
 }
 
 impl std::fmt::Debug for IrcChannel {
@@ -405,6 +409,7 @@ impl IrcChannel {
             wants: AtomicU8::new(0),
             announced: Mutex::new(HashMap::new()),
             tasks: Mutex::new(vec![task]),
+            unlinked: SideTasks::new(MAX_UNLINKED),
         };
         match tokio::time::timeout(timeout + Duration::from_secs(1), ready_rx.recv()).await {
             Ok(Some(Ok(()))) => Ok(channel),
@@ -558,7 +563,7 @@ impl Channel for IrcChannel {
             .ok_or(ChannelError::Invalid("a malformed line"))?;
         let lines = private_lines(to, command, message)
             .ok_or(ChannelError::Invalid("a private line IRC cannot carry"))?;
-        if is_orderbook_answer(command) {
+        if is_free_to_ask(command) {
             self.send_bulk(lines)
         } else {
             self.send_lines(lines)
@@ -593,6 +598,7 @@ impl Channel for IrcChannel {
 
     // A throwaway nick on a way out of its own joins the pit and says it in public, so the line is not tied to
     // the nick that relays it.
+    // On the side: a server that stalls the throwaway nick must not hold up the driver's loop.
     async fn publish_unlinked(&self, line: &str) -> Result<(), ChannelError> {
         let throwaway = NickIdentity::generate();
         let config = IrcConfig {
@@ -600,28 +606,34 @@ impl Channel for IrcChannel {
             network: self.shared.config.network.clone(),
             timeout: self.shared.config.timeout,
         };
-        let temporary = IrcChannel::connect(throwaway, config, &self.outbound).await?;
-        temporary.public(line)?;
-        // The line has to leave the queue before the connection goes.
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let empty = temporary
-                .shared
-                .writer
-                .lock()
-                .ok()
-                .and_then(|w| {
-                    w.as_ref()
-                        .map(|w| w.round.capacity() == w.round.max_capacity())
-                })
-                .unwrap_or(true);
-            if empty {
-                break;
+        let outbound = self.outbound.clone();
+        let line = line.to_string();
+        self.unlinked.spawn(async move {
+            let Ok(temporary) = IrcChannel::connect(throwaway, config, &outbound).await else {
+                return;
+            };
+            if temporary.public(&line).is_ok() {
+                // The line has to leave the queue before the connection goes.
+                for _ in 0..50 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let empty = temporary
+                        .shared
+                        .writer
+                        .lock()
+                        .ok()
+                        .and_then(|w| {
+                            w.as_ref()
+                                .map(|w| w.round.capacity() == w.round.max_capacity())
+                        })
+                        .unwrap_or(true);
+                    if empty {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        temporary.shutdown().await;
-        Ok(())
+            temporary.shutdown().await;
+        })
     }
 
     async fn receive(&mut self, wait: Duration) -> Next<IrcRoute> {

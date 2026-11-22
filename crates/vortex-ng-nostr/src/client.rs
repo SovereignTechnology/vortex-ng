@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::{Stream, StreamExt};
 use nostr::prelude::{Event, EventId, Filter, Kind, Timestamp};
 use nostr_sdk::prelude::{Client, ClientNotification, Proxy};
+use vortex_ng_channel::{MAX_UNLINKED, SideTasks};
 use vortex_ng_core::command::Command;
 use vortex_ng_core::line::PrivMsg;
 use vortex_ng_core::offer::Offer;
@@ -65,6 +66,8 @@ pub struct NickClient {
     notifications: std::sync::Mutex<Pin<Box<dyn Stream<Item = ClientNotification> + Send>>>,
     seen: HashSet<EventId>,
     reassembler: Reassembler,
+    /// Unlinked lines being published.
+    unlinked: SideTasks,
 }
 
 impl std::fmt::Debug for NickClient {
@@ -134,6 +137,7 @@ impl NickClient {
             notifications: std::sync::Mutex::new(notifications),
             seen: HashSet::new(),
             reassembler: Reassembler::new(REASSEMBLY_CAP),
+            unlinked: SideTasks::new(MAX_UNLINKED),
         })
     }
 
@@ -145,7 +149,26 @@ impl NickClient {
         keys: NickKeys,
         timeout: Duration,
     ) -> Result<NickClient, ChannelError> {
-        NickClient::connect_via(keys, &self.network, &self.relays, &self.outbound, timeout).await
+        self.sibling_later(keys, timeout).await
+    }
+
+    /// [`NickClient::sibling`] as a future that borrows nothing, to run on the side.
+    pub(crate) fn sibling_later(
+        &self,
+        keys: NickKeys,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<NickClient, ChannelError>> + Send + 'static {
+        let (network, relays, outbound) = (
+            self.network.clone(),
+            self.relays.clone(),
+            self.outbound.clone(),
+        );
+        async move { NickClient::connect_via(keys, &network, &relays, &outbound, timeout).await }
+    }
+
+    /// The tasks publishing unlinked lines.
+    pub(crate) fn unlinked(&self) -> &SideTasks {
+        &self.unlinked
     }
 
     /// The nick's keys.

@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use vortex_ng_chain::ChainLookup;
 pub use vortex_ng_channel::{Channel, ChannelError, Incoming, Next};
 use vortex_ng_core::bitcoin::Transaction;
+use vortex_ng_core::bitcoin::secp256k1::Secp256k1;
+use vortex_ng_core::bond::BondProof;
 use vortex_ng_core::command::{Command, ENCRYPTED, Outgoing, parse_plaintext};
 use vortex_ng_core::line::PrivMsg;
 use vortex_ng_core::offer::{Offer, Pit};
@@ -161,23 +163,36 @@ async fn deliver<C: Channel>(
     chain: &impl ChainLookup,
     outgoing: Vec<Outgoing>,
 ) -> Result<(), NodeError> {
+    // One line that cannot go must not keep the next one, to another peer, from going.
+    let mut result = Ok(());
     for out in outgoing {
-        match out {
-            Outgoing::Private { to, command, body } => {
-                let route = peers
-                    .get(&to)
-                    .ok_or(ChannelError::Invalid("no route known for the recipient"))?;
-                client.send_private(route, &to, &command, &body).await?
-            }
+        let sent = match out {
+            Outgoing::Private { to, command, body } => match peers.get(&to) {
+                Some(route) => client.send_private(route, &to, &command, &body).await,
+                None => Err(ChannelError::Invalid("no route known for the recipient")),
+            },
             // A taker asked us to broadcast the round we signed for it (`!push`). A failure is its
             // problem to notice (it watches for the transaction and has other makers to ask).
             Outgoing::Broadcast(tx) => {
                 let _ = blocking(|| chain.broadcast(&tx));
+                Ok(())
             }
-            Outgoing::PublicEphemeral(content) => client.publish_unlinked(&content).await?,
+            Outgoing::PublicEphemeral(content) => client.publish_unlinked(&content).await,
+        };
+        if result.is_ok() {
+            result = sent.map_err(NodeError::from);
         }
     }
-    Ok(())
+    result
+}
+
+/// Whether `proof` is a `!tbond` that `maker` made out to `me`. A proof names the taker it is for, so unlike the
+/// rest of a signed line it cannot have been harvested from another exchange and delivered here.
+fn proof_for_us(proof: &str, me: &str, maker: &str) -> bool {
+    BondProof::from_base64(proof).is_ok_and(|p| {
+        p.verify_signatures(&Secp256k1::verification_only(), me, maker)
+            .is_ok()
+    })
 }
 
 /// Learn how to reach `nick`. A private line is the authoritative route and replaces what was known; a
@@ -229,10 +244,13 @@ impl OrderbookLimiter {
 
     /// [`Self::allow`] with the random draw given.
     fn allow_with(&mut self, channel: usize, nick: &str, now: Instant, draw: u32) -> bool {
-        if now.duration_since(self.window) >= Duration::from_secs(60) {
+        let elapsed = now.duration_since(self.window);
+        if elapsed >= Duration::from_secs(60) {
             self.window = now;
+            // After a quiet minute, a flood before it says nothing about the minute starting now.
+            let quiet = elapsed >= Duration::from_secs(120);
             for budget in self.channels.values_mut() {
-                budget.asked_before = budget.asked;
+                budget.asked_before = if quiet { 0 } else { budget.asked };
                 budget.asked = 0;
                 budget.answered = 0;
             }
@@ -311,7 +329,8 @@ fn maker_step<C: Channel>(
     incoming: Incoming<C::Route>,
 ) -> Vec<Outgoing> {
     if peers.len() >= MAX_KNOWN_PEERS {
-        peers.retain(|nick, _| maker.in_session(nick));
+        let now = unix_now();
+        peers.retain(|nick, _| maker.in_session(nick, now));
     }
     match incoming {
         Incoming::Public {
@@ -339,7 +358,7 @@ fn maker_step<C: Channel>(
         }
         Incoming::Private { msg, route } => {
             // A session keeps the route it started on: its lines can be delivered again by another way.
-            let settled = maker.in_session(&msg.from);
+            let settled = maker.in_session(&msg.from, unix_now());
             remember(peers, &msg.from, &route, !settled);
             let mut out = Vec::new();
             for cmd in commands(&msg) {
@@ -576,8 +595,10 @@ pub async fn fetch_orderbook<C: Channel>(
     let mut asked = Instant::now();
     let mut book = Orderbook::default();
     let mut per_nick: HashMap<String, usize> = HashMap::new();
-    // The channel each maker first answered on: its route, whatever is delivered later or elsewhere.
-    let mut answered_on: HashMap<String, usize> = HashMap::new();
+    // The channel each maker answered on, and whether that answer carried a bond proof made out to us. The
+    // first answer sets the route. Anyone can deliver a maker's old signed offer first, so a later answer with
+    // such a proof, which only the maker can have made, replaces one without.
+    let mut answered: HashMap<String, (usize, bool)> = HashMap::new();
     let gather_until = Instant::now() + gather;
     while let Some(left) = gather_until.checked_duration_since(Instant::now()) {
         match client.receive(left).await {
@@ -597,30 +618,46 @@ pub async fn fetch_orderbook<C: Channel>(
                     continue;
                 }
                 let channel = client.channel_of(&route);
-                if answered_on.get(&msg.from).is_some_and(|c| *c != channel) {
-                    continue;
+                let line = commands(&msg);
+                let has_offer = line.iter().any(|c| matches!(c, Command::Offer(_)));
+                let proof = line.iter().find_map(|c| match c {
+                    Command::Tbond(proof) => Some(proof.clone()),
+                    _ => None,
+                });
+                let proven = proof
+                    .as_deref()
+                    .is_some_and(|p| proof_for_us(p, client.nick_on(&route), &msg.from));
+                match answered.get(&msg.from).copied() {
+                    // The first answer with a proof for us: what came before it may have been a replay.
+                    Some((_, false)) if proven && has_offer => {
+                        book.offers.retain(|(nick, _)| *nick != msg.from);
+                        per_nick.remove(&msg.from);
+                        answered.remove(&msg.from);
+                    }
+                    Some((on, was_proven)) if on != channel || (was_proven && !proven) => continue,
+                    _ => {}
                 }
-                let first = !answered_on.contains_key(&msg.from);
-                // Only a nick that answers with offers is remembered, and its `!tbond` kept: senders of
-                // anything else cannot grow the taker's state.
-                for cmd in commands(&msg) {
-                    match cmd {
-                        Command::Offer(offer) => {
-                            let count = per_nick.entry(msg.from.clone()).or_default();
-                            if *count < MAX_OFFERS_PER_NICK {
-                                *count += 1;
-                                book.offers.push((msg.from.clone(), offer));
-                            }
-                            answered_on.entry(msg.from.clone()).or_insert(channel);
+                let first = !answered.contains_key(&msg.from);
+                // Only a nick that answers with offers is remembered, and only a proof made out to us
+                // kept: senders of anything else cannot grow the taker's state.
+                for cmd in line {
+                    if let Command::Offer(offer) = cmd {
+                        let count = per_nick.entry(msg.from.clone()).or_default();
+                        if *count < MAX_OFFERS_PER_NICK {
+                            *count += 1;
+                            book.offers.push((msg.from.clone(), offer));
                         }
-                        Command::Tbond(proof) if per_nick.contains_key(&msg.from) => {
-                            book.proofs.entry(msg.from.clone()).or_insert(proof);
-                        }
-                        _ => {}
+                        answered.entry(msg.from.clone()).or_insert((channel, false));
                     }
                 }
-                if first && per_nick.contains_key(&msg.from) {
-                    remember(&mut book.peers, &msg.from, &route, true);
+                if let Some(entry) = answered.get_mut(&msg.from) {
+                    entry.1 |= proven;
+                    if let (true, Some(proof)) = (proven, proof) {
+                        book.proofs.entry(msg.from.clone()).or_insert(proof);
+                    }
+                    if first {
+                        remember(&mut book.peers, &msg.from, &route, true);
+                    }
                 }
             }
             Next::Message(Incoming::Public { .. }) => {}
@@ -685,7 +722,8 @@ pub async fn run_taker<C: Channel>(
             }
             let (outgoing, progress) =
                 blocking(|| taker.handle(&msg.from, cmd, chain)).map_err(NodeError::Taker)?;
-            deliver(client, &peers, chain, outgoing).await?;
+            // A line that could not go (a full queue, say) does not end the round: the deadline does.
+            let _ = deliver(client, &peers, chain, outgoing).await;
             if progress == Progress::MakersSigned {
                 return taker.finish(wallet).map_err(NodeError::Taker);
             }

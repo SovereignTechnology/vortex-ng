@@ -212,14 +212,12 @@ impl Reassembler {
                 if last {
                     return (piece.len() <= MAX_MESSAGE).then(|| piece.to_string());
                 }
+                // Not the oldest: that is usually a long real message, which a burst of first pieces could
+                // then always push out. The map's order is one a sender cannot predict.
                 if self.pending.len() >= MAX_PENDING
-                    && let Some(oldest) = self
-                        .pending
-                        .iter()
-                        .min_by_key(|(_, (_, at))| *at)
-                        .map(|(nick, _)| nick.clone())
+                    && let Some(nick) = self.pending.keys().next().cloned()
                 {
-                    self.pending.remove(&oldest);
+                    self.pending.remove(&nick);
                 }
                 (piece.to_string(), now)
             }
@@ -442,7 +440,7 @@ mod tests {
             let _ = r.push(&format!("N{i}"), "!auth x ;", now);
         }
         assert_eq!(r.pending(), MAX_PENDING);
-        // A message in one piece still gets through, and a new sender takes the oldest one's place.
+        // A message in one piece still gets through, and a new sender takes another's place.
         assert_eq!(
             r.push("Nfree", "!pubkey x ~", now).as_deref(),
             Some("!pubkey x")

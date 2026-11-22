@@ -56,7 +56,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use vortex_ng_channel::socks::{BoxedStream, NickConnector, Outbound};
-use vortex_ng_channel::{Channel, ChannelError, Incoming, Next};
+use vortex_ng_channel::{Channel, ChannelError, Incoming, MAX_UNLINKED, Next, SideTasks};
 use vortex_ng_core::bitcoin::hashes::{Hash, sha256};
 use vortex_ng_core::bitcoin::hex::DisplayHex;
 use vortex_ng_core::bitcoin::secp256k1::Secp256k1;
@@ -89,7 +89,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(600);
 const NICK_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// The domain JoinMarket-NG's nick-authentication proof ends with (JMP-0005).
 const NICK_AUTH_DOMAIN: &[u8] = b"nick-auth-v1";
-/// Most peer locations remembered.
+/// Most peer locations remembered from each directory, so one cannot crowd out what the others said.
 const MAX_LOCATIONS: usize = 10_000;
 /// How long a peer location is trusted after a directory named it.
 const LOCATION_TTL: Duration = Duration::from_secs(3_600);
@@ -240,8 +240,8 @@ struct Shared {
     writers: Vec<Mutex<Option<mpsc::Sender<String>>>>,
     inbox: mpsc::Sender<(Via, u64, String)>,
     stop: AtomicBool,
-    /// Where peers serve, as each directory named them: (directory, nick) -> (host, port, when).
-    locations: Mutex<Locations>,
+    /// Where peers serve, as each directory named them.
+    locations: Mutex<Vec<Locations>>,
     /// Connections we opened: nick -> writer.
     links: Mutex<HashMap<String, mpsc::Sender<String>>>,
     /// Connections peers opened to us: id -> (claimed nick, writer).
@@ -253,8 +253,8 @@ struct Shared {
     location: Option<String>,
 }
 
-/// Where peers serve: (directory, nick) -> (host, port, when the directory said so).
-type Locations = HashMap<(usize, String), (String, u16, Instant)>;
+/// Where peers serve, as one directory said: nick -> (host, port, when it said so).
+type Locations = HashMap<String, (String, u16, Instant)>;
 
 /// A place in a bounded count, given back when dropped (a task that is aborted gives it back too).
 struct Slot(Arc<AtomicUsize>);
@@ -283,30 +283,32 @@ impl Shared {
             return;
         }
         let entries = parse_peerlist(line, self.config.peers == PeerPolicy::Local);
-        let Ok(mut locations) = self.locations.lock() else {
+        let Ok(mut all) = self.locations.lock() else {
+            return;
+        };
+        let Some(locations) = all.get_mut(directory) else {
             return;
         };
         let now = Instant::now();
         for entry in entries {
-            let key = (directory, entry.nick);
             if entry.gone {
-                locations.remove(&key);
+                locations.remove(&entry.nick);
                 continue;
             }
-            if locations.len() >= MAX_LOCATIONS && !locations.contains_key(&key) {
+            if locations.len() >= MAX_LOCATIONS && !locations.contains_key(&entry.nick) {
                 locations.retain(|_, (_, _, at)| now.duration_since(*at) < LOCATION_TTL);
                 if locations.len() >= MAX_LOCATIONS {
                     continue;
                 }
             }
-            locations.insert(key, (entry.host, entry.port, now));
+            locations.insert(entry.nick, (entry.host, entry.port, now));
         }
     }
 
     /// Where `nick` serves, if directory `directory` said so recently.
     fn location(&self, directory: usize, nick: &str) -> Option<(String, u16)> {
-        let locations = self.locations.lock().ok()?;
-        let (host, port, at) = locations.get(&(directory, nick.to_string()))?;
+        let all = self.locations.lock().ok()?;
+        let (host, port, at) = all.get(directory)?.get(nick)?;
         (at.elapsed() < LOCATION_TTL).then(|| (host.clone(), *port))
     }
 
@@ -356,6 +358,8 @@ pub struct OnionChannel {
     wants: AtomicU8,
     announced: Mutex<HashMap<Pit, Vec<u64>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Unlinked lines being published.
+    unlinked: SideTasks,
     /// The onion service, while we serve through Tor.
     _service: Option<control::OnionService>,
 }
@@ -635,7 +639,7 @@ impl OnionChannel {
             connector: outbound.connector(),
             inbox: inbox_tx,
             stop: AtomicBool::new(false),
-            locations: Mutex::new(HashMap::new()),
+            locations: Mutex::new((0..count).map(|_| HashMap::new()).collect()),
             links: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
             next_inbound: AtomicU64::new(0),
@@ -657,6 +661,7 @@ impl OnionChannel {
             wants: AtomicU8::new(0),
             announced: Mutex::new(HashMap::new()),
             tasks: Mutex::new(tasks),
+            unlinked: SideTasks::new(MAX_UNLINKED),
             _service: service,
         };
         let deadline = tokio::time::Instant::now() + timeout + Duration::from_secs(1);
@@ -943,39 +948,41 @@ impl Channel for OnionChannel {
         Ok(())
     }
 
+    // On the side: a directory that stalls the throwaway nick must not hold up the driver's loop.
     async fn publish_unlinked(&self, line: &str) -> Result<(), ChannelError> {
         // A fresh nick on a way out of its own, for each directory; nothing about it leads back to ours.
         let throwaway = NickIdentity::generate();
         let connector = Arc::new(self.outbound.connector());
         let public = public_line(throwaway.nick(), line);
-        let mut tasks = Vec::new();
-        for directory in self.shared.config.directories.clone() {
-            let (connector, throwaway, public) =
-                (Arc::clone(&connector), throwaway.clone(), public.clone());
-            let (network, timeout) = (
-                self.shared.config.network.clone(),
-                self.shared.config.timeout,
-            );
-            tasks.push(tokio::spawn(async move {
-                let sent = async {
-                    let (_reader, mut writer) =
-                        open(&connector, &directory, &throwaway, &network, None).await?;
-                    write_line(&mut writer, PUBMSG, &public).await?;
-                    let _ = writer.shutdown().await;
-                    Ok::<(), String>(())
-                };
-                matches!(tokio::time::timeout(timeout, sent).await, Ok(Ok(())))
-            }));
-        }
-        let mut any = false;
-        for task in tasks {
-            any |= task.await.unwrap_or(false);
-        }
-        if any {
-            Ok(())
-        } else {
-            Err(transport("no directory took the unlinked line"))
-        }
+        let directories = self.shared.config.directories.clone();
+        let (network, timeout) = (
+            self.shared.config.network.clone(),
+            self.shared.config.timeout,
+        );
+        self.unlinked.spawn(async move {
+            let mut tasks = Vec::new();
+            for directory in directories {
+                let (connector, throwaway, public, network) = (
+                    Arc::clone(&connector),
+                    throwaway.clone(),
+                    public.clone(),
+                    network.clone(),
+                );
+                tasks.push(tokio::spawn(async move {
+                    let sent = async {
+                        let (_reader, mut writer) =
+                            open(&connector, &directory, &throwaway, &network, None).await?;
+                        write_line(&mut writer, PUBMSG, &public).await?;
+                        let _ = writer.shutdown().await;
+                        Ok::<(), String>(())
+                    };
+                    let _ = tokio::time::timeout(timeout, sent).await;
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        })
     }
 
     async fn receive(&mut self, wait: Duration) -> Next<OnionRoute> {

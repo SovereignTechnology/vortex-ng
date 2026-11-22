@@ -204,27 +204,28 @@ async fn a_rounds_lines_go_before_orderbook_answers() {
     let maker = join(&irc).await;
     let taker = join(&irc).await;
     let route = crate::IrcRoute;
-    // A queue of answers to `!orderbook`, then a line of a round.
+    // A queue of what anyone can ask for (answers to `!orderbook`, replies to `!fill`), then a line of a
+    // round that has proved a coin.
     for i in 0..4 {
+        let (command, body) = if i % 2 == 0 {
+            ("sw0absoffer", format!("{i} 10000 100000 0 500"))
+        } else {
+            ("pubkey", "ab".repeat(32))
+        };
         maker
-            .send_private(
-                &route,
-                taker.nick(),
-                "sw0absoffer",
-                &format!("{i} 10000 100000 0 500"),
-            )
+            .send_private(&route, taker.nick(), command, &body)
             .await
             .unwrap();
     }
     maker
-        .send_private(&route, taker.nick(), "pubkey", &"ab".repeat(32))
+        .send_private(&route, taker.nick(), "ioauth", "QUJD")
         .await
         .unwrap();
     let order = || -> Vec<bool> {
         irc.received()
             .iter()
             .filter(|(from, line)| from == maker.nick() && line.starts_with("PRIVMSG J"))
-            .map(|(_, line)| line.contains("!pubkey "))
+            .map(|(_, line)| line.contains("!ioauth "))
             .collect()
     };
     for _ in 0..80 {
