@@ -284,8 +284,9 @@ pub fn read_client_hello(line: &str, network: &str) -> Result<String, WireError>
 }
 
 /// Check a peer's answer to our handshake on a direct connection (JoinMarket-NG sends one; joinmarket-clientserver
-/// accepts silently): JoinMarket, not a directory, protocol version 5, the same network.
-pub fn read_peer_hello(line: &str, network: &str) -> Result<(), WireError> {
+/// accepts silently): JoinMarket, not a directory, protocol version 5, the same network, and the nick we
+/// meant to reach.
+pub fn read_peer_hello(line: &str, network: &str, nick: &str) -> Result<(), WireError> {
     let value: Value =
         serde_json::from_str(line).map_err(|_| WireError("handshake is not JSON"))?;
     let object = value
@@ -302,6 +303,9 @@ pub fn read_peer_hello(line: &str, network: &str) -> Result<(), WireError> {
     }
     if object.get("network").and_then(Value::as_str) != Some(network) {
         return Err(WireError("the peer is on another network"));
+    }
+    if object.get("nick").and_then(Value::as_str) != Some(nick) {
+        return Err(WireError("another nick answers at that location"));
     }
     let version = |key: &str| object.get(key).and_then(Value::as_u64);
     let supported = match (
@@ -444,20 +448,22 @@ mod tests {
     #[test]
     fn a_peer_answer_is_checked() {
         let ng = r#"{"app-name":"joinmarket","directory":false,"location-string":"NOT-SERVING-ONION","proto-ver":5,"features":{},"nick":"J5x","network":"regtest"}"#;
-        assert!(read_peer_hello(ng, "regtest").is_ok());
-        assert!(read_peer_hello(ng, "testnet").is_err());
+        assert!(read_peer_hello(ng, "regtest", "J5x").is_ok());
+        assert!(read_peer_hello(ng, "regtest", "J5other").is_err());
+        assert!(read_peer_hello(ng, "testnet", "J5x").is_err());
         let directory = ng.replace(r#""directory":false"#, r#""directory":true"#);
-        assert!(read_peer_hello(&directory, "regtest").is_err());
+        assert!(read_peer_hello(&directory, "regtest", "J5x").is_err());
         let refused = ng.replace(r#""features":{}"#, r#""features":{},"accepted":false"#);
-        assert!(read_peer_hello(&refused, "regtest").is_err());
+        assert!(read_peer_hello(&refused, "regtest", "J5x").is_err());
         assert!(
             read_peer_hello(
                 &ng.replace(r#""proto-ver":5"#, r#""proto-ver":4"#),
-                "regtest"
+                "regtest",
+                "J5x"
             )
             .is_err()
         );
-        assert!(read_peer_hello("[]", "regtest").is_err());
+        assert!(read_peer_hello("[]", "regtest", "J5x").is_err());
     }
 
     #[test]

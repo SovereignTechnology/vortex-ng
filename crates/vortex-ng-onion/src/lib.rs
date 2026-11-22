@@ -12,7 +12,9 @@
 //! request). When a taker has chosen its makers ([`Channel::prepare`]), the channel connects to each one that
 //! serves an onion, on a way out of its own (its own Tor circuit), says its handshake, and from then on sends
 //! that maker's private lines there and reads the maker's answers there; the directory no longer sees them. A
-//! connection that fails or drops leaves the lines to the directories.
+//! connection that fails or drops leaves the lines to the directories. Only the directory a maker answered
+//! through is believed about where that maker is: it could already see or drop those lines, while another
+//! directory naming a location would gain a way into them.
 //!
 //! Serving (a maker's, issue #46, [`Serve`]): the channel listens on `127.0.0.1` and says where in its
 //! handshakes, so directories name it in peer lists and takers can connect to it. On regtest the loopback
@@ -20,8 +22,15 @@
 //! as an ephemeral onion through Tor's control port ([`control`]). An inbound peer gets 10 s to say a valid
 //! handshake and gets ours back (joinmarket-clientserver counts a peer as handshaked only once it has had
 //! the peer's handshake, whichever side connected), then may send private lines in its own nick only, at a
-//! bounded rate; at most 32 connections are open and 16 handshakes pending at once. This is the project's
-//! only inbound listener (ADR 0007).
+//! bounded rate, and is dropped after 5 minutes of silence; at most 32 connections are open and 16 handshakes
+//! pending at once. The nick in a handshake proves nothing, so a connection is never chosen for a nick: an
+//! answer goes back on it only when the line being answered, signed by that nick, came in on it.
+//!
+//! That is not yet enough to serve in public, and the commands do not: a line's signature does not cover its
+//! recipient, so a maker chosen for a round can hand the taker's signed `!fill` to another maker over a
+//! connection of its own and take that session's place. Serving outside regtest needs a challenge the nick
+//! key answers, which JoinMarket's peers do not speak today. This is the project's only inbound listener
+//! (ADR 0007).
 //!
 //! Each directory has a task that connects (through the nick's own [`NickConnector`], so a Tor daemon gives
 //! this nick circuits of its own), does the handshake (and JoinMarket-NG's nick authentication, JMP-0005,
@@ -35,7 +44,7 @@ pub mod wire;
 pub mod testing;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -98,6 +107,8 @@ const INBOUND_HELLO: Duration = Duration::from_secs(10);
 const MAX_PENDING_INBOUND: usize = 16;
 /// Most lines a direct connection may carry per minute before it is closed.
 const MAX_LINK_LINES_PER_MINUTE: u32 = 600;
+/// A direct connection silent this long is closed.
+const LINK_IDLE: Duration = Duration::from_secs(300);
 
 fn transport(e: impl std::fmt::Display) -> ChannelError {
     ChannelError::Transport(format!("onion directory: {e}"))
@@ -179,7 +190,10 @@ pub enum Serve {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Via {
     Directory(usize),
+    /// A connection we opened to this nick.
     Peer(String),
+    /// A connection a peer opened to us, claiming this nick.
+    Inbound(u64, String),
 }
 
 /// The directory or direct connection a line came through; an answer goes back the most direct way open.
@@ -226,19 +240,45 @@ struct Shared {
     writers: Vec<Mutex<Option<mpsc::Sender<String>>>>,
     inbox: mpsc::Sender<(Via, u64, String)>,
     stop: AtomicBool,
-    /// Where peers serve, as directories named them: nick -> (host, port, when).
-    locations: Mutex<HashMap<String, (String, u16, Instant)>>,
-    /// Open direct connections: nick -> writer.
+    /// Where peers serve, as each directory named them: (directory, nick) -> (host, port, when).
+    locations: Mutex<Locations>,
+    /// Connections we opened: nick -> writer.
     links: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    /// Connections peers opened to us: id -> (claimed nick, writer).
+    inbound: Mutex<HashMap<u64, (String, mpsc::Sender<String>)>>,
+    next_inbound: AtomicU64,
     /// The tasks of the direct connections.
     link_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Where we serve, if we do.
     location: Option<String>,
 }
 
+/// Where peers serve: (directory, nick) -> (host, port, when the directory said so).
+type Locations = HashMap<(usize, String), (String, u16, Instant)>;
+
+/// A place in a bounded count, given back when dropped (a task that is aborted gives it back too).
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(count: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
+        count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()?;
+        Some(Slot(Arc::clone(count)))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Shared {
-    /// Take in a directory's peer list.
-    fn learn(&self, line: &str) {
+    /// Take in directory `directory`'s peer list.
+    fn learn(&self, directory: usize, line: &str) {
         if self.config.peers == PeerPolicy::Relay {
             return;
         }
@@ -248,25 +288,33 @@ impl Shared {
         };
         let now = Instant::now();
         for entry in entries {
+            let key = (directory, entry.nick);
             if entry.gone {
-                locations.remove(&entry.nick);
+                locations.remove(&key);
                 continue;
             }
-            if locations.len() >= MAX_LOCATIONS && !locations.contains_key(&entry.nick) {
+            if locations.len() >= MAX_LOCATIONS && !locations.contains_key(&key) {
                 locations.retain(|_, (_, _, at)| now.duration_since(*at) < LOCATION_TTL);
                 if locations.len() >= MAX_LOCATIONS {
                     continue;
                 }
             }
-            locations.insert(entry.nick, (entry.host, entry.port, now));
+            locations.insert(key, (entry.host, entry.port, now));
         }
     }
 
-    /// Where `nick` serves, if a directory said so recently.
-    fn location(&self, nick: &str) -> Option<(String, u16)> {
+    /// Where `nick` serves, if directory `directory` said so recently.
+    fn location(&self, directory: usize, nick: &str) -> Option<(String, u16)> {
         let locations = self.locations.lock().ok()?;
-        let (host, port, at) = locations.get(nick)?;
+        let (host, port, at) = locations.get(&(directory, nick.to_string()))?;
         (at.elapsed() < LOCATION_TTL).then(|| (host.clone(), *port))
+    }
+
+    /// The writer of the inbound connection `id`, if it is open and claims `nick`.
+    fn inbound_link(&self, id: u64, nick: &str) -> Option<mpsc::Sender<String>> {
+        let inbound = self.inbound.lock().ok()?;
+        let (claimed, writer) = inbound.get(&id)?;
+        (claimed == nick && !writer.is_closed()).then(|| writer.clone())
     }
 
     /// The writer of the direct connection to `nick`, if one is open.
@@ -277,13 +325,18 @@ impl Shared {
 
     /// How many direct connections are open.
     fn link_count(&self) -> usize {
-        self.links.lock().map(|l| l.len()).unwrap_or(MAX_LINKS)
+        let outbound = self.links.lock().map(|l| l.len()).unwrap_or(MAX_LINKS);
+        let inbound = self.inbound.lock().map(|l| l.len()).unwrap_or(MAX_LINKS);
+        outbound + inbound
     }
 
     /// Close every direct connection.
     fn close_links(&self) {
         if let Ok(mut links) = self.links.lock() {
             links.clear();
+        }
+        if let Ok(mut inbound) = self.inbound.lock() {
+            inbound.clear();
         }
         if let Ok(mut tasks) = self.link_tasks.lock() {
             for task in tasks.drain(..) {
@@ -506,7 +559,7 @@ async fn session(
                     break Ok(());
                 }
             }
-            Ok((PEERLIST, line)) => shared.learn(&line),
+            Ok((PEERLIST, line)) => shared.learn(index, &line),
             Ok((PING, _)) => {
                 if let Ok(pong) = encode(PONG, "") {
                     let _ = out_tx.try_send(pong);
@@ -584,6 +637,8 @@ impl OnionChannel {
             stop: AtomicBool::new(false),
             locations: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
+            inbound: Mutex::new(HashMap::new()),
+            next_inbound: AtomicU64::new(0),
             link_tasks: Mutex::new(Vec::new()),
             location,
         });
@@ -677,7 +732,7 @@ impl OnionChannel {
         if kind == PRIVMSG {
             let msg =
                 verify_line(&Secp256k1::verification_only(), line, ONION_HOSTID, nick).ok()?;
-            if let Via::Peer(peer) = &via
+            if let Via::Peer(peer) | Via::Inbound(_, peer) = &via
                 && msg.from != *peer
             {
                 return None;
@@ -687,7 +742,7 @@ impl OnionChannel {
                 route: OnionRoute { via },
             });
         }
-        if matches!(via, Via::Peer(_)) {
+        if !matches!(via, Via::Directory(_)) {
             return None;
         }
         let route = OnionRoute { via };
@@ -759,7 +814,12 @@ impl Channel for OnionChannel {
         .map_err(ChannelError::Line)?;
         // A direct connection first; then the directory the peer's line came through, which holds its
         // connection; then any other.
-        if let Some(link) = self.shared.link(to) {
+        let direct = match &route.via {
+            // A connection someone opened to us is used only for the nick whose signed line came in on it.
+            Via::Inbound(id, _) => self.shared.inbound_link(*id, to),
+            _ => self.shared.link(to),
+        };
+        if let Some(link) = direct {
             let encoded = encode(PRIVMSG, &line).map_err(|e| ChannelError::Invalid(e.0))?;
             if link.try_send(encoded).is_ok() {
                 return Ok(());
@@ -767,7 +827,7 @@ impl Channel for OnionChannel {
         }
         let sent = match &route.via {
             Via::Directory(index) => self.send_to(*index, PRIVMSG, &line),
-            Via::Peer(_) => Err(transport("no directory named")),
+            _ => Err(transport("no directory named")),
         };
         match sent {
             Ok(()) => Ok(()),
@@ -780,34 +840,40 @@ impl Channel for OnionChannel {
         if self.shared.config.peers == PeerPolicy::Relay {
             return;
         }
-        let wanted: Vec<&str> = peers
+        // Each maker with the directory it answered through: the one believed about where it is.
+        let wanted: Vec<(&str, usize)> = peers
             .iter()
-            .map(|(nick, _)| nick.as_str())
-            .filter(|nick| self.shared.link(nick).is_none())
+            .filter_map(|(nick, route)| match route.via {
+                Via::Directory(index) => Some((nick.as_str(), index)),
+                _ => None,
+            })
+            .filter(|(nick, _)| self.shared.link(nick).is_none())
             .collect();
         if wanted.is_empty() {
             return;
         }
-        // Ask the directories for peers they have not named yet (JoinMarket-NG's answer; joinmarket-clientserver's
-        // ignore it, and name a peer when they relay its line).
-        if wanted
-            .iter()
-            .any(|nick| self.shared.location(nick).is_none())
-        {
-            let _ = self.send_all(GETPEERLIST, "");
+        // Ask those directories for peers they have not named yet (JoinMarket-NG's answer;
+        // joinmarket-clientserver's ignore it, and name a peer when they relay its line).
+        let unknown = |shared: &Shared| {
+            wanted
+                .iter()
+                .any(|(nick, index)| shared.location(*index, nick).is_none())
+        };
+        if unknown(&self.shared) {
+            let asked: std::collections::HashSet<usize> =
+                wanted.iter().map(|(_, index)| *index).collect();
+            for index in asked {
+                let _ = self.send_to(index, GETPEERLIST, "");
+            }
             let until = Instant::now() + LOCATION_WAIT;
-            while Instant::now() < until
-                && wanted
-                    .iter()
-                    .any(|nick| self.shared.location(nick).is_none())
-            {
+            while Instant::now() < until && unknown(&self.shared) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
         let limit = self.shared.config.timeout.min(PREPARE_LIMIT);
         let mut attempts = Vec::new();
-        for nick in wanted {
-            let Some((host, port)) = self.shared.location(nick) else {
+        for (nick, index) in wanted {
+            let Some((host, port)) = self.shared.location(index, nick) else {
                 continue;
             };
             if self.shared.link_count() + attempts.len() >= MAX_LINKS {
@@ -825,6 +891,7 @@ impl Channel for OnionChannel {
                         port,
                         &shared.identity,
                         &shared.config.network,
+                        &nick,
                     ),
                 )
                 .await;
@@ -838,7 +905,14 @@ impl Channel for OnionChannel {
             let Ok(Some((nick, reader, writer, first))) = attempt.await else {
                 continue;
             };
-            start_link(Arc::clone(&self.shared), nick, reader, writer, first);
+            start_link(
+                Arc::clone(&self.shared),
+                Via::Peer(nick),
+                reader,
+                writer,
+                first,
+                None,
+            );
         }
     }
 
@@ -947,18 +1021,26 @@ impl Channel for OnionChannel {
 
 /// Take inbound direct connections until the channel stops.
 async fn accept_peers(shared: Arc<Shared>, listener: TcpListener) {
+    let open = Arc::new(AtomicUsize::new(0));
     let pending = Arc::new(AtomicUsize::new(0));
-    while let Ok((conn, _)) = listener.accept().await {
+    loop {
+        let conn = match listener.accept().await {
+            Ok((conn, _)) => conn,
+            // Out of file descriptors, a connection reset before we took it: the listener stays.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
-        if shared.link_count() >= MAX_LINKS || pending.load(Ordering::SeqCst) >= MAX_PENDING_INBOUND
-        {
-            drop(conn);
+        let Some(place) = Slot::take(&open, MAX_LINKS) else {
             continue;
-        }
-        pending.fetch_add(1, Ordering::SeqCst);
-        let (shared, pending) = (Arc::clone(&shared), Arc::clone(&pending));
+        };
+        let Some(in_hello) = Slot::take(&pending, MAX_PENDING_INBOUND) else {
+            continue;
+        };
         let task_shared = Arc::clone(&shared);
         let task = tokio::spawn(async move {
             let shared = task_shared;
@@ -966,15 +1048,13 @@ async fn accept_peers(shared: Arc<Shared>, listener: TcpListener) {
             let (read, mut writer) = tokio::io::split(stream);
             let mut reader = BufReader::new(read);
             let hello = tokio::time::timeout(INBOUND_HELLO, read_line(&mut reader)).await;
-            pending.fetch_sub(1, Ordering::SeqCst);
             let Ok(Ok((HANDSHAKE, line))) = hello else {
                 return;
             };
             let Ok(nick) = read_client_hello(&line, &shared.config.network) else {
                 return;
             };
-            // Our own nick, or a peer already connected: the first connection stays.
-            if nick == shared.identity.nick() || shared.link(&nick).is_some() {
+            if nick == shared.identity.nick() {
                 return;
             }
             let ours = wire::client_handshake(
@@ -983,10 +1063,21 @@ async fn accept_peers(shared: Arc<Shared>, listener: TcpListener) {
                 &[],
                 shared.location.as_deref(),
             );
-            if write_line(&mut writer, HANDSHAKE, &ours).await.is_err() {
+            let answered =
+                tokio::time::timeout(INBOUND_HELLO, write_line(&mut writer, HANDSHAKE, &ours));
+            if !matches!(answered.await, Ok(Ok(()))) {
                 return;
             }
-            start_link(Arc::clone(&shared), nick, reader, writer, None);
+            drop(in_hello);
+            let id = shared.next_inbound.fetch_add(1, Ordering::SeqCst);
+            start_link(
+                Arc::clone(&shared),
+                Via::Inbound(id, nick),
+                reader,
+                writer,
+                None,
+                Some(place),
+            );
         });
         if let Ok(mut tasks) = shared.link_tasks.lock() {
             tasks.retain(|t| !t.is_finished());
@@ -1003,6 +1094,7 @@ async fn open_peer(
     port: u16,
     identity: &NickIdentity,
     network: &str,
+    expected: &str,
 ) -> Result<(Reader, Writer, Option<(u64, String)>), String> {
     let stream = connector
         .connect(host, port)
@@ -1017,7 +1109,7 @@ async fn open_peer(
         Err(_) => None,
         Ok(Err(e)) => return Err(e),
         Ok(Ok((HANDSHAKE, line))) => {
-            read_peer_hello(&line, network).map_err(|e| e.to_string())?;
+            read_peer_hello(&line, network, expected).map_err(|e| e.to_string())?;
             None
         }
         Ok(Ok(other)) => Some(other),
@@ -1025,18 +1117,30 @@ async fn open_peer(
     Ok((reader, write, first))
 }
 
-/// Keep a direct connection to `nick`: its writer goes into the shared links, its reader hands that peer's
-/// private lines on, at most [`MAX_LINK_LINES_PER_MINUTE`]. The connection is forgotten when it drops.
+/// Keep a direct connection (`via`: [`Via::Peer`] or [`Via::Inbound`]): its writer is registered, its reader
+/// hands that peer's private lines on, at most [`MAX_LINK_LINES_PER_MINUTE`], until it drops or stays silent
+/// for [`LINK_IDLE`]. `place` is the connection's place in the inbound count, held until then.
 fn start_link(
     shared: Arc<Shared>,
-    nick: String,
+    via: Via,
     mut reader: Reader,
     mut writer: Writer,
     first: Option<(u64, String)>,
+    place: Option<Slot>,
 ) {
     let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOX);
-    if let Ok(mut links) = shared.links.lock() {
-        links.insert(nick.clone(), out_tx.clone());
+    match &via {
+        Via::Peer(nick) => {
+            if let Ok(mut links) = shared.links.lock() {
+                links.insert(nick.clone(), out_tx.clone());
+            }
+        }
+        Via::Inbound(id, nick) => {
+            if let Ok(mut inbound) = shared.inbound.lock() {
+                inbound.insert(*id, (nick.clone(), out_tx.clone()));
+            }
+        }
+        Via::Directory(_) => return,
     }
     let write_task = tokio::spawn(async move {
         while let Some(line) = out_rx.recv().await {
@@ -1049,14 +1153,15 @@ fn start_link(
     let task_shared = Arc::clone(&shared);
     let read_task = tokio::spawn(async move {
         let shared = task_shared;
+        let _place = place;
         let mut next = first;
         let (mut window, mut lines) = (Instant::now(), 0u32);
         loop {
             let (kind, line) = match next.take() {
                 Some(item) => item,
-                None => match read_line(&mut reader).await {
-                    Ok(item) => item,
-                    Err(_) => break,
+                None => match tokio::time::timeout(LINK_IDLE, read_line(&mut reader)).await {
+                    Ok(Ok(item)) => item,
+                    _ => break,
                 },
             };
             if window.elapsed() >= Duration::from_secs(60) {
@@ -1068,12 +1173,7 @@ fn start_link(
             }
             match kind {
                 PRIVMSG => {
-                    if shared
-                        .inbox
-                        .send((Via::Peer(nick.clone()), kind, line))
-                        .await
-                        .is_err()
-                    {
+                    if shared.inbox.send((via.clone(), kind, line)).await.is_err() {
                         break;
                     }
                 }
@@ -1086,10 +1186,20 @@ fn start_link(
                 _ => {}
             }
         }
-        if let Ok(mut links) = shared.links.lock()
-            && links.get(&nick).is_some_and(|w| w.same_channel(&out_tx))
-        {
-            links.remove(&nick);
+        match &via {
+            Via::Peer(nick) => {
+                if let Ok(mut links) = shared.links.lock()
+                    && links.get(nick).is_some_and(|w| w.same_channel(&out_tx))
+                {
+                    links.remove(nick);
+                }
+            }
+            Via::Inbound(id, _) => {
+                if let Ok(mut inbound) = shared.inbound.lock() {
+                    inbound.remove(id);
+                }
+            }
+            Via::Directory(_) => {}
         }
     });
     if let Ok(mut tasks) = shared.link_tasks.lock() {

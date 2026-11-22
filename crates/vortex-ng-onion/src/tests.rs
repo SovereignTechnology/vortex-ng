@@ -530,3 +530,129 @@ async fn inbound_peers_are_held_to_their_handshake() {
         Next::Timeout
     ));
 }
+
+#[tokio::test]
+async fn a_stranger_claiming_a_nick_gets_none_of_its_lines() {
+    use tokio::net::TcpStream;
+
+    let directory = TestDirectory::start("regtest", None).await;
+    let identity = NickIdentity::generate();
+    let mut maker = serving_maker(&directory, identity.clone()).await;
+    maker.listen(false, true).await.unwrap();
+    let location = maker.location().unwrap().to_string();
+    // The real taker, on the directory, with a route to the maker.
+    let taker = NickIdentity::generate();
+    let mut cfg = config(&[&directory], "regtest");
+    cfg.peers = PeerPolicy::Relay;
+    let taker_channel = OnionChannel::connect(taker.clone(), cfg, &Outbound::Direct)
+        .await
+        .unwrap();
+    settled(&[&directory], 2).await;
+    // A stranger connects to the maker claiming the taker's nick, and more than once: no place is held.
+    let mut strangers = Vec::new();
+    for _ in 0..2 {
+        let mut conn = TcpStream::connect(&location).await.unwrap();
+        let hello = encode(
+            HANDSHAKE,
+            &wire::client_handshake(taker.nick(), "regtest", &[], None),
+        )
+        .unwrap();
+        conn.write_all(hello.as_bytes()).await.unwrap();
+        strangers.push(conn);
+    }
+    assert!(eventually(|| maker.direct() == 2).await);
+    // The taker's line comes by the directory, so the answer goes back by the directory.
+    let fill = sign_line(
+        &Secp256k1::signing_only(),
+        taker.secret(),
+        identity.nick(),
+        "fill",
+        "0 50000 abc",
+        ONION_HOSTID,
+    )
+    .unwrap();
+    assert!(directory.send(identity.nick(), PRIVMSG, &fill));
+    let Next::Message(Incoming::Private { route, .. }) = maker.receive(WAIT).await else {
+        panic!("the fill")
+    };
+    maker
+        .send_private(&route, taker.nick(), "pubkey", &"ab".repeat(32))
+        .await
+        .unwrap();
+    assert!(
+        eventually(|| directory
+            .received()
+            .iter()
+            .any(|(from, kind, line)| from == identity.nick()
+                && *kind == PRIVMSG
+                && line.contains("!pubkey ")))
+        .await
+    );
+    // The strangers got our handshake and nothing else.
+    for conn in &mut strangers {
+        let mut reader = BufReader::new(conn);
+        let (kind, _) = tokio::time::timeout(WAIT, read_line(&mut reader))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, HANDSHAKE);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), read_line(&mut reader))
+                .await
+                .is_err()
+        );
+    }
+    drop(taker_channel);
+}
+
+#[tokio::test]
+async fn only_the_directory_a_maker_answered_through_is_believed_about_it() {
+    let honest = TestDirectory::start("regtest", None).await;
+    let other = TestDirectory::start("regtest", None).await;
+    let maker = NickIdentity::generate();
+    let trap = TestPeer::start("regtest", maker.nick(), true).await;
+    let mut cfg = config(&[&honest, &other], "regtest");
+    cfg.peers = PeerPolicy::Local;
+    let mut taker = OnionChannel::connect(NickIdentity::generate(), cfg, &Outbound::Direct)
+        .await
+        .unwrap();
+    taker.listen(true, false).await.unwrap();
+    settled(&[&honest, &other], 1).await;
+    // The other directory says the maker is at the trap; the maker's answer came through the honest one.
+    assert!(other.send(
+        taker.nick(),
+        PEERLIST,
+        &format!("{};{}", maker.nick(), trap.location())
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let offer = sign_line(
+        &Secp256k1::signing_only(),
+        maker.secret(),
+        taker.nick(),
+        "sw0absoffer",
+        "0 10000 100000 0 500",
+        ONION_HOSTID,
+    )
+    .unwrap();
+    assert!(honest.send(taker.nick(), PRIVMSG, &offer));
+    let Next::Message(Incoming::Private { route, .. }) = taker.receive(WAIT).await else {
+        panic!("the offer")
+    };
+    taker
+        .prepare(&[(maker.nick().to_string(), route.clone())])
+        .await;
+    assert!(trap.handshakes().is_empty());
+    assert_eq!(taker.direct(), 0);
+}
+
+#[tokio::test]
+async fn another_nick_answering_at_a_location_is_not_linked() {
+    let directory = TestDirectory::start("regtest", None).await;
+    let maker = NickIdentity::generate();
+    let impostor = TestPeer::start("regtest", "J5impostorOOOOOO", true).await;
+    let (taker, route) = taker_with_route(&directory, &maker, Some(impostor.location())).await;
+    taker
+        .prepare(&[(maker.nick().to_string(), route.clone())])
+        .await;
+    assert_eq!(taker.direct(), 0);
+}
