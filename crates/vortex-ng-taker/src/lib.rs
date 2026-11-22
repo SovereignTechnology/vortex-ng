@@ -27,7 +27,7 @@ use vortex_ng_core::offer::{Offer, Pit};
 use vortex_ng_core::podle::{Podle, generate};
 use vortex_ng_core::protocol::MAKER_CHANGE_THRESHOLD_SAT;
 use vortex_ng_core::script::{taproot_output_secret, wsh0_script_pubkey};
-use vortex_ng_core::sig::verify_sig;
+use vortex_ng_core::sig::{InputSigner, verify_sig};
 use vortex_ng_core::sigmsg;
 use vortex_ng_core::tx::{random_u64, shuffle};
 use vortex_ng_wallet::PitWallet;
@@ -347,6 +347,36 @@ pub fn choose_coins(cfg: &TakerConfig, mut coins: Vec<Coin>) -> Result<Vec<Coin>
             }
         }
     }
+}
+
+/// Choose coins held outside this wallet (a Lightning node's), largest first, until they cover the amount
+/// and [`estimated_cost`]. Unlike [`choose_coins`], none of them has to be fit to commit to: the node cannot
+/// prove a PoDLE, so the commitment comes from another coin.
+pub fn choose_external(
+    cfg: &TakerConfig,
+    mut coins: Vec<(OutPoint, TxOut)>,
+) -> Result<Vec<(OutPoint, TxOut)>, TakerError> {
+    coins.sort_by_key(|(_, out)| std::cmp::Reverse(out.value));
+    let mut chosen = Vec::new();
+    let mut have = 0u64;
+    for coin in coins {
+        have = have.saturating_add(coin.1.value.to_sat());
+        chosen.push(coin);
+        let need =
+            cfg.amount
+                .saturating_add(estimated_cost(cfg, chosen.len(), ASSUMED_MAKER_INPUTS));
+        if have >= need {
+            return Ok(chosen);
+        }
+    }
+    let need = cfg.amount.saturating_add(estimated_cost(
+        cfg,
+        chosen.len().max(1),
+        ASSUMED_MAKER_INPUTS,
+    ));
+    Err(TakerError::Funds(format!(
+        "the coins hold {have} sat; the round needs about {need}"
+    )))
 }
 
 /// The PoDLE for one of our UTXOs (`tr0` uses the BIP86 output secret, `wsh0` adds the cosigner).
@@ -864,7 +894,10 @@ impl Taker {
 
     /// Sign our own inputs (after every maker's, and after any channel's `funding_signed`) and return the
     /// complete transaction.
-    pub fn finish(&mut self, wallet: &PitWallet) -> Result<Transaction, TakerError> {
+    pub fn finish(
+        &mut self,
+        signer: &(impl InputSigner + ?Sized),
+    ) -> Result<Transaction, TakerError> {
         let mut tx = self
             .tx
             .clone()
@@ -879,9 +912,9 @@ impl Taker {
             return Err(TakerError::Internal("makers have not all signed".into()));
         }
         let ours: Vec<OutPoint> = self.inputs.iter().map(|(o, _)| *o).collect();
-        let signed = wallet
-            .sign_inputs(self.mixdepth, &tx, &self.prevouts, &ours)
-            .map_err(|e| TakerError::Internal(e.to_string()))?;
+        let signed = signer
+            .sign_own_inputs(self.mixdepth, &tx, &self.prevouts, &ours)
+            .map_err(TakerError::Internal)?;
         if signed.len() != ours.len() {
             return Err(TakerError::Internal(
                 "could not sign every input of ours".into(),
@@ -889,6 +922,17 @@ impl Taker {
         }
         let secp = Secp256k1::verification_only();
         for (index, payload) in signed {
+            // A signer outside this process answers for our inputs and no others: a witness it returned
+            // for a maker's input must not replace the maker's.
+            if !tx
+                .input
+                .get(index)
+                .is_some_and(|input| ours.contains(&input.previous_output))
+            {
+                return Err(TakerError::Internal(format!(
+                    "the signer answered for input {index}, which is not ours"
+                )));
+            }
             let witness = verify_sig(&secp, self.cfg.pit, &payload, &tx, index, &self.prevouts)
                 .map_err(|e| TakerError::Internal(e.to_string()))?;
             self.witnesses.insert(index, witness);

@@ -152,6 +152,14 @@ async fn taker_with_joinmarket_ng_makers() {
     let sink = sink();
     rpc.generate_to_address(1, &taker_wallet.next_receive_address(0).unwrap())
         .unwrap();
+    // `VORTEX_NG_INTEROP_COMMIT_ELSEWHERE=1`: the commitment comes from a coin that is not an input of the
+    // round, as when a Lightning node's wallet holds the inputs and cannot prove a PoDLE (ADR 0008).
+    let commit_elsewhere =
+        std::env::var("VORTEX_NG_INTEROP_COMMIT_ELSEWHERE").is_ok_and(|v| v == "1");
+    if commit_elsewhere {
+        rpc.generate_to_address(1, &taker_wallet.next_receive_address(3).unwrap())
+            .unwrap();
+    }
     if harness.bonds {
         let mnemonics = std::env::var("VORTEX_NG_INTEROP_BOND_MNEMONICS").expect("bond mnemonics");
         for mnemonic in mnemonics.split('|') {
@@ -173,7 +181,11 @@ async fn taker_with_joinmarket_ng_makers() {
     wait_for_makers(&url, harness.makers, Duration::from_secs(900)).await;
 
     let utxo = taker_wallet.utxos(0).unwrap().remove(0);
-    let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+    let committed = commit_elsewhere.then(|| taker_wallet.utxos(3).unwrap().remove(0));
+    let podle = match &committed {
+        Some(coin) => podle_for(&taker_wallet, 3, coin, 0).unwrap(),
+        None => podle_for(&taker_wallet, 0, &utxo, 0).unwrap(),
+    };
     let cfg = TakerConfig {
         pit: harness.pit,
         network: Network::Regtest,
@@ -248,6 +260,16 @@ async fn taker_with_joinmarket_ng_makers() {
         harness.makers + 1
     );
     assert_pit_outputs(&tx, harness.pit);
+    if let Some(coin) = &committed {
+        assert!(
+            tx.input
+                .iter()
+                .all(|input| input.previous_output != coin.outpoint),
+            "the coin committed to is not an input"
+        );
+        assert!(rpc.utxo(&coin.outpoint).unwrap().is_some());
+        println!("joinmarket-ng's makers took a commitment to a coin outside the round");
+    }
     taker_wallet.sync(&rpc, 0).unwrap();
     assert_eq!(
         taker_wallet.confirmed_balance(1).unwrap(),

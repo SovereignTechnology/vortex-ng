@@ -19,6 +19,7 @@ use vortex_ng_core::command::{Command, ENCRYPTED, Outgoing, parse_plaintext};
 use vortex_ng_core::line::{PrivMsg, sign_line};
 use vortex_ng_core::offer::{Offer, Pit};
 use vortex_ng_core::protocol::{MAKER_CHANGE_THRESHOLD_SAT, NOSTR_HOSTID};
+use vortex_ng_core::sig::InputSigner;
 use vortex_ng_maker::Maker;
 use vortex_ng_nostr::ChannelError;
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
@@ -28,7 +29,6 @@ use vortex_ng_taker::{
     Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, select_makers,
     verify_bond,
 };
-use vortex_ng_wallet::PitWallet;
 use vortex_ng_wallet::sync::BlockSource;
 
 /// Lifetime of a maker's offer event, seconds.
@@ -625,7 +625,7 @@ pub async fn fetch_orderbook(
 /// after every maker; channel funding hooks in before `Taker::finish`).
 pub async fn run_taker(
     taker: &mut Taker,
-    wallet: &PitWallet,
+    signer: &(impl InputSigner + ?Sized),
     client: &mut NickClient,
     chain: &impl ChainLookup,
     cfg: &TakerConfig,
@@ -660,7 +660,7 @@ pub async fn run_taker(
                 blocking(|| taker.handle(&msg.from, cmd, chain)).map_err(NodeError::Taker)?;
             deliver(client, network, &peers, chain, outgoing).await?;
             if progress == Progress::MakersSigned {
-                return taker.finish(wallet).map_err(NodeError::Taker);
+                return blocking(|| taker.finish(signer)).map_err(NodeError::Taker);
             }
         }
     }

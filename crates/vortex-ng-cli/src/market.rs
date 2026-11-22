@@ -10,6 +10,7 @@ use vortex_ng_core::bitcoin::{Address, Network, OutPoint, TxOut};
 use vortex_ng_core::bond::BondValueParams;
 use vortex_ng_core::lnclose::CloseEvidence;
 use vortex_ng_core::offer::{CjFee, Offer, RelativeFee};
+use vortex_ng_core::sig::InputSigner;
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{
     CONNECT_TIMEOUT, MAX_BOND_LOOKUPS, MakerReport, MakerService, NodeError, OfferFee, OfferPolicy,
@@ -27,7 +28,7 @@ use vortex_ng_wallet::{MIXDEPTHS, PitWallet};
 use crate::args::Args;
 use crate::podle_log::PodleLog;
 use crate::wallet::{failed, network_name, parse};
-use crate::{Failure, secret, wallet};
+use crate::{Failure, lightning, secret, wallet};
 
 /// Relays a nick connects to at most.
 const MAX_RELAYS: usize = 8;
@@ -353,7 +354,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
 }
 
 /// A taker's failure in plain words.
-fn taker_failed(error: TakerError) -> Failure {
+pub(crate) fn taker_failed(error: TakerError) -> Failure {
     match error {
         TakerError::Funds(why) => failed(why),
         TakerError::Maker(nick, why) => failed(format!("maker {nick}: {why}")),
@@ -362,7 +363,11 @@ fn taker_failed(error: TakerError) -> Failure {
 }
 
 /// The wallet's confirmed coins in `mixdepth`, with their depth at `height`.
-fn confirmed_coins(wallet: &PitWallet, mixdepth: u32, height: u32) -> Result<Vec<Coin>, Failure> {
+pub(crate) fn confirmed_coins(
+    wallet: &PitWallet,
+    mixdepth: u32,
+    height: u32,
+) -> Result<Vec<Coin>, Failure> {
     Ok(confirmed_coins_with_origin(wallet, mixdepth, height)?
         .into_iter()
         .map(|(coin, _)| coin)
@@ -487,6 +492,54 @@ pub(crate) fn balance(rest: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The coins of `mixdepth` for a round, and a commitment to one of them.
+fn wallet_coins(
+    args: &Args,
+    cfg: &TakerConfig,
+    pit_wallet: &PitWallet,
+    mixdepth: u32,
+    height: u32,
+    log: &PodleLog,
+) -> Result<(Vec<(OutPoint, TxOut)>, vortex_ng_core::podle::Podle), Failure> {
+    let mut candidates = confirmed_coins_with_origin(pit_wallet, mixdepth, height)?;
+    if args.flag("from-closes") {
+        // Only coins a channel close paid the wallet: they are not merged with coins of another history.
+        candidates.retain(|(_, origin)| origin.is_some());
+        if candidates.is_empty() {
+            return Err(failed(format!(
+                "no confirmed coin from a channel close in mixdepth {mixdepth}: `vortex-ng coins \
+                 --closes-only` lists them (a close needs a wallet address as its delivery address, \
+                 and a force close its sweep, to show up here)"
+            )));
+        }
+    }
+    let chosen = choose_coins(cfg, candidates.into_iter().map(|(coin, _)| coin).collect())
+        .map_err(taker_failed)?;
+    // The first commitment of the chosen coins that was never sent: three per coin (NUMS indices 0-2).
+    let mut podle = None;
+    'coins: for coin in chosen.iter().filter(|coin| coin.fit_to_commit(cfg.amount)) {
+        for index in 0..3u8 {
+            let candidate =
+                podle_for(pit_wallet, mixdepth, &coin.utxo, index).map_err(taker_failed)?;
+            if !log.contains(&candidate.commitment()) {
+                podle = Some(candidate);
+                break 'coins;
+            }
+        }
+    }
+    let Some(podle) = podle else {
+        return Err(failed(
+            "every commitment of the chosen coins has been used (three per coin, spent even by a round \
+             that failed): use another mixdepth, or wait for other coins to reach 5 confirmations",
+        ));
+    };
+    let inputs = chosen
+        .iter()
+        .map(|coin| (coin.utxo.outpoint, coin.utxo.txout.clone()))
+        .collect();
+    Ok((inputs, podle))
+}
+
 /// `vortex-ng coinjoin`: one CoinJoin as the taker.
 pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let mut valued = vec![
@@ -504,11 +557,17 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         "proxy",
     ];
     valued.extend(RPC_OPTIONS);
+    valued.extend(lightning::OPTIONS);
     let args = parse(
         rest,
         &valued,
-        &["yes", "allow-bondless-fees", "from-closes"],
+        &["yes", "allow-bondless-fees", "from-closes", "from-lnd"],
     )?;
+    if args.flag("from-closes") && args.flag("from-lnd") {
+        return Err(usage(
+            "`--from-closes` spends this wallet's close coins, `--from-lnd` the LND node's: one or the other",
+        ));
+    }
     let relays = relays(&args)?;
     let (pit, pit_name) = wallet::pit(&args)?;
     let amount = match args.sats("amount").map_err(Failure::Usage)? {
@@ -567,38 +626,25 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         bond_params: BondValueParams::default(),
     };
 
-    let mut candidates = confirmed_coins_with_origin(&pit_wallet, mixdepth, height)?;
-    if args.flag("from-closes") {
-        // Only coins a channel close paid the wallet: they are not merged with coins of another history.
-        candidates.retain(|(_, origin)| origin.is_some());
-        if candidates.is_empty() {
-            return Err(failed(format!(
-                "no confirmed coin from a channel close in mixdepth {mixdepth}: `vortex-ng coins \
-                 --closes-only` lists them (a close needs a wallet address as its delivery address, \
-                 and a force close its sweep, to show up here)"
-            )));
-        }
-    }
-    let chosen = choose_coins(&cfg, candidates.into_iter().map(|(coin, _)| coin).collect())
-        .map_err(taker_failed)?;
-    // The first commitment of the chosen coins that was never sent: three per coin (NUMS indices 0-2).
     let mut log = PodleLog::open(wallet_path).map_err(failed)?;
-    let mut podle = None;
-    'coins: for coin in chosen.iter().filter(|coin| coin.fit_to_commit(amount)) {
-        for index in 0..3u8 {
-            let candidate =
-                podle_for(&pit_wallet, mixdepth, &coin.utxo, index).map_err(taker_failed)?;
-            if !log.contains(&candidate.commitment()) {
-                podle = Some(candidate);
-                break 'coins;
-            }
+    let lnd = if args.flag("from-lnd") {
+        Some(lightning::connect(&args, network)?)
+    } else {
+        None
+    };
+    let (inputs, podle, committed_sats) = match &lnd {
+        Some(lnd) => {
+            let selection = lightning::select(lnd, &cfg, &pit_wallet, height, &log)?;
+            (
+                selection.inputs,
+                selection.podle,
+                Some(selection.committed_sats),
+            )
         }
-    }
-    let Some(podle) = podle else {
-        return Err(failed(
-            "every commitment of the chosen coins has been used (three per coin, spent even by a round \
-             that failed): use another mixdepth, or wait for other coins to reach 5 confirmations",
-        ));
+        None => {
+            let (inputs, podle) = wallet_coins(&args, &cfg, &pit_wallet, mixdepth, height, &log)?;
+            (inputs, podle, None)
+        }
     };
 
     let (cj_script, to) = match args.get("destination") {
@@ -624,21 +670,26 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         .next_change_address(mixdepth)
         .map_err(failed)?
         .script_pubkey();
-    let inputs: Vec<(OutPoint, TxOut)> = chosen
-        .iter()
-        .map(|coin| (coin.utxo.outpoint, coin.utxo.txout.clone()))
-        .collect();
     let total: u64 = inputs.iter().map(|(_, out)| out.value.to_sat()).sum();
     println!(
-        "CoinJoin of {amount} sat in the {pit_name} pit with {makers} makers, from mixdepth {mixdepth} \
-         ({} coin(s){}, {total} sat), to {to}.",
-        inputs.len(),
-        if args.flag("from-closes") {
-            ", channel closes only"
+        "CoinJoin of {amount} sat in the {pit_name} pit with {makers} makers, from {} ({} coin(s), \
+         {total} sat), to {to}.",
+        if lnd.is_some() {
+            "the LND node's channel closes".to_string()
+        } else if args.flag("from-closes") {
+            format!("mixdepth {mixdepth}, channel closes only")
         } else {
-            ""
-        }
+            format!("mixdepth {mixdepth}")
+        },
+        inputs.len(),
     );
+    if let Some(sats) = committed_sats {
+        println!(
+            "Change goes to mixdepth {mixdepth} of this wallet. The node cannot prove a commitment, so one \
+             comes from a {sats} sat coin of this wallet: the makers see that coin, and can link it to \
+             this round."
+        );
+    }
     println!(
         "Each maker's fee is at most {max_maker_fee} sat; mining fee rate {} sat/vB; makers without a \
          fidelity bond {}.",
@@ -653,8 +704,18 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         return Err(failed("not confirmed: nothing was sent"));
     }
 
+    // The node keeps these coins for the round; if the round fails, dropping the lease gives them back.
+    let outpoints: Vec<OutPoint> = inputs.iter().map(|(outpoint, _)| *outpoint).collect();
+    let lease = match &lnd {
+        Some(lnd) => Some(lnd.lease(&outpoints).map_err(failed)?),
+        None => None,
+    };
     // From here the commitment counts as used, whatever becomes of the round.
     log.record(&podle.commitment()).map_err(failed)?;
+    let signer: &dyn InputSigner = match &lnd {
+        Some(lnd) => lnd,
+        None => &pit_wallet,
+    };
     let mut taker = Taker::new(
         cfg.clone(),
         mixdepth,
@@ -679,7 +740,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         let gather = Duration::from_secs(wait.into());
         let round = run_taker(
             &mut taker,
-            &pit_wallet,
+            signer,
             &mut client,
             &chain,
             &cfg,
@@ -700,6 +761,9 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         )));
     }
     let txid = chain.broadcast(&tx).map_err(failed)?;
+    if let Some(lease) = lease {
+        lease.keep();
+    }
     let kept: u64 = tx
         .output
         .iter()

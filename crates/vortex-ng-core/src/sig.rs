@@ -77,6 +77,21 @@ pub fn encode_tr0(sig: &schnorr::Signature, output_key: &XOnlyPublicKey) -> Stri
     STANDARD.encode(out)
 }
 
+/// Who signs a taker's own inputs: its wallet, or a Lightning node whose wallet holds the coins and never
+/// hands out a key.
+pub trait InputSigner {
+    /// Sign the inputs of `tx` that spend `declared`, given every input's prevout in order, and return
+    /// `(input index, !sig payload)` for each. Nothing else in `tx` may be signed. `mixdepth` is the
+    /// wallet's account for the coins, and means nothing to a signer without mixdepths.
+    fn sign_own_inputs(
+        &self,
+        mixdepth: u32,
+        tx: &Transaction,
+        prevouts: &[TxOut],
+        declared: &[bitcoin::OutPoint],
+    ) -> Result<Vec<(usize, String)>, String>;
+}
+
 /// The `wsh0` payload: both signatures in the witness script's key order, then the script.
 pub fn encode_wsh0(
     sig1: &ecdsa::Signature,

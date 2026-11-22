@@ -19,7 +19,7 @@ use vortex_ng_core::bitcoin::{
 use vortex_ng_core::offer::Pit;
 use vortex_ng_maker::MakerConfig;
 use vortex_ng_taker::podle_for;
-use vortex_ng_wallet::Seed;
+use vortex_ng_wallet::{PitWallet, Seed};
 
 use super::*;
 

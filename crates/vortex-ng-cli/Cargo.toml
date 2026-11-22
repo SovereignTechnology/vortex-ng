@@ -15,6 +15,7 @@ workspace = true
 vortex-ng-core = { workspace = true }
 vortex-ng-wallet = { workspace = true }
 vortex-ng-chain = { workspace = true }
+vortex-ng-ln = { workspace = true }
 vortex-ng-nostr = { workspace = true }
 vortex-ng-maker = { workspace = true }
 vortex-ng-taker = { workspace = true }

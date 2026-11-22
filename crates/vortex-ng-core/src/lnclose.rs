@@ -151,7 +151,7 @@ fn is_taproot_delayed_script(script: &[u8]) -> bool {
 
 /// A taproot control block: the leaf version `0xc0` (parity bit aside), the internal key, then hashes.
 fn is_control_block(bytes: &[u8]) -> bool {
-    bytes.len() >= 33 && (bytes.len() - 33) % 32 == 0 && bytes[0] & 0xfe == 0xc0
+    bytes.len() >= 33 && (bytes.len() - 33).is_multiple_of(32) && bytes[0] & 0xfe == 0xc0
 }
 
 /// Whether one input's witness sweeps an output a force close left behind: `Some(taproot)` if it does.
