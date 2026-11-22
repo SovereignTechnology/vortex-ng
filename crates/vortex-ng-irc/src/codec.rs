@@ -208,8 +208,18 @@ impl Reassembler {
                 if !piece.starts_with('!') {
                     return None;
                 }
-                if self.pending.len() >= MAX_PENDING {
-                    return None;
+                // A message in one piece needs no room, so a full table cannot hold it up.
+                if last {
+                    return (piece.len() <= MAX_MESSAGE).then(|| piece.to_string());
+                }
+                if self.pending.len() >= MAX_PENDING
+                    && let Some(oldest) = self
+                        .pending
+                        .iter()
+                        .min_by_key(|(_, (_, at))| *at)
+                        .map(|(nick, _)| nick.clone())
+                {
+                    self.pending.remove(&oldest);
                 }
                 (piece.to_string(), now)
             }
@@ -432,6 +442,21 @@ mod tests {
             let _ = r.push(&format!("N{i}"), "!auth x ;", now);
         }
         assert_eq!(r.pending(), MAX_PENDING);
+        // A message in one piece still gets through, and a new sender takes the oldest one's place.
+        assert_eq!(
+            r.push("Nfree", "!pubkey x ~", now).as_deref(),
+            Some("!pubkey x")
+        );
+        assert_eq!(
+            r.push("Nnew", "!auth x ;", now + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(r.pending(), MAX_PENDING);
+        assert_eq!(
+            r.push("Nnew", "y ~", now + Duration::from_secs(1))
+                .as_deref(),
+            Some("!auth xy")
+        );
     }
 
     #[test]

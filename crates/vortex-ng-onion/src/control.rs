@@ -1,12 +1,14 @@
 //! Just enough of Tor's control protocol (control-spec.txt) to publish an ephemeral onion service: a maker's
 //! address for direct connections (issue #46).
 //!
-//! `PROTOCOLINFO`, then `AUTHENTICATE` with the cookie Tor names (method `COOKIE`) or with nothing (method
-//! `NULL`), then `ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port=<virtual>,127.0.0.1:<local>`. The service
+//! `PROTOCOLINFO`, then `AUTHENTICATE` with the configured cookie file (method `COOKIE`) or with nothing
+//! (method `NULL`), then `ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port=<virtual>,127.0.0.1:<local>`. The service
 //! lives as long as the control connection: [`OnionService`] keeps it open, and dropping it removes the
 //! service. The key is discarded: a new address each time, which is what a nick that changes each run wants.
-//! `SAFECOOKIE` and password authentication are not supported; configure Tor with `CookieAuthentication 1`
-//! (offers `COOKIE`) and make the cookie readable.
+//! A path the port itself names is never read: whatever answered on that port could otherwise have any
+//! 32-byte file sent to it. `COOKIE` still shows the cookie to whatever listens on the port, so this must move
+//! to `SAFECOOKIE` before the commands use it. `SAFECOOKIE` and password authentication are not supported yet;
+//! configure Tor with `CookieAuthentication 1` (offers `COOKIE`) and make the cookie readable.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -33,7 +35,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct TorControl {
     /// The control port, normally `127.0.0.1:9051`.
     pub addr: SocketAddr,
-    /// The authentication cookie, when Tor's `PROTOCOLINFO` should not be trusted to name it.
+    /// The authentication cookie file, needed for method `COOKIE`.
     pub cookie: Option<PathBuf>,
 }
 
@@ -72,7 +74,7 @@ async fn command(control: &mut Control, line: &str) -> Result<Vec<String>, Strin
             return Err("the control port closed or sent too long a line".into());
         }
         let text = String::from_utf8_lossy(&buf).trim_end().to_string();
-        if text.len() < 4 || lines.len() >= MAX_REPLY_LINES {
+        if !text.is_ascii() || text.len() < 4 || lines.len() >= MAX_REPLY_LINES {
             return Err("a malformed control reply".into());
         }
         let (code, rest) = text.split_at(3);
@@ -99,10 +101,6 @@ async fn authenticate(control: &mut Control, config: &TorControl) -> Result<(), 
         .find_map(|field| field.strip_prefix("METHODS="))
         .map(|m| m.split(',').collect())
         .unwrap_or_default();
-    let named = auth
-        .split_once("COOKIEFILE=\"")
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(path, _)| PathBuf::from(path.replace("\\\\", "\\")));
     if methods.contains(&"NULL") {
         command(control, "AUTHENTICATE").await?;
         return Ok(());
@@ -111,8 +109,7 @@ async fn authenticate(control: &mut Control, config: &TorControl) -> Result<(), 
         let path = config
             .cookie
             .clone()
-            .or(named)
-            .ok_or("Tor names no cookie file")?;
+            .ok_or("no cookie file is configured")?;
         // 32 bytes, read once.
         let cookie =
             std::fs::read(&path).map_err(|e| format!("the cookie {}: {e}", path.display()))?;
@@ -226,6 +223,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reply_that_is_not_ascii_is_an_error() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = conn.read(&mut buf).await;
+            conn.write_all(b"ab\xc3\xa9 reply\r\n").await.unwrap();
+        });
+        let config = TorControl { addr, cookie: None };
+        assert!(publish(&config, 1).await.is_err());
+    }
+
+    #[tokio::test]
     async fn an_onion_is_published_with_null_or_cookie_authentication() {
         let (addr, seen) = fake_control("NULL", None).await;
         let service = publish(&TorControl { addr, cookie: None }, 18_082)
@@ -243,14 +254,31 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cookie = dir.join("control.authcookie");
         std::fs::write(&cookie, [7u8; 32]).unwrap();
-        let (addr, seen) =
-            fake_control("COOKIE,SAFECOOKIE", Some(cookie.display().to_string())).await;
-        publish(&TorControl { addr, cookie: None }, 1)
-            .await
-            .unwrap();
+        // The configured file is what is read.
+        let (addr, seen) = fake_control("COOKIE,SAFECOOKIE", None).await;
+        let config = TorControl {
+            addr,
+            cookie: Some(cookie.clone()),
+        };
+        publish(&config, 1).await.unwrap();
         assert_eq!(
             seen.lock().unwrap()[1],
             format!("AUTHENTICATE {}", "07".repeat(32))
+        );
+        // A path the port names is not: nothing of that file goes back to it.
+        let (addr, seen) =
+            fake_control("COOKIE,SAFECOOKIE", Some(cookie.display().to_string())).await;
+        assert!(
+            publish(&TorControl { addr, cookie: None }, 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("AUTHENTICATE"))
         );
         std::fs::remove_dir_all(&dir).unwrap();
 

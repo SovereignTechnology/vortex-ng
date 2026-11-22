@@ -197,3 +197,60 @@ async fn an_unlinked_line_comes_from_a_stranger() {
     assert_ne!(nick, maker.nick());
     assert!(matches!(commands.as_slice(), [Command::Hp2(_)]));
 }
+
+#[tokio::test]
+async fn a_rounds_lines_go_before_orderbook_answers() {
+    let irc = TestIrc::start(Some("TestNet")).await;
+    let maker = join(&irc).await;
+    let taker = join(&irc).await;
+    let route = crate::IrcRoute;
+    // A queue of answers to `!orderbook`, then a line of a round.
+    for i in 0..4 {
+        maker
+            .send_private(
+                &route,
+                taker.nick(),
+                "sw0absoffer",
+                &format!("{i} 10000 100000 0 500"),
+            )
+            .await
+            .unwrap();
+    }
+    maker
+        .send_private(&route, taker.nick(), "pubkey", &"ab".repeat(32))
+        .await
+        .unwrap();
+    let order = || -> Vec<bool> {
+        irc.received()
+            .iter()
+            .filter(|(from, line)| from == maker.nick() && line.starts_with("PRIVMSG J"))
+            .map(|(_, line)| line.contains("!pubkey "))
+            .collect()
+    };
+    for _ in 0..80 {
+        if order().contains(&true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let seen = order();
+    let at = seen
+        .iter()
+        .position(|is_round| *is_round)
+        .expect("the round's line");
+    assert!(at <= 1, "the round's line went out as line {at}: {seen:?}");
+    // Past its small queue, an answer is refused rather than queued for minutes.
+    let mut refused = false;
+    for i in 0..(super::channel::BULK_QUEUE_FOR_TESTS + 2) {
+        refused |= maker
+            .send_private(
+                &route,
+                taker.nick(),
+                "sw0absoffer",
+                &format!("{i} 10000 100000 0 500"),
+            )
+            .await
+            .is_err();
+    }
+    assert!(refused);
+}

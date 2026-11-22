@@ -35,6 +35,11 @@ use crate::codec::{
 const INBOX: usize = 1_024;
 /// Lines waiting to be sent (a 40,000-byte private message is about 100).
 const OUTBOX: usize = 1_024;
+/// Lines of `!orderbook` answers waiting to be sent, about 40 s at the line rate. They go out only when no
+/// round's line is waiting, and past this they are dropped: anyone can ask for them, for free.
+const BULK_QUEUE: usize = 32;
+#[cfg(test)]
+pub(crate) const BULK_QUEUE_FOR_TESTS: usize = BULK_QUEUE;
 /// The longest wait between reconnection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(600);
 /// Silence after which we ping the server, and after which a connection counts as dead.
@@ -100,9 +105,23 @@ struct Shared {
     channel: String,
     connector: NickConnector,
     hostid: Mutex<String>,
-    writer: Mutex<Option<mpsc::Sender<String>>>,
+    writer: Mutex<Option<Writers>>,
     inbox: mpsc::Sender<Arrived>,
     stop: AtomicBool,
+}
+
+/// The connection's two send queues.
+#[derive(Clone)]
+struct Writers {
+    /// Everything that must not wait behind `!orderbook` answers.
+    round: mpsc::Sender<String>,
+    /// `!orderbook` answers.
+    bulk: mpsc::Sender<String>,
+}
+
+/// Whether a private line is an answer to `!orderbook`.
+fn is_orderbook_answer(command: &str) -> bool {
+    command.ends_with("offer") || command == "tbond"
 }
 
 /// One nick on one IRC server's pit channel. See the module documentation.
@@ -222,6 +241,11 @@ async fn register(shared: &Shared) -> Result<(Reader, Writer), String> {
         }
     }
     if let Ok(mut domain) = shared.hostid.lock() {
+        // Other channels' domains were checked against this one when the channel started; a server that
+        // comes back with another must not get lines signed for it.
+        if !domain.is_empty() && *domain != hostid.value() {
+            return Err("the server's signature domain changed".into());
+        }
         *domain = hostid.value().to_string();
     }
     Ok((reader, write))
@@ -246,16 +270,26 @@ async fn session(
         }
     };
     let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOX);
+    let (bulk_tx, mut bulk_rx) = mpsc::channel::<String>(BULK_QUEUE);
     if let Ok(mut slot) = shared.writer.lock() {
-        *slot = Some(out_tx.clone());
+        *slot = Some(Writers {
+            round: out_tx.clone(),
+            bulk: bulk_tx,
+        });
     }
     if let Some(ready) = ready.take() {
         let _ = ready.send(Ok(())).await;
     }
-    // The writer keeps to the line rate.
+    // The writer keeps to the line rate, and a round's lines go before `!orderbook` answers.
     let write_task = tokio::spawn(async move {
         let mut pacer = Pacer::default();
-        while let Some(line) = out_rx.recv().await {
+        loop {
+            let line = tokio::select! {
+                biased;
+                Some(line) = out_rx.recv() => line,
+                Some(line) = bulk_rx.recv() => line,
+                else => break,
+            };
             tokio::time::sleep_until(pacer.slot(Instant::now()).into()).await;
             if writer.write_all(line.as_bytes()).await.is_err() {
                 break;
@@ -393,16 +427,35 @@ impl IrcChannel {
         self.shared.writer.lock().is_ok_and(|w| w.is_some())
     }
 
-    fn send_lines(&self, lines: Vec<String>) -> Result<(), ChannelError> {
-        let writer = self
-            .shared
+    fn writers(&self) -> Result<Writers, ChannelError> {
+        self.shared
             .writer
             .lock()
             .ok()
             .and_then(|w| w.clone())
-            .ok_or_else(|| transport("not connected"))?;
+            .ok_or_else(|| transport("not connected"))
+    }
+
+    fn send_lines(&self, lines: Vec<String>) -> Result<(), ChannelError> {
+        let writers = self.writers()?;
         for line in lines {
-            writer
+            writers
+                .round
+                .try_send(line)
+                .map_err(|_| transport("the send queue is full or closed"))?;
+        }
+        Ok(())
+    }
+
+    /// Queue an `!orderbook` answer, whole or not at all.
+    fn send_bulk(&self, lines: Vec<String>) -> Result<(), ChannelError> {
+        let writers = self.writers()?;
+        if writers.bulk.capacity() < lines.len() {
+            return Err(transport("too many orderbook answers waiting"));
+        }
+        for line in lines {
+            writers
+                .bulk
                 .try_send(line)
                 .map_err(|_| transport("the send queue is full or closed"))?;
         }
@@ -505,7 +558,11 @@ impl Channel for IrcChannel {
             .ok_or(ChannelError::Invalid("a malformed line"))?;
         let lines = private_lines(to, command, message)
             .ok_or(ChannelError::Invalid("a private line IRC cannot carry"))?;
-        self.send_lines(lines)
+        if is_orderbook_answer(command) {
+            self.send_bulk(lines)
+        } else {
+            self.send_lines(lines)
+        }
     }
 
     async fn ask_orderbook(&self) -> Result<(), ChannelError> {
@@ -553,7 +610,10 @@ impl Channel for IrcChannel {
                 .writer
                 .lock()
                 .ok()
-                .and_then(|w| w.as_ref().map(|w| w.capacity() == w.max_capacity()))
+                .and_then(|w| {
+                    w.as_ref()
+                        .map(|w| w.round.capacity() == w.round.max_capacity())
+                })
                 .unwrap_or(true);
             if empty {
                 break;
@@ -587,7 +647,7 @@ impl Channel for IrcChannel {
             && let Some(quit) = build("QUIT", &["bye"])
             && let Some(w) = writer.take()
         {
-            let _ = w.try_send(quit);
+            let _ = w.round.try_send(quit);
         }
         if let Ok(mut tasks) = self.tasks.lock() {
             for task in tasks.drain(..) {
