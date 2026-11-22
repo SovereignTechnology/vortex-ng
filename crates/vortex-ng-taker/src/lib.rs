@@ -411,11 +411,20 @@ struct MakerIo {
 struct MakerSlot {
     offer: Offer,
     cjfee: u64,
+    /// The session the maker's `!ioauth` proved.
     session: Option<Session>,
-    /// The maker's NaCl public key from `!pubkey`, lowercase hex: what its `!ioauth` signature covers.
+    /// That session's NaCl public key from `!pubkey`, lowercase hex: what its `!ioauth` signature covers.
     maker_nacl: String,
+    /// Every distinct key signed by this maker that reached us as a `!pubkey`, with its session, each
+    /// answered with an `!auth`. A signed `!pubkey` from another exchange can be delivered here, since the
+    /// signature does not cover the recipient, so the first one is not necessarily this round's; the one that
+    /// decrypts the maker's `!ioauth` is.
+    candidates: Vec<(String, Session)>,
     io: Option<MakerIo>,
 }
+
+/// Most `!pubkey` keys tried per maker; the oldest gives way.
+pub const MAX_PUBKEY_CANDIDATES: usize = 8;
 
 /// A taker running one CoinJoin.
 pub struct Taker {
@@ -510,6 +519,7 @@ impl Taker {
                     cjfee,
                     session: None,
                     maker_nacl: String::new(),
+                    candidates: Vec::new(),
                     io: None,
                 },
             );
@@ -571,7 +581,8 @@ impl Taker {
             .makers
             .get_mut(from)
             .ok_or_else(|| err(from, "unknown"))?;
-        if slot.session.is_some() {
+        let key = maker_nacl.to_ascii_lowercase();
+        if slot.session.is_some() || slot.candidates.iter().any(|(known, _)| *known == key) {
             return Ok(self.stray());
         }
         let session = self
@@ -581,8 +592,10 @@ impl Taker {
         let body = session
             .encrypt(&revelation)
             .map_err(|e| err(from, e.to_string()))?;
-        slot.session = Some(session);
-        slot.maker_nacl = maker_nacl.to_ascii_lowercase();
+        if slot.candidates.len() >= MAX_PUBKEY_CANDIDATES {
+            slot.candidates.remove(0);
+        }
+        slot.candidates.push((key, session));
         Ok((
             vec![Outgoing::Private {
                 to: from.to_string(),
@@ -614,18 +627,26 @@ impl Taker {
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
         let secp = Secp256k1::new();
         let pit = self.cfg.pit;
-        let (plaintext, maker_nacl) = {
+        let (candidate, plaintext, maker_nacl) = {
             let Some(slot) = self.makers.get(from) else {
                 return Ok(self.stray());
             };
-            // Before `!pubkey`, after an `!ioauth` already taken, or not for this session: not this round's.
-            let (Some(session), None) = (slot.session.as_ref(), slot.io.as_ref()) else {
+            if slot.io.is_some() {
+                return Ok(self.stray());
+            }
+            // Before `!pubkey`, or for none of the sessions we offered: not this round's.
+            let found = slot
+                .candidates
+                .iter()
+                .enumerate()
+                .find_map(|(i, (key, session))| {
+                    let plaintext = session.decrypt(ciphertext).ok()?;
+                    Some((i, plaintext, key.clone()))
+                });
+            let Some(found) = found else {
                 return Ok(self.stray());
             };
-            let Ok(plaintext) = session.decrypt(ciphertext) else {
-                return Ok(self.stray());
-            };
-            (plaintext, slot.maker_nacl.clone())
+            found
         };
         let io = Ioauth::parse(&plaintext).ok_or_else(|| err(from, "malformed !ioauth"))?;
         if io.utxos.len() > self.cfg.max_maker_utxos {
@@ -705,6 +726,10 @@ impl Taker {
             .makers
             .get_mut(from)
             .ok_or_else(|| err(from, "unknown"))?;
+        let (_, session) = slot.candidates.swap_remove(candidate);
+        slot.candidates.clear();
+        slot.session = Some(session);
+        slot.maker_nacl = maker_nacl;
         slot.io = Some(MakerIo {
             utxos,
             cj_script,

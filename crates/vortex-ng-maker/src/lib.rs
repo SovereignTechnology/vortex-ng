@@ -136,9 +136,12 @@ pub const MAX_SESSIONS: usize = 64;
 /// (joinmarket-ng's `session_timeout_sec` default). Older sessions are forgotten, so quiet takers and
 /// finished rounds cannot fill the table.
 pub const SESSION_TTL: u64 = 300;
+/// Seconds a session may wait between `!fill` and a valid `!auth`. A `!fill` proves nothing yet, so it must
+/// not hold a place for long, and when the table is full the oldest such session gives way to a new one.
+pub const FILLED_TTL: u64 = 60;
 
-/// Most PoDLE commitments remembered as used; the oldest are forgotten first. Anyone can announce
-/// commitments, so the list must not grow without end.
+/// Most PoDLE commitments remembered as used, of each kind (see [`Commitments`]); the oldest are forgotten
+/// first. Anyone can announce commitments, so the list must not grow without end.
 pub const MAX_COMMITMENTS: usize = 100_000;
 /// Commitments handed to us privately that we announce in [`HP2_RELAY_WINDOW`] seconds, at most. Each one
 /// costs a throwaway nick's connections.
@@ -146,18 +149,14 @@ pub const HP2_RELAYS_PER_WINDOW: usize = 10;
 /// See [`HP2_RELAYS_PER_WINDOW`].
 pub const HP2_RELAY_WINDOW: u64 = 600;
 
-/// PoDLE commitments seen used, bounded: the oldest are forgotten first.
+/// A set of commitments, bounded: the oldest are forgotten first.
 #[derive(Default)]
-struct Commitments {
+struct BoundedCommitments {
     seen: HashSet<[u8; 32]>,
     order: std::collections::VecDeque<[u8; 32]>,
 }
 
-impl Commitments {
-    fn contains(&self, commitment: &[u8; 32]) -> bool {
-        self.seen.contains(commitment)
-    }
-
+impl BoundedCommitments {
     /// Remember `commitment`; whether it was new.
     fn insert(&mut self, commitment: [u8; 32]) -> bool {
         if !self.seen.insert(commitment) {
@@ -170,6 +169,31 @@ impl Commitments {
             }
         }
         true
+    }
+}
+
+/// PoDLE commitments seen used. The ones this maker verified itself, after which it showed its coins, are
+/// kept apart from the ones merely announced by others (`!hp2`, unsigned and free to send), so a flood of
+/// announcements cannot push a verified commitment out and let it be used again to see the coins twice.
+#[derive(Default)]
+struct Commitments {
+    verified: BoundedCommitments,
+    announced: BoundedCommitments,
+}
+
+impl Commitments {
+    fn contains(&self, commitment: &[u8; 32]) -> bool {
+        self.verified.seen.contains(commitment) || self.announced.seen.contains(commitment)
+    }
+
+    /// Remember a commitment someone announced; whether it was new.
+    fn insert(&mut self, commitment: [u8; 32]) -> bool {
+        !self.verified.seen.contains(&commitment) && self.announced.insert(commitment)
+    }
+
+    /// Remember a commitment this maker verified.
+    fn insert_verified(&mut self, commitment: [u8; 32]) {
+        self.verified.insert(commitment);
     }
 }
 
@@ -329,10 +353,14 @@ impl Maker {
     ) -> Vec<Outgoing> {
         // Forget sessions past their time before anything else, so they never count against the cap.
         let (sessions, started) = (&mut self.sessions, &mut self.started);
-        sessions.retain(|nick, _| {
+        sessions.retain(|nick, stage| {
+            let limit = match stage {
+                Stage::Filled(_) => FILLED_TTL,
+                _ => SESSION_TTL,
+            };
             started
                 .get(nick)
-                .is_some_and(|at| now.saturating_sub(*at) <= SESSION_TTL)
+                .is_some_and(|at| now.saturating_sub(*at) <= limit)
         });
         started.retain(|nick, _| sessions.contains_key(nick));
         let result = match command {
@@ -384,9 +412,6 @@ impl Maker {
             // The taker's own `!fill` again (a duplicate delivery), or a copy of one it sent to another maker.
             return Err(MakerError::Stray("session exists"));
         }
-        if self.sessions.len() >= MAX_SESSIONS {
-            return Err(MakerError::State("too many open sessions"));
-        }
         let offer = self
             .config
             .offers
@@ -404,6 +429,7 @@ impl Maker {
         if self.used_commitments.contains(&commitment) {
             return Err(MakerError::Podle("commitment already used".into()));
         }
+        self.make_room()?;
         let ours = NaclKeypair::generate();
         let session = ours
             .session(taker_nacl)
@@ -426,6 +452,30 @@ impl Maker {
         Ok(vec![reply])
     }
 
+    /// Room for one more session: when the table is full, the oldest session still waiting for its `!auth`
+    /// gives way. Sessions past `!auth` proved a real coin and are never pushed out.
+    fn make_room(&mut self) -> Result<(), MakerError> {
+        if self.sessions.len() < MAX_SESSIONS {
+            return Ok(());
+        }
+        let oldest = self
+            .sessions
+            .iter()
+            .filter(|(_, stage)| matches!(stage, Stage::Filled(_)))
+            .min_by_key(|(nick, _)| self.started.get(*nick).copied().unwrap_or(0))
+            .map(|(nick, _)| nick.clone())
+            .ok_or(MakerError::State("too many open sessions"))?;
+        self.sessions.remove(&oldest);
+        self.started.remove(&oldest);
+        Ok(())
+    }
+
+    /// Whether `nick` has a session open. Its route must not move while it does: a line can be delivered
+    /// again through another channel or directory by anyone who saw it.
+    pub fn in_session(&self, nick: &str) -> bool {
+        self.sessions.contains_key(nick)
+    }
+
     fn on_auth(
         &mut self,
         from: &str,
@@ -440,11 +490,13 @@ impl Maker {
                 .map_err(|_| MakerError::Stray("auth not for this session"))?,
             _ => return Err(MakerError::Stray("auth out of place")),
         };
+        // The command is not signed: another step's line, relabelled, also decrypts. Only a line that reads
+        // as this step's may end the session.
+        let podle = Podle::parse_revelation(&revelation)
+            .map_err(|_| MakerError::Stray("auth is not a revelation"))?;
         let Some(Stage::Filled(filled)) = self.sessions.remove(from) else {
             return Err(MakerError::Stray("auth out of place"));
         };
-        let podle =
-            Podle::parse_revelation(&revelation).map_err(|e| MakerError::Podle(e.to_string()))?;
         let secp = Secp256k1::new();
         podle
             .verify(&secp, &filled.commitment, &self.config.podle_indices)
@@ -467,7 +519,7 @@ impl Maker {
         {
             return Err(MakerError::Podle("utxo too small".into()));
         }
-        self.used_commitments.insert(filled.commitment);
+        self.used_commitments.insert_verified(filled.commitment);
         let commitment_hex = filled.commitment.to_lower_hex_string();
 
         let cjfee = filled
@@ -628,14 +680,15 @@ impl Maker {
                 .map_err(|_| MakerError::Stray("tx not for this session"))?,
             _ => return Err(MakerError::Stray("tx out of place")),
         };
+        // As in `on_auth`: a relabelled line of another step decrypts too, and must leave the session alone.
+        let raw = STANDARD
+            .decode(plaintext)
+            .map_err(|_| MakerError::Stray("tx is not base64"))?;
+        let tx: Transaction =
+            deserialize(&raw).map_err(|_| MakerError::Stray("tx is not a transaction"))?;
         let Some(Stage::Authed(authed)) = self.sessions.remove(from) else {
             return Err(MakerError::Stray("tx out of place"));
         };
-        let raw = STANDARD
-            .decode(plaintext)
-            .map_err(|_| MakerError::Tx("tx base64".into()))?;
-        let tx: Transaction =
-            deserialize(&raw).map_err(|_| MakerError::Tx("tx encoding".into()))?;
 
         let mut prevouts = Vec::with_capacity(tx.input.len());
         let mut known = BTreeMap::new();

@@ -350,17 +350,81 @@ fn sessions_expire_and_never_block_new_takers() {
         let out = maker.handle(&format!("J5quiet{i}"), fill(i), &chain, NOW);
         assert_eq!(private(&out[0]).0, "pubkey", "fill {i}");
     }
-    let out = maker.handle("J5late", fill(200), &chain, NOW + SESSION_TTL);
-    assert_eq!(
-        private(&out[0]).0,
-        "error",
-        "the table is full while they are in time"
-    );
-    // Once they are out of time they are forgotten, and a new taker is served.
-    let out = maker.handle("J5late", fill(201), &chain, NOW + SESSION_TTL + 1);
+    // A full table does not lock a new taker out: the oldest session waiting for `!auth` gives way.
+    let out = maker.handle("J5late", fill(200), &chain, NOW + 1);
+    assert_eq!(private(&out[0]).0, "pubkey", "a new taker is served");
+    assert_eq!(maker.sessions.len(), MAX_SESSIONS);
+    assert!(maker.in_session("J5late"));
+    // Once they are out of time they are forgotten.
+    let out = maker.handle("J5later", fill(201), &chain, NOW + FILLED_TTL + 2);
     assert_eq!(private(&out[0]).0, "pubkey");
     assert_eq!(maker.sessions.len(), 1);
     assert_eq!(maker.started.len(), 1);
+}
+
+#[test]
+fn a_flood_of_announcements_cannot_free_a_verified_commitment() {
+    let key = |i: usize| {
+        let mut c = [0xee; 32];
+        c[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        c
+    };
+    let mut commitments = Commitments::default();
+    commitments.insert_verified([1; 32]);
+    for i in 0..=MAX_COMMITMENTS {
+        commitments.insert(key(i));
+    }
+    assert!(commitments.contains(&[1; 32]), "still refused");
+    assert!(!commitments.contains(&key(0)), "announcements are bounded");
+    assert!(!commitments.insert([1; 32]), "not new");
+}
+
+#[test]
+fn a_line_relabelled_to_another_step_leaves_the_session() {
+    let secp = Secp256k1::new();
+    let (taker, chain) = new_taker();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    let mut maker = funded_maker();
+    let fill = Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: taker.nacl.public_hex(),
+        commitment: podle.commitment(),
+    };
+    let out = maker.handle("J5taker", fill, &chain, NOW);
+    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    let encrypted = |name: &str, text: &str| Command::Encrypted {
+        name: name.into(),
+        ciphertext: session.encrypt(text).unwrap(),
+    };
+    // It decrypts, but is not a revelation: nothing happens, and the real `!auth` still works.
+    assert!(
+        maker
+            .handle(
+                "J5taker",
+                encrypted("auth", "not a revelation"),
+                &chain,
+                NOW
+            )
+            .is_empty()
+    );
+    let out = maker.handle(
+        "J5taker",
+        encrypted("auth", &podle.revelation()),
+        &chain,
+        NOW,
+    );
+    assert_eq!(private(&out[0]).0, "ioauth");
+    // The `!auth` again, relabelled `!tx`: it decrypts, is no transaction, and ends nothing.
+    assert!(
+        maker
+            .handle("J5taker", encrypted("tx", &podle.revelation()), &chain, NOW)
+            .is_empty()
+    );
+    assert!(matches!(
+        maker.sessions.get("J5taker"),
+        Some(Stage::Authed(_))
+    ));
 }
 
 /// Run `!fill` and `!auth` for `amount`: the maker's `!ioauth`, or `None` when it refused.
@@ -514,7 +578,7 @@ fn remembered_commitments_are_bounded() {
     // The oldest went first.
     assert!(!commitments.contains(&key(0)));
     assert!(commitments.contains(&key(1)));
-    assert_eq!(commitments.seen.len(), MAX_COMMITMENTS);
+    assert_eq!(commitments.announced.seen.len(), MAX_COMMITMENTS);
 }
 
 #[test]

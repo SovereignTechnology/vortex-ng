@@ -122,6 +122,12 @@ fn is_refusal(out: &Outgoing) -> bool {
 /// server may: every line arrives twice, every line seen so far is delivered again after each step, and every
 /// line the taker sent also reaches the other maker. None of that may change the round.
 fn coinjoin_with(pit: Pit, noisy: bool) -> (Transaction, PitWallet) {
+    coinjoin_after(pit, noisy, false)
+}
+
+/// As [`coinjoin_with`]. With `stale_pubkey`, a `!pubkey` of each maker from another exchange (a key the
+/// round does not use) reaches the taker before anything else.
+fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkey: bool) -> (Transaction, PitWallet) {
     let mut chain = FakeChain::default();
     let mut makers: BTreeMap<String, Maker> = BTreeMap::new();
     for (i, nick) in ["J5makerA", "J5makerB"].iter().enumerate() {
@@ -178,6 +184,18 @@ fn coinjoin_with(pit: Pit, noisy: bool) -> (Transaction, PitWallet) {
         .into_iter()
         .map(|o| ("J5taker".to_string(), o))
         .collect();
+    if stale_pubkey {
+        for nick in makers.keys() {
+            queue.push_front((
+                nick.clone(),
+                Outgoing::Private {
+                    to: "J5taker".into(),
+                    command: "pubkey".into(),
+                    body: vortex_ng_core::nacl::NaclKeypair::generate().public_hex(),
+                },
+            ));
+        }
+    }
     let mut progress = Progress::Waiting;
     let mut seen: Vec<(String, String, String, String)> = Vec::new();
     while let Some((from, message)) = queue.pop_front() {
@@ -236,6 +254,13 @@ fn coinjoin_with(pit: Pit, noisy: bool) -> (Transaction, PitWallet) {
 
 fn check(pit: Pit) {
     check_with(pit, false);
+}
+
+#[test]
+fn a_pubkey_from_another_exchange_does_not_end_the_round() {
+    let (tx, _) = coinjoin_after(Pit::Sw0, false, true);
+    assert_eq!(tx.input.len(), 3);
+    assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
 }
 
 fn check_with(pit: Pit, noisy: bool) {
