@@ -6,9 +6,9 @@ use std::path::Path;
 use vortex_ng_core::bitcoin::{Network, OutPoint, Script, TxOut};
 use vortex_ng_core::offer::Pit;
 use vortex_ng_core::podle::Podle;
-use vortex_ng_ln::lnd::Lnd;
+use vortex_ng_ln::lnd::{Lnd, keeps_reserve};
 use vortex_ng_taker::{TakerConfig, choose_external, podle_for};
-use vortex_ng_wallet::{MIXDEPTHS, PitWallet};
+use vortex_ng_wallet::PitWallet;
 
 use crate::Failure;
 use crate::args::Args;
@@ -21,6 +21,11 @@ pub(crate) const OPTIONS: [&str; 3] = ["lnd-rest", "lnd-tls-cert", "lnd-macaroon
 
 /// The node the options name, checked to be on `network`.
 pub(crate) fn connect(args: &Args, network: Network) -> Result<Lnd, Failure> {
+    if network == Network::Bitcoin {
+        return Err(failed(
+            "mainnet is disabled in this pre-release: vortex-ng is unaudited",
+        ));
+    }
     let required = |name| args.required(name).map_err(Failure::Usage);
     let lnd = Lnd::open(
         required("lnd-rest")?,
@@ -58,6 +63,7 @@ pub(crate) fn lnd_coins(rest: &[String]) -> Result<(), Failure> {
     let network = wallet::network(&args)?;
     let lnd = connect(&args, network)?;
     let mut coins = lnd.coins().map_err(failed)?;
+    let reserve = lnd.anchor_reserve().map_err(failed)?;
     if args.flag("closes-only") {
         coins.retain(|coin| coin.close.is_some());
     }
@@ -87,6 +93,9 @@ pub(crate) fn lnd_coins(rest: &[String]) -> Result<(), Failure> {
         "{} coin(s), {total} sat; {close_count} coin(s), {close_total} sat of it from channel closes.",
         coins.len()
     );
+    println!(
+        "The node keeps {reserve} sat for its anchor channels: a round will not spend into it."
+    );
     Ok(())
 }
 
@@ -100,19 +109,22 @@ pub(crate) struct Selection {
     pub(crate) committed_sats: u64,
 }
 
-/// Choose the node's close coins for a round in `cfg`'s pit, and a commitment from `wallet`.
+/// Choose the node's close coins for a round in `cfg`'s pit, leaving what the node must keep for its anchor
+/// channels, and a commitment from `mixdepth` of `wallet`.
 pub(crate) fn select(
     lnd: &Lnd,
     cfg: &TakerConfig,
     wallet: &PitWallet,
+    mixdepth: u32,
     height: u32,
     log: &PodleLog,
+    merge: bool,
 ) -> Result<Selection, Failure> {
-    let closes: Vec<_> = lnd
-        .coins()
-        .map_err(failed)?
-        .into_iter()
+    let coins = lnd.coins().map_err(failed)?;
+    let closes: Vec<_> = coins
+        .iter()
         .filter(|coin| coin.close.is_some())
+        .cloned()
         .collect();
     if closes.is_empty() {
         return Err(failed(
@@ -135,8 +147,16 @@ pub(crate) fn select(
              `vortex-ng lnd-coins --closes-only` shows each coin's pit, and `--pit` picks one"
         )));
     }
-    let inputs = choose_external(cfg, usable).map_err(taker_failed)?;
-    let (podle, committed_sats) = commitment(wallet, cfg.amount, height, log)?;
+    let inputs = choose_external(cfg, usable, merge).map_err(taker_failed)?;
+    let spending: Vec<OutPoint> = inputs.iter().map(|(outpoint, _)| *outpoint).collect();
+    let reserve = lnd.anchor_reserve().map_err(failed)?;
+    if !keeps_reserve(&coins, &spending, reserve) {
+        return Err(failed(format!(
+            "this round would leave the LND wallet under the {reserve} sat it must keep to fee-bump the \
+             force close of its open anchor channels: nothing was sent"
+        )));
+    }
+    let (podle, committed_sats) = commitment(wallet, mixdepth, cfg.amount, height, log)?;
     Ok(Selection {
         inputs,
         podle,
@@ -144,33 +164,58 @@ pub(crate) fn select(
     })
 }
 
-/// A fresh commitment from the smallest coin of the wallet that makers accept, from any mixdepth. Makers
-/// see this coin, so the smallest one puts the least at stake.
+/// A fresh commitment from the smallest suitable coin of `mixdepth`. Makers see this coin and can tie it to
+/// the round, so it must not tie anything else: it comes from the round's own mixdepth, never from a
+/// CoinJoin (that would show makers whose output it was), and never from a coin already committed to
+/// (that would let a maker in both rounds link two channels).
 fn commitment(
     wallet: &PitWallet,
+    mixdepth: u32,
     amount: u64,
     height: u32,
     log: &PodleLog,
 ) -> Result<(Podle, u64), Failure> {
     let mut fit = Vec::new();
-    for mixdepth in 0..MIXDEPTHS {
-        for coin in confirmed_coins(wallet, mixdepth, height)? {
-            if coin.fit_to_commit(amount) {
-                fit.push((mixdepth, coin));
-            }
+    for coin in confirmed_coins(wallet, mixdepth, height)? {
+        if coin.fit_to_commit(amount)
+            && !wallet
+                .came_from_coinjoin(mixdepth, &coin.utxo.outpoint)
+                .map_err(failed)?
+        {
+            fit.push(coin);
         }
     }
-    fit.sort_by_key(|(_, coin)| coin.utxo.txout.value);
-    for (mixdepth, coin) in &fit {
-        for index in 0..3u8 {
-            let podle = podle_for(wallet, *mixdepth, &coin.utxo, index).map_err(taker_failed)?;
-            if !log.contains(&podle.commitment()) {
-                return Ok((podle, coin.utxo.txout.value.to_sat()));
-            }
+    fit.sort_by_key(|coin| coin.utxo.txout.value);
+    for coin in &fit {
+        let podles = (0..3u8)
+            .map(|index| podle_for(wallet, mixdepth, &coin.utxo, index))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(taker_failed)?;
+        if podles
+            .iter()
+            .all(|podle| !log.contains(&podle.commitment()))
+            && let Some(podle) = podles.into_iter().next()
+        {
+            return Ok((podle, coin.utxo.txout.value.to_sat()));
         }
     }
-    Err(failed(
-        "the node cannot prove a PoDLE, so this wallet needs a coin of the pit to commit to: five \
-         confirmations, a fifth of the amount, and a commitment left (three per coin)",
-    ))
+    Err(failed(format!(
+        "the node cannot prove a PoDLE, so mixdepth {mixdepth} of this wallet needs a coin of the pit to \
+         commit to: five confirmations, a fifth of the amount, not from a CoinJoin, and never committed to \
+         before (each one serves one round, so that no maker can link two)"
+    )))
+}
+
+/// With the coins leased, and before any maker hears of them: the node still keeps its reserve, and will
+/// sign. A commitment spent on a round that cannot finish is lost, and makers would have seen the coins.
+pub(crate) fn check_before_round(lnd: &Lnd, inputs: &[(OutPoint, TxOut)]) -> Result<(), Failure> {
+    let spending: Vec<OutPoint> = inputs.iter().map(|(outpoint, _)| *outpoint).collect();
+    let reserve = lnd.anchor_reserve().map_err(failed)?;
+    if !keeps_reserve(&lnd.coins().map_err(failed)?, &spending, reserve) {
+        return Err(failed(format!(
+            "the LND wallet would fall under the {reserve} sat it must keep for its anchor channels: \
+             nothing was sent"
+        )));
+    }
+    lnd.check_can_sign(inputs).map_err(failed)
 }

@@ -3,7 +3,7 @@
 
 Starts Bitcoin Core on regtest and two LND nodes A and B on loopback, opens two channels from A to B, closes one
 cooperatively and force-closes the other, and mines until A has swept it. A's wallet then holds one coin from each
-close and the change of its channel opens (the coins that must NOT be spent). Bakes the two macaroons a user would
+close and the change of its channel opens (the coins that must NOT be spent), and one channel stays open. Bakes the two macaroons a user would
 bake, and runs crates/vortex-ng-cli/tests/regtest_lnd.rs against A.
 
 Usage (tools/lnd-itest/run.sh): drive.py <empty work directory>, with bitcoind, lnd and lncli on PATH.
@@ -23,8 +23,14 @@ CORE_RPC = 18643
 FEE_PORT = 18644
 CHANNEL_SATS = 4_000_000
 PUSH_SATS = 500_000
-READ_PERMISSIONS = ["info:read", "onchain:read", "offchain:read"]
-ROUND_PERMISSIONS = READ_PERMISSIONS + ["onchain:write", "signer:generate"]
+# The macaroons a user is told to bake: each call by name, so that the signing right does not reach the node's
+# channel and identity keys the way `signer:generate` does.
+READ_PERMISSIONS = ["uri:/lnrpc.Lightning/GetInfo", "uri:/walletrpc.WalletKit/ListUnspent",
+                    "uri:/lnrpc.Lightning/ClosedChannels", "uri:/lnrpc.Lightning/WalletBalance"]
+NO_SIGN_PERMISSIONS = READ_PERMISSIONS + ["uri:/walletrpc.WalletKit/LeaseOutput",
+                                          "uri:/walletrpc.WalletKit/ReleaseOutput",
+                                          "uri:/walletrpc.WalletKit/NextAddr"]
+ROUND_PERMISSIONS = NO_SIGN_PERMISSIONS + ["uri:/signrpc.Signer/ComputeInputScript"]
 # BIP173's regtest example: a valid address no key here spends.
 NOBODY = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
 
@@ -217,11 +223,15 @@ def scenario(root, core, a, b, lab):
     print(f"A's closed channels: {closed}; tip {core.call('getblockcount')}", flush=True)
     if closed != ["COOPERATIVE_CLOSE", "LOCAL_FORCE_CLOSE"]:
         raise RuntimeError(f"unexpected closes: {closed}")
+    # One channel stays open, so that the node has an anchor reserve to protect.
+    lab.open_channel()
 
     read = f"{root}/read.macaroon"
     full = f"{root}/round.macaroon"
     a.bake(read, READ_PERMISSIONS)
     a.bake(full, ROUND_PERMISSIONS)
+    no_sign = f"{root}/no-sign.macaroon"
+    a.bake(no_sign, NO_SIGN_PERMISSIONS)
     return {
         "VORTEX_NG_REGTEST_RPC": f"http://127.0.0.1:{CORE_RPC}",
         "VORTEX_NG_REGTEST_COOKIE": core.cookie,
@@ -229,6 +239,7 @@ def scenario(root, core, a, b, lab):
         "VORTEX_NG_LND_CERT": f"{a.dir}/tls.cert",
         "VORTEX_NG_LND_MACAROON": full,
         "VORTEX_NG_LND_READ_MACAROON": read,
+        "VORTEX_NG_LND_NOSIGN_MACAROON": no_sign,
         "VORTEX_NG_LND_OTHER_CERT": f"{b.dir}/tls.cert",
     }
 

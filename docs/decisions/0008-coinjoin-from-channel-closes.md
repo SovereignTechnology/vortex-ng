@@ -4,8 +4,8 @@ Date: 2026-11-19
 
 ## Status
 
-Accepted. Slice 1 (wallets that hold their own keys) is built; slice 2 (a Lightning node's wallet) is designed
-here and not built.
+Accepted. Slice 1 (wallets that hold their own keys) and slice 2 (an LND node's wallet) are built. Both run on
+regtest only: mainnet stays refused.
 
 ## Context
 
@@ -32,14 +32,20 @@ Facts that shape it:
   one-input rule is what keeps a CoinJoin from reading as a close, and it is tested.
 - **A taker needs a coin's private key**, twice: to sign its inputs, and to build the PoDLE commitment
   (`podle_for` takes the key of the committed coin; the proof is a DLEQ over `x·G` and `x·J`). A Lightning
-  node's wallet signs inputs when asked (LND's `signrpc.ComputeInputScript`, `walletrpc.SignPsbt`) and never
-  hands out a key, and nothing it exposes computes a PoDLE proof. LND's `DeriveSharedKey` is documented to
-  return a hash of `x·Q`, which could serve as the commitment hash but not the proof. **These LND calls are
-  from its documentation as remembered, not from a source tree: slice 2 starts by checking each against the
-  LND release it pins, and this ADR is amended if one differs.**
+  node's wallet signs inputs when asked (LND's `signrpc.ComputeInputScript`) and never hands out a key, and
+  nothing it exposes computes a PoDLE proof: `DeriveSharedKey` returns only a hash of `x·Q`. Checked against
+  LND v0.21.8-beta's protos and server source.
+- **LND keeps a reserve that only its own sends respect.** It refuses to spend below what it needs to fee-bump
+  the force close of its open anchor channels (`CheckReservedValue`). A spend it merely signs is not checked,
+  and without those funds a commitment transaction may not confirm before its HTLCs expire.
+- **LND pays its closes and sweeps to P2TR** (seen on v0.21.8 regtest, both kinds), so its close coins can only
+  join the `tr0` pit, whose makers today are vortex-ng and joinmarket-ng's Taproot branch (PR #643). The
+  deployed `sw0` market is reached by a mutual close with a `sw0` delivery address (decision 2).
 - **joinmarket-ng's maker does not require the PoDLE coin to be a transaction input.** It binds the revealed
   key to the coin's scriptPubKey, then checks the coin's age (5 confirmations) and size (20 % of the amount)
-  (`maker/coinjoin.py`, c3312cb). `Taker::new` already takes the commitment apart from the inputs.
+  (`maker/coinjoin.py`, c3312cb), and a round with real joinmarket-ng makers confirms this way
+  (`tools/jmng-interop`, `VORTEX_NG_INTEROP_COMMIT_ELSEWHERE=1`). `Taker::new` takes the commitment apart from
+  the inputs.
 - A taker's inputs come from one mixdepth of one wallet, and its outputs go to the next mixdepth: a close
   coin that is spent from where it landed ends in the same wallet's next mixdepth.
 
@@ -60,30 +66,44 @@ Facts that shape it:
    Walking ancestors through the node was considered and left out: it needs a transaction index on the
    node, and the send that moves the coin usually merges other coins of the node's wallet, which is the
    linkage this feature exists to avoid. Force closes are slice 2's job.
-3. **Slice 2: a Lightning node as a coin source, built on a signing seam.** The taker's `finish` calls a
-   `PitWallet`; slice 2 puts an `InputSigner` trait there, implemented by `PitWallet` (as now) and by an LND
-   client over its REST API (macaroon + pinned TLS certificate, both read from owner-only files, never from
-   the command line). The node supplies the coin list (`ListUnspent`) and close history (`ClosedChannels`,
-   `PendingChannels`, transaction labels) and signs the inputs (`ComputeInputScript`); the CoinJoin's outputs
-   go to a vortex-ng wallet's mixdepths. Because the node cannot prove a PoDLE, the commitment comes from a
-   coin of a vortex-ng wallet (any mixdepth, five confirmations, a fifth of the amount), which joinmarket-ng's
-   maker accepts: the user keeps a small coin there for it. Real-LND regtest is the proof, not a fake.
+3. **Slice 2: an LND node as a coin source, built on a signing seam.** `Taker::finish` takes an `InputSigner`,
+   implemented by `PitWallet` and by an LND client over its REST API (`vortex_ng_ln::lnd`: TLS pinned to the
+   node's own certificate, no new crates). `vortex-ng lnd-coins` lists the node's coins and marks closes by its
+   own records (`ClosedChannels`, counting only sweeps this node made), which also sees force closes and taproot
+   channels. `coinjoin --from-lnd --mixdepth <n>` spends them with the node signing. Its rules, each because the
+   obvious version loses money or privacy:
+   - **The anchor reserve is enforced here**, before the prompt and again once the coins are leased.
+   - **One coin per round**, the smallest that covers it. Merging links different channels: `--merge-closes`.
+   - **Change goes back to the node**, so it carries no channel's history into a mixdepth and a small round
+     does not move a whole coin out of it. The amount goes to the wallet's next mixdepth.
+   - **The commitment coin is shown to makers**, so it comes from the mixdepth the user names, is never a
+     CoinJoin's output, and serves one round: a maker in two rounds could otherwise link two channels.
+   - **Nothing reaches a maker until the node has shown it will sign**, on a throwaway transaction that states
+     each amount one satoshi too high, so its signatures can never be valid.
+   - **After a broadcast the coins are not given back**: held until the spend has six confirmations, or for a
+     day if the call failed without saying whether the transaction got out.
+   - **The macaroon** must be mode 600 and baked by `uri:` for exactly the calls used. `signer:generate` is
+     not enough of a limit: it also reaches channel and identity keys through `SignOutputRaw`.
 4. **Other nodes (LDK, CLN, Eclair, Phoenix) use slice 1's route**: the mutual close's delivery address is
    a vortex-ng address. None exposes the signing slice 2 needs (ldk-server has no PSBT signing). A force
    close there is mixed as an unlabelled coin, with plain `coinjoin`, after the node has swept it.
 5. **No unattended spending.** Nothing here watches for closes and CoinJoins by itself. A daemon policy that
    spends money without a person is a separate decision, and mainnet wallets stay refused in the CLI.
+6. **An address is never handed out twice.** The wallet lives in memory and learns what is used from the chain,
+   so a failed or unconfirmed round's addresses used to come back in the next one, linking the two for good.
+   `coinjoin` now writes each to `<wallet>.issued` before it leaves the process, and every command starts past
+   them. A maker's own addresses are not covered by this change.
 
 ## Consequences
 
-- `vortex-ng-core` gains a pure module with BOLT 3's script shapes. Real captures from an LND regtest close
-  (mutual, force, swept) replace the hand-built vectors when slice 2's harness exists: hand-built shapes can
-  agree with the author's reading of the spec and with nothing else.
+- `vortex-ng-core` gains a pure module with BOLT 3's script shapes. Its vectors are hand-built and spent on
+  Core, so Core validates them; they are not yet captures of what LND broadcasts. `--from-lnd` does not depend
+  on them (it uses the node's records). Capturing LND's transactions into the tests is still owed.
 - The commands print amounts, depths and kinds. Outpoints are shown only with `--outpoints`: a closing
   transaction's id names the channel's funding output, and the same data on a live node is key material.
 - A mixed-history wallet is the user's to tidy: `--from-closes` never touches other coins, and says so.
 - `Sweep` and a commitment's `to_remote` reach a vortex-ng wallet only when something pays them there
   directly. They are in slice 1 because the detector is shared with slice 2, where an LND wallet's own
   coins are created by exactly these transactions, and because it keeps the labels honest if they do.
-- Slice 2 adds an HTTPS client and the LND REST types to `vortex-ng-ln`, so new crates and a `cargo deny`
-  pass; that is the reason it is its own change.
+- `tools/lnd-itest` runs all of it against a real LND v0.21.8 on regtest: a mutual close, a swept force close,
+  one channel left open, and macaroons baked as the README says.

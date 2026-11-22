@@ -202,6 +202,41 @@ impl PitWallet {
             .address)
     }
 
+    /// The next unused address of mixdepth `m`'s external or `internal` chain, with its index, so that a
+    /// caller can record it as issued before it leaves the process.
+    pub fn next_address_indexed(
+        &mut self,
+        m: u32,
+        internal: bool,
+    ) -> Result<(u32, Address), WalletError> {
+        let keychain = if internal {
+            KeychainKind::Internal
+        } else {
+            KeychainKind::External
+        };
+        let info = self.mixdepth_mut(m)?.reveal_next_address(keychain);
+        Ok((info.index, info.address))
+    }
+
+    /// Treat every address of the chain up to and including `index` as issued: the next one handed out is
+    /// past it, and a sync watches them.
+    pub fn reveal_through(
+        &mut self,
+        m: u32,
+        internal: bool,
+        index: u32,
+    ) -> Result<(), WalletError> {
+        let keychain = if internal {
+            KeychainKind::Internal
+        } else {
+            KeychainKind::External
+        };
+        self.mixdepth_mut(m)?
+            .reveal_addresses_to(keychain, index)
+            .for_each(drop);
+        Ok(())
+    }
+
     /// Mixdepth `m`'s unspent outputs.
     pub fn utxos(&self, m: u32) -> Result<Vec<LocalOutput>, WalletError> {
         Ok(self.mixdepth(m)?.list_unspent().collect())

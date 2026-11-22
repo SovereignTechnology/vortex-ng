@@ -107,6 +107,11 @@ fn listed(stdout: &str) -> Vec<Listed> {
         .collect()
 }
 
+/// How many coins a `coins` listing shows.
+fn listing_coins(stdout: &str) -> usize {
+    stdout.lines().filter(|line| line.starts_with("  ")).count()
+}
+
 fn first_address(wallet: &str, password: &str, pit: &str, mixdepth: &str) -> Address {
     let listing = ok(&[
         "wallet",
@@ -170,6 +175,7 @@ async fn a_coinjoin_spends_what_a_close_left_in_an_lnd_wallet() {
         Some(cert),
         Some(macaroon),
         Some(read_macaroon),
+        Some(no_sign_macaroon),
         Some(other_cert),
     ) = (
         env("VORTEX_NG_REGTEST_RPC"),
@@ -178,6 +184,7 @@ async fn a_coinjoin_spends_what_a_close_left_in_an_lnd_wallet() {
         env("VORTEX_NG_LND_CERT"),
         env("VORTEX_NG_LND_MACAROON"),
         env("VORTEX_NG_LND_READ_MACAROON"),
+        env("VORTEX_NG_LND_NOSIGN_MACAROON"),
         env("VORTEX_NG_LND_OTHER_CERT"),
     )
     else {
@@ -250,6 +257,15 @@ async fn a_coinjoin_spends_what_a_close_left_in_an_lnd_wallet() {
         "the change of the channel opens is the control: {before:?}"
     );
 
+    // The channel still open makes the node keep funds to fee-bump its force close, and the figure is read.
+    let args = lnd_coins("regtest", &cert, &read_macaroon);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let said = ok(&args);
+    assert!(
+        said.contains("The node keeps 10000 sat for its anchor channels"),
+        "{said}"
+    );
+
     // Who may talk to the node.
     let check_refused = |args: Vec<String>, why: &str| {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -287,7 +303,7 @@ async fn a_coinjoin_spends_what_a_close_left_in_an_lnd_wallet() {
     assert!(!pits.is_empty(), "{before:?}");
     for pit in &pits {
         println!("--- a round in {pit}");
-        // A coin for the commitment, in a mixdepth the round has nothing to do with.
+        // A coin for the commitment, in the mixdepth named for the round.
         let commit_to = first_address(&taker, &password, pit, "3");
         rpc.generate_to_address(1, &commit_to).unwrap();
         // Two makers, a coinbase each.
@@ -354,6 +370,8 @@ async fn a_coinjoin_spends_what_a_close_left_in_an_lnd_wallet() {
                 &relay_url,
                 "--pit",
                 pit,
+                "--mixdepth",
+                "3",
                 "--amount",
                 "1000000",
                 "--makers",
@@ -379,6 +397,17 @@ async fn a_coinjoin_spends_what_a_close_left_in_an_lnd_wallet() {
         let spent_before = commitments();
         check_refused(round(&read_macaroon, &[]), "permission");
         assert_eq!(commitments(), spent_before);
+        // One that may hold the coins but not sign is caught before any maker hears of them, and the
+        // coins it held are given back.
+        check_refused(round(&no_sign_macaroon, &[]), "permission");
+        assert_eq!(commitments(), spent_before);
+        wait_for("LND to get its coins back", Duration::from_secs(30), || {
+            let now = list();
+            before
+                .iter()
+                .all(|coin| now.iter().any(|other| other.outpoint == coin.outpoint))
+        })
+        .await;
 
         let args = round(&macaroon, &[]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -451,13 +480,21 @@ async fn a_coinjoin_spends_what_a_close_left_in_an_lnd_wallet() {
         ];
         listing.extend(node);
         let committed = ok(&listing);
-        let line = committed
+        // Mixdepth 3 holds it and nothing else: the change went back to the node.
+        let committed = committed
             .lines()
-            .find(|line| line.starts_with("  "))
-            .unwrap_or_else(|| panic!("the committed coin in\n{committed}"));
-        let committed = OutPoint::from_str(line.split_whitespace().last().unwrap()).unwrap();
+            .filter(|line| line.starts_with("  "))
+            .map(|line| OutPoint::from_str(line.split_whitespace().last().unwrap()).unwrap())
+            .find(|outpoint| outpoint.txid != txid)
+            .expect("the committed coin");
         assert!(!inputs.contains(&committed));
         assert!(rpc.utxo(&committed).unwrap().is_some());
+
+        assert_eq!(
+            listing_coins(&ok(&listing)),
+            1,
+            "the round's change must not land in the wallet"
+        );
 
         // The amount is in the vortex-ng wallet's next mixdepth.
         let mut args = vec![
@@ -471,21 +508,25 @@ async fn a_coinjoin_spends_what_a_close_left_in_an_lnd_wallet() {
         ];
         args.extend(node);
         let balance = ok(&args);
-        let mixdepth_one = balance
+        let next_mixdepth = balance
             .lines()
-            .find(|line| line.starts_with("mixdepth 1:"))
+            .find(|line| line.starts_with("mixdepth 4:"))
             .unwrap();
         assert!(
-            mixdepth_one.contains(" 1000000 sat in 1 coin(s)"),
+            next_mixdepth.contains(" 1000000 sat in 1 coin(s)"),
             "{balance}"
         );
 
         // The node saw its coins go, and only those.
         let gone: BTreeSet<OutPoint> = spent.iter().map(|coin| coin.outpoint).collect();
         wait_for(
-            "LND to see its coins spent",
+            "LND to hold the round's change",
             Duration::from_secs(60),
-            || list().iter().all(|coin| !gone.contains(&coin.outpoint)),
+            || {
+                let now = list();
+                now.iter().all(|coin| !gone.contains(&coin.outpoint))
+                    && now.iter().any(|coin| coin.outpoint.txid == txid)
+            },
         )
         .await;
         let after = list();

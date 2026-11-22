@@ -11,9 +11,13 @@
 //! - **What is kept from the answers** is outpoints, amounts, scripts, depths and close kinds. A channel's
 //!   funding outpoint, the peer's key and the node's identity are in those answers and are never parsed
 //!   into anything.
-//! - **The macaroon is a spending credential** when it carries `signer:generate`: with it, any coin of the
-//!   node's wallet can be signed away. `lncli bakemacaroon info:read onchain:read offchain:read` is enough
-//!   to list coins; a round adds `onchain:write signer:generate`.
+//! - **The macaroon is a spending credential** once it may call `ComputeInputScript`: with it, any coin of
+//!   the node's wallet can be signed away. Bake one limited to the calls used, by `uri:` permission (never
+//!   `signer:generate`, which also reaches the node's channel and identity keys through `SignOutputRaw`):
+//!   the list is in the README. It must be in a file only its owner can read.
+//! - **A round must not take what the node needs to stay safe.** LND keeps a reserve to fee-bump the force
+//!   close of its anchor channels and enforces it on its own sends. It does not on a spend it only signs,
+//!   so [`keeps_reserve`] does.
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -35,8 +39,10 @@ use vortex_ng_core::bitcoin::base64::engine::general_purpose::STANDARD;
 use vortex_ng_core::bitcoin::consensus::encode::serialize;
 use vortex_ng_core::bitcoin::hex::DisplayHex;
 use vortex_ng_core::bitcoin::secp256k1::{PublicKey, XOnlyPublicKey, schnorr};
+use vortex_ng_core::bitcoin::transaction::Version;
 use vortex_ng_core::bitcoin::{
-    Amount, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid, ecdsa,
+    Address, Amount, Network, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+    Txid, Witness, absolute, ecdsa,
 };
 use vortex_ng_core::lnclose::CloseKind;
 use vortex_ng_core::sig::{InputSigner, encode_sw0, encode_tr0};
@@ -53,6 +59,10 @@ const MAX_MACAROON: u64 = 64 * 1024;
 const MAX_CERT: u64 = 64 * 1024;
 /// How long a lease holds a coin if nothing releases it: longer than the longest round `coinjoin` runs.
 const LEASE_SECONDS: u64 = 1_200;
+/// How long the coins stay held when a broadcast failed in a way that does not say whether it got out.
+const UNKNOWN_BROADCAST_SECONDS: u64 = 86_400;
+/// Confirmations of the spending transaction after which the node may forget a broadcast round's lease.
+const HOLD_UNTIL_SPEND_CONFS: u32 = 6;
 const SIGHASH_ALL: u32 = 1;
 const SIGHASH_DEFAULT: u32 = 0;
 
@@ -134,9 +144,8 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
-/// A file of at most `limit` bytes.
-fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, LndError> {
-    let file = std::fs::File::open(path).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+/// An open file of at most `limit` bytes (`path` is for the error).
+fn read_limited(file: std::fs::File, path: &Path, limit: u64) -> Result<Vec<u8>, LndError> {
     let mut bytes = Vec::new();
     file.take(limit + 1)
         .read_to_end(&mut bytes)
@@ -169,21 +178,27 @@ impl Lnd {
     /// The node at `address` (`host:port`, its `restlisten`), which must present the certificate in
     /// `tls_cert`, authenticated with the macaroon in `macaroon`: a file no other user may read.
     pub fn open(address: &str, tls_cert: &Path, macaroon: &Path) -> Result<Lnd, LndError> {
-        let mode = std::fs::metadata(macaroon)
+        // The file that is checked is the file that is read: one handle for both.
+        let file = std::fs::File::open(macaroon)
+            .map_err(|e| fail(format!("{}: {e}", macaroon.display())))?;
+        let mode = file
+            .metadata()
             .map_err(|e| fail(format!("{}: {e}", macaroon.display())))?
             .permissions()
             .mode();
-        if mode & 0o007 != 0 {
+        if mode & 0o077 != 0 {
             return Err(fail(format!(
-                "{} can be read by other users: it can spend the node's coins (chmod o-rwx)",
+                "{} can be read by other users: it can spend the node's coins (chmod 600)",
                 macaroon.display()
             )));
         }
-        let mut raw = read_limited(macaroon, MAX_MACAROON)?;
+        let mut raw = read_limited(file, macaroon, MAX_MACAROON)?;
         let hex = Zeroizing::new(raw.to_lower_hex_string());
         raw.zeroize();
 
-        let pem = read_limited(tls_cert, MAX_CERT)?;
+        let cert_file = std::fs::File::open(tls_cert)
+            .map_err(|e| fail(format!("{}: {e}", tls_cert.display())))?;
+        let pem = read_limited(cert_file, tls_cert, MAX_CERT)?;
         let cert = CertificateDer::from_pem_slice(&pem)
             .map_err(|_| fail(format!("{}: no certificate in it", tls_cert.display())))?
             .into_owned();
@@ -279,15 +294,98 @@ impl Lnd {
             .ok_or_else(|| fail("the node does not say which network it is on"))
     }
 
-    /// The wallet's confirmed coins, each with the kind of close that paid it if one did.
+    /// The confirmed coins of the wallet's default account (the one LND can sign for at any time), each
+    /// with the kind of close that paid it if one did.
     pub fn coins(&self) -> Result<Vec<LndCoin>, LndError> {
         let utxos = self.call(
             "POST",
             "/v2/wallet/utxos",
-            Some(&json!({"min_confs": 1, "max_confs": i32::MAX})),
+            Some(&json!({"min_confs": 1, "max_confs": i32::MAX, "account": "default"})),
         )?;
         let closed = self.call("GET", "/v1/channels/closed", None)?;
         parse_coins(&utxos, &parse_closes(&closed)?)
+    }
+
+    /// What the node must keep in its wallet to fee-bump the force close of its open anchor channels.
+    /// LND enforces this on its own sends. A spend it only signs for, as a round is, has to enforce it
+    /// here ([`keeps_reserve`]): without those funds a commitment transaction may never confirm, and the
+    /// channel's HTLCs can be lost. An answer without the figure is an error, never a reserve of zero.
+    pub fn anchor_reserve(&self) -> Result<u64, LndError> {
+        let balance = self.call("GET", "/v1/balance/blockchain", None)?;
+        int(balance.get("reserved_balance_anchor_chan"))
+            .ok_or_else(|| fail("the node does not say what it must keep for its anchor channels"))
+    }
+
+    /// A fresh change address of the node's wallet, as a script: P2TR or P2WPKH, on `network`. A round's
+    /// change goes back where the coin came from, so that it does not carry a channel's history into a
+    /// mixdepth, and so that a small round does not move a whole coin out of the node.
+    pub fn next_change_script(
+        &self,
+        network: Network,
+        taproot: bool,
+    ) -> Result<ScriptBuf, LndError> {
+        let kind = if taproot {
+            "TAPROOT_PUBKEY"
+        } else {
+            "WITNESS_PUBKEY_HASH"
+        };
+        let answer = self.call(
+            "POST",
+            "/v2/wallet/address/next",
+            Some(&json!({"type": kind, "change": true})),
+        )?;
+        let script = answer
+            .get("addr")
+            .and_then(Value::as_str)
+            .and_then(|text| Address::from_str(text).ok())
+            .and_then(|address| address.require_network(network).ok())
+            .map(|address| address.script_pubkey())
+            .ok_or_else(|| fail("the node's change address is not one for this network"))?;
+        if script.is_p2tr() != taproot || script.is_p2wpkh() == taproot {
+            return Err(fail("the node's change address is of another type"));
+        }
+        Ok(script)
+    }
+
+    /// Whether the node will sign for `coins`, found out before any maker has seen them. It signs a
+    /// throwaway transaction that states each coin's value one satoshi too high. Both BIP143 and BIP341
+    /// commit to the amount, so these signatures can never be valid on chain, whoever gets them.
+    pub fn check_can_sign(&self, coins: &[(OutPoint, TxOut)]) -> Result<(), LndError> {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: coins
+                .iter()
+                .map(|(outpoint, _)| TxIn {
+                    previous_output: *outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return([0u8; 4]),
+            }],
+        };
+        let wrong: Vec<TxOut> = coins
+            .iter()
+            .map(|(_, out)| TxOut {
+                value: out.value + Amount::from_sat(1),
+                script_pubkey: out.script_pubkey.clone(),
+            })
+            .collect();
+        let declared: Vec<OutPoint> = coins.iter().map(|(outpoint, _)| *outpoint).collect();
+        let request = sign_request(&tx, &wrong, &declared).map_err(fail)?;
+        let answer = self.call("POST", "/v2/signer/inputscript", Some(&request.json))?;
+        let signed = answer
+            .get("input_scripts")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        if signed != coins.len() {
+            return Err(fail("the node will not sign for these coins"));
+        }
+        Ok(())
     }
 
     /// Keep `outpoints` from being spent by the node until the returned [`Lease`] is dropped (or, if this
@@ -318,8 +416,8 @@ impl Lnd {
     }
 }
 
-/// Coins the node holds back for a round. Dropping it gives them back; [`Lease::keep`] is for coins that
-/// have been spent.
+/// Coins the node holds back for a round. Dropping it gives them back, which is right only while nothing
+/// has been broadcast: after that, [`Lease::hold_until_spent`] or [`Lease::hold_for_a_day`].
 #[derive(Debug)]
 pub struct Lease<'a> {
     lnd: &'a Lnd,
@@ -328,10 +426,32 @@ pub struct Lease<'a> {
 }
 
 impl Lease<'_> {
-    /// The round was broadcast: leave the coins leased, so the node cannot pick them while the
-    /// transaction is unconfirmed. The lease then runs out on its own.
-    pub fn keep(mut self) {
-        self.outpoints.clear();
+    fn renew(&mut self, terms: &Value) {
+        for outpoint in std::mem::take(&mut self.outpoints) {
+            let mut request = json!({
+                "id": STANDARD.encode(self.id),
+                "outpoint": outpoint_json(&outpoint),
+            });
+            if let (Some(request), Some(terms)) = (request.as_object_mut(), terms.as_object()) {
+                request.extend(terms.clone());
+            }
+            // Best effort: the lease already held runs on until its time.
+            let _ = self
+                .lnd
+                .call("POST", "/v2/wallet/utxos/lease", Some(&request));
+        }
+    }
+
+    /// The round was broadcast: the node holds the coins until the spend is buried, so it cannot pick one
+    /// while the transaction is unconfirmed, whatever its backend sees of the mempool.
+    pub fn hold_until_spent(mut self) {
+        self.renew(&json!({"release_after_spend_confs": HOLD_UNTIL_SPEND_CONFS}));
+    }
+
+    /// The broadcast failed without saying whether the transaction got out. A spend that never comes must
+    /// not hold the coins for good, so this one has a time limit.
+    pub fn hold_for_a_day(mut self) {
+        self.renew(&json!({"expiration_seconds": UNKNOWN_BROADCAST_SECONDS.to_string()}));
     }
 }
 
@@ -500,6 +620,30 @@ fn payload_from_witness(script: &Script, witness: &[Vec<u8>]) -> Result<String, 
     }
 }
 
+/// Whether the coins left after spending `spending` still cover `reserve`. Only confirmed coins of the
+/// default account count ([`Lnd::coins`]), which is stricter than LND's own check: a round's change goes to
+/// the vortex-ng wallet and gives the node nothing back.
+pub fn keeps_reserve(coins: &[LndCoin], spending: &[OutPoint], reserve: u64) -> bool {
+    let left: u64 = coins
+        .iter()
+        .filter(|coin| !spending.contains(&coin.outpoint))
+        .map(|coin| coin.txout.value.to_sat())
+        .sum();
+    left >= reserve
+}
+
+/// Whether a resolution's sweep is this node's own claim. Others are recorded too: a timed-out incoming HTLC
+/// is the peer's sweep, a claimed outgoing one the peer's, an anchor may be a third party's, and an anchor
+/// we did sweep was paid for with an unrelated wallet coin, so its change is not a channel's money.
+fn swept_by_us(resolution: &Value) -> bool {
+    let field = |name| resolution.get(name).and_then(Value::as_str);
+    matches!(
+        (field("resolution_type"), field("outcome")),
+        (Some("COMMIT" | "INCOMING_HTLC"), Some("CLAIMED"))
+            | (Some("OUTGOING_HTLC"), Some("TIMEOUT"))
+    )
+}
+
 /// A protobuf integer in JSON: a number, or for 64-bit fields a string.
 fn int(value: Option<&Value>) -> Option<u64> {
     let value = value?;
@@ -534,7 +678,7 @@ fn parse_closes(closed: &Value) -> Result<HashMap<Txid, CloseKind>, LndError> {
             closes.insert(closing, kind);
         }
         let resolutions = channel.get("resolutions").and_then(Value::as_array);
-        for resolution in resolutions.into_iter().flatten() {
+        for resolution in resolutions.into_iter().flatten().filter(|r| swept_by_us(r)) {
             if let Some(sweep) = txid(resolution.get("sweep_txid"))? {
                 closes.entry(sweep).or_insert(CloseKind::Sweep);
             }
@@ -665,14 +809,13 @@ fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    use vortex_ng_core::bitcoin::CompressedPublicKey;
     use vortex_ng_core::bitcoin::hashes::Hash;
     use vortex_ng_core::bitcoin::key::TapTweak;
     use vortex_ng_core::bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
     use vortex_ng_core::bitcoin::sighash::{
         EcdsaSighashType, Prevouts, SighashCache, TapSighashType,
     };
-    use vortex_ng_core::bitcoin::transaction::Version;
-    use vortex_ng_core::bitcoin::{CompressedPublicKey, Sequence, TxIn, Witness, absolute};
     use vortex_ng_core::offer::Pit;
     use vortex_ng_core::sig::verify_sig;
 
@@ -682,6 +825,10 @@ mod tests {
     const TX2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const TX3: &str = "3333333333333333333333333333333333333333333333333333333333333333";
     const TX4: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+    const TX5: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const TX6: &str = "6666666666666666666666666666666666666666666666666666666666666666";
+    const TX7: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+    const TX8: &str = "8888888888888888888888888888888888888888888888888888888888888888";
 
     fn txid(text: &str) -> Txid {
         Txid::from_str(text).unwrap()
@@ -692,8 +839,12 @@ mod tests {
         let closes = parse_closes(&json!({"channels": [
             {"close_type": "COOPERATIVE_CLOSE", "closing_tx_hash": TX1, "resolutions": []},
             {"close_type": "LOCAL_FORCE_CLOSE", "closing_tx_hash": TX2, "resolutions": [
-                {"resolution_type": "COMMIT", "sweep_txid": TX3},
-                {"resolution_type": "ANCHOR", "sweep_txid": ""},
+                {"resolution_type": "COMMIT", "outcome": "CLAIMED", "sweep_txid": TX3},
+                {"resolution_type": "ANCHOR", "outcome": "CLAIMED", "sweep_txid": TX5},
+                {"resolution_type": "INCOMING_HTLC", "outcome": "TIMEOUT", "sweep_txid": TX6},
+                {"resolution_type": "OUTGOING_HTLC", "outcome": "CLAIMED", "sweep_txid": TX7},
+                {"resolution_type": "OUTGOING_HTLC", "outcome": "TIMEOUT", "sweep_txid": TX8},
+                {"resolution_type": "COMMIT", "outcome": "CLAIMED", "sweep_txid": ""},
             ]},
             {"close_type": "FUNDING_CANCELED", "closing_tx_hash": TX4},
         ]}))
@@ -701,8 +852,12 @@ mod tests {
         assert_eq!(closes.get(&txid(TX1)), Some(&CloseKind::Cooperative));
         assert_eq!(closes.get(&txid(TX2)), Some(&CloseKind::Unilateral));
         assert_eq!(closes.get(&txid(TX3)), Some(&CloseKind::Sweep));
-        assert_eq!(closes.get(&txid(TX4)), None);
-        assert_eq!(closes.len(), 3);
+        assert_eq!(closes.get(&txid(TX8)), Some(&CloseKind::Sweep));
+        // The peer's sweeps, an anchor's, and a channel that never paid anyone.
+        for other in [TX4, TX5, TX6, TX7] {
+            assert_eq!(closes.get(&txid(other)), None, "{other}");
+        }
+        assert_eq!(closes.len(), 4);
         // A close without a close_type field is proto3's zero value, cooperative.
         let zero = parse_closes(&json!({"channels": [{"closing_tx_hash": TX1}]})).unwrap();
         assert_eq!(zero.get(&txid(TX1)), Some(&CloseKind::Cooperative));
@@ -741,6 +896,38 @@ mod tests {
         ] {
             assert!(parse_coins(&json!({"utxos": [bad]}), &closes).is_err());
         }
+    }
+
+    #[test]
+    fn a_round_must_leave_the_anchor_reserve() {
+        let coin = |text: &str, sats: u64| LndCoin {
+            outpoint: OutPoint {
+                txid: txid(text),
+                vout: 0,
+            },
+            txout: TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey: ScriptBuf::new(),
+            },
+            confirmations: 6,
+            close: None,
+        };
+        let coins = [coin(TX1, 500_000), coin(TX2, 10_000), coin(TX3, 9_999)];
+        let spend = |texts: &[&str]| -> Vec<OutPoint> {
+            texts
+                .iter()
+                .map(|text| OutPoint {
+                    txid: txid(text),
+                    vout: 0,
+                })
+                .collect()
+        };
+        // What is left is exactly the reserve, one sat short of it, or nothing.
+        assert!(keeps_reserve(&coins, &spend(&[TX1, TX3]), 10_000));
+        assert!(!keeps_reserve(&coins, &spend(&[TX1, TX2]), 10_000));
+        assert!(!keeps_reserve(&coins, &spend(&[TX1, TX2, TX3]), 10_000));
+        // No anchor channel open: nothing to keep.
+        assert!(keeps_reserve(&coins, &spend(&[TX1, TX2, TX3]), 0));
     }
 
     #[test]
@@ -945,7 +1132,11 @@ mod tests {
         std::fs::write(&macaroon, [1u8, 2, 3]).unwrap();
         let cert = dir.join("c");
         std::fs::write(&cert, b"no certificate here").unwrap();
-        for (mode, why) in [(0o644, "other users"), (0o600, "no certificate")] {
+        for (mode, why) in [
+            (0o644, "other users"),
+            (0o640, "other users"),
+            (0o600, "no certificate"),
+        ] {
             std::fs::set_permissions(&macaroon, std::fs::Permissions::from_mode(mode)).unwrap();
             let error = Lnd::open("127.0.0.1:1", &cert, &macaroon).unwrap_err();
             assert!(error.0.contains(why), "{mode:o}: {error}");

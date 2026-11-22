@@ -30,6 +30,24 @@ impl PitWallet {
             .and_then(|created_by| classify(&created_by.tx_node.tx)))
     }
 
+    /// Whether the transaction that created `outpoint` looks like a CoinJoin: two of its outputs have the
+    /// same value. Its equal outputs and its change alike have a history that must not be shown to anyone
+    /// next to another coin.
+    pub fn came_from_coinjoin(&self, m: u32, outpoint: &OutPoint) -> Result<bool, WalletError> {
+        let Some(created_by) = self.mixdepth(m)?.get_tx(outpoint.txid) else {
+            return Ok(false);
+        };
+        let mut values: Vec<_> = created_by
+            .tx_node
+            .tx
+            .output
+            .iter()
+            .map(|out| out.value)
+            .collect();
+        values.sort_unstable();
+        Ok(values.windows(2).any(|pair| pair[0] == pair[1]))
+    }
+
     /// Mixdepth `m`'s unspent outputs, each with its channel-close evidence if it has any.
     pub fn utxos_with_origin(
         &self,
@@ -206,5 +224,39 @@ mod tests {
         let coins = wallet.utxos_with_origin(1).unwrap();
         assert_eq!(coins.len(), 1);
         assert_eq!(coins[0].1, None);
+    }
+
+    #[test]
+    fn a_coin_from_a_transaction_with_equal_outputs_is_from_a_coinjoin() {
+        let mut wallet = PitWallet::new(
+            &Seed::from_mnemonic(WORDS, "", Network::Regtest).unwrap(),
+            Pit::Sw0,
+        )
+        .unwrap();
+        let (change, plain) = (
+            wallet.next_change_address(0).unwrap().script_pubkey(),
+            wallet.next_receive_address(0).unwrap().script_pubkey(),
+        );
+        let stranger = ScriptBuf::new_op_return([1u8; 4]);
+        // The change of a round: not one of the equal outputs, and its history is the round's all the same.
+        let round = paying(
+            vec![(Txid::from_byte_array([1; 32]), Witness::new(), 0xffff_fffd)],
+            &[
+                (stranger.clone(), 100_000),
+                (stranger.clone(), 100_000),
+                (change, 45_000),
+            ],
+        );
+        let payment = paying(
+            vec![(Txid::from_byte_array([2; 32]), Witness::new(), 0xffff_fffd)],
+            &[(plain, 70_000), (stranger, 30_000)],
+        );
+        let (round_id, payment_id) = (round.compute_txid(), payment.compute_txid());
+        wallet
+            .apply_block(&block_of(vec![round, payment]), 1)
+            .unwrap();
+        let at = |txid| OutPoint { txid, vout: 0 };
+        assert_eq!(wallet.came_from_coinjoin(0, &at(round_id)), Ok(true));
+        assert_eq!(wallet.came_from_coinjoin(0, &at(payment_id)), Ok(false));
     }
 }

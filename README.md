@@ -20,7 +20,8 @@ around JoinMarket's maker/taker market instead of a central coordinator:
 - **CoinJoin from a channel close.** A coin a Lightning channel close paid your wallet is recognised from
   the transaction that created it (a mutual close, a force close, or the sweep of one), and
   `coinjoin --from-closes` spends those coins and no others, so they are not merged with coins of another
-  history (ADR 0008). Closing is the moment a node's coins are easiest to link; this mixes them right after.
+  history. `coinjoin --from-lnd` does it from an LND node's own wallet, the node signing (ADR 0008). Closing is
+  the moment a node's coins are easiest to link; this mixes them right after.
 - **Upstreamable by construction.** Every protocol piece JoinMarket lacks is written as a JMP draft
   (`docs/jmp/`) for [joinmarket-ng](https://github.com/joinmarket-ng/joinmarket-ng) to adopt.
 
@@ -57,7 +58,7 @@ rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Ecl
 
 ## Command line
 
-`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin`, `balance` and `coins`.
+`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin`, `balance`, `coins` and `lnd-coins`.
 
 ```
 vortex-ng wallet new          --wallet <file> --network <network> [--words 12|24] [--birthday <height>]
@@ -73,9 +74,10 @@ vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fra
 vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
                     [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                     [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
-                    [--allow-bondless-fees] [--from-closes] [--yes]
+                    [--allow-bondless-fees] [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
 vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
 vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only] [--outpoints]
+vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
 ```
 
 `node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
@@ -104,8 +106,33 @@ vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [
   a sweep pays this wallet *directly*: a force close that the node sweeps into its own wallet, and the coin
   sent on from there, look like an ordinary payment. A taproot channel's mutual close is a lone key-path spend
   and is not recognised either. Outpoints are printed only with `--outpoints`. Nothing watches for closes or
-  spends by itself. Spending straight from a Lightning node's own wallet, which covers force closes, is
-  designed in ADR 0008 and not built.
+  spends by itself.
+- **From an LND node's own wallet**, force closes included. `lnd-coins` marks coins by the node's close records,
+  and `coinjoin --from-lnd --mixdepth <n>` spends one with the node signing: the amount goes to this wallet, the
+  change back to the node. `lnd` is `--lnd-rest <host:port> --lnd-tls-cert <file> --lnd-macaroon <file>`.
+  - It never takes what the node must keep to fee-bump its open anchor channels, and merges coins of different
+    channels only with `--merge-closes`.
+  - LND cannot prove a PoDLE, so mixdepth `<n>` must hold a small coin of the pit to commit to: five
+    confirmations, a fifth of the amount, not from a CoinJoin, used for one round only. **The makers see that
+    coin and can link it to the round.**
+  - LND pays closes to P2TR, so its close coins need `--pit tr0`, a market that is only vortex-ng and
+    joinmarket-ng's Taproot branch today. For the wider `sw0` market, close cooperatively with a `sw0` address
+    of this wallet as the delivery address and use `--from-closes`.
+  - **A macaroon that may sign can spend every coin of the node's wallet.** Keep it mode 600, and bake it for
+    exactly these calls (not `signer:generate`, which also reaches channel and identity keys):
+
+    ```
+    lncli bakemacaroon --save_to vortex-round.macaroon \
+      uri:/lnrpc.Lightning/GetInfo uri:/walletrpc.WalletKit/ListUnspent \
+      uri:/lnrpc.Lightning/ClosedChannels uri:/lnrpc.Lightning/WalletBalance \
+      uri:/walletrpc.WalletKit/LeaseOutput uri:/walletrpc.WalletKit/ReleaseOutput \
+      uri:/walletrpc.WalletKit/NextAddr uri:/signrpc.Signer/ComputeInputScript
+    chmod 600 vortex-round.macaroon
+    ```
+
+    The first four calls are enough for `lnd-coins`.
+- `coinjoin` never hands out an address twice: each is written to `<wallet>.issued` before it is used, so a
+  failed or unconfirmed round's addresses do not come back in the next one.
 - Every PoDLE commitment sent is first written to `<wallet>.podle` (the public value makers broadcast, one
   per line): a commitment is spent even by a round that fails, and each coin has three.
 - `orderbook` lists what the makers on the relays answer, and verifies their fidelity bonds when given a node.

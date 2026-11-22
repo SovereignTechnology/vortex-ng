@@ -349,14 +349,34 @@ pub fn choose_coins(cfg: &TakerConfig, mut coins: Vec<Coin>) -> Result<Vec<Coin>
     }
 }
 
-/// Choose coins held outside this wallet (a Lightning node's), largest first, until they cover the amount
-/// and [`estimated_cost`]. Unlike [`choose_coins`], none of them has to be fit to commit to: the node cannot
-/// prove a PoDLE, so the commitment comes from another coin.
+/// Choose coins held outside this wallet (a Lightning node's). Unlike [`choose_coins`], none of them has to
+/// be fit to commit to: the node cannot prove a PoDLE, so the commitment comes from another coin.
+///
+/// The smallest single coin that covers the amount and [`estimated_cost`] is taken. Merging coins shows
+/// they have one owner, and each of these is a different channel's, so it happens only with `merge`, and
+/// then largest first.
 pub fn choose_external(
     cfg: &TakerConfig,
     mut coins: Vec<(OutPoint, TxOut)>,
+    merge: bool,
 ) -> Result<Vec<(OutPoint, TxOut)>, TakerError> {
-    coins.sort_by_key(|(_, out)| std::cmp::Reverse(out.value));
+    coins.sort_by_key(|(_, out)| out.value);
+    let need_one = cfg
+        .amount
+        .saturating_add(estimated_cost(cfg, 1, ASSUMED_MAKER_INPUTS));
+    if let Some(at) = coins
+        .iter()
+        .position(|(_, out)| out.value.to_sat() >= need_one)
+    {
+        return Ok(vec![coins.swap_remove(at)]);
+    }
+    if !merge {
+        return Err(TakerError::Funds(format!(
+            "no single coin holds the {need_one} sat the round needs, and merging coins of different \
+             channels, which links them, was not asked for"
+        )));
+    }
+    coins.reverse();
     let mut chosen = Vec::new();
     let mut have = 0u64;
     for coin in coins {

@@ -9,6 +9,7 @@
 //! failed, 2 when it was not understood.
 
 mod args;
+mod issued;
 mod lightning;
 mod market;
 mod podle_log;
@@ -43,7 +44,7 @@ Usage:
   vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
                       [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                       [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
-                      [--allow-bondless-fees] [--from-closes | --from-lnd lnd] [--yes]
+                      [--allow-bondless-fees] [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
   vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
   vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only]
                       [--outpoints]
@@ -53,9 +54,9 @@ Usage:
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
 
-lnd: --lnd-rest <host:port> --lnd-tls-cert <file> --lnd-macaroon <file>. The node's `tls.cert` is pinned. To
-list coins the macaroon needs info:read onchain:read offchain:read; a round adds onchain:write signer:generate,
-and with those it can spend every coin of the node's wallet: keep it in a file only you can read.
+lnd: --lnd-rest <host:port> --lnd-tls-cert <file> --lnd-macaroon <file>. The node's `tls.cert` is pinned. The
+macaroon must be in a file only you can read (mode 600): one that may sign can spend every coin of the node's
+wallet. Bake it by `uri:` permission, as the README shows, not with `signer:generate`.
 
 Channel closes: close a channel with one of the wallet's addresses as the delivery address (`vortex-ng wallet
 addresses` lists them; LND `closechannel --delivery_addr`, CLN `close <id> <timeout> <address>`). `coins` then
@@ -66,9 +67,11 @@ are not recognised here. The recognition is evidence, not proof, and a mutual cl
 not recognised.
 
 From an LND node's own wallet, force closes included: `lnd-coins` marks the coins by the node's close records,
-and `coinjoin --from-lnd` spends those and no others, the node signing, the outputs going to this wallet. The
-node cannot prove a PoDLE, so this wallet must hold a coin of the pit (five confirmations, a fifth of the
-amount) to commit to. The makers see that coin and can link it to the round: keep a small one for it.
+and `coinjoin --from-lnd --mixdepth <n>` spends one of them, the node signing. The amount goes to this wallet
+and the change back to the node. It never takes what the node must keep to fee-bump its open anchor channels,
+and it merges coins of different channels only with `--merge-closes`. The node cannot prove a PoDLE, so mixdepth
+<n> must hold a coin of the pit to commit to (five confirmations, a fifth of the amount, not from a CoinJoin,
+never committed to before). The makers see that coin and can link it to the round: keep a small one for it.
 
 `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
 username and password, such as a Tor daemon's SOCKS port (127.0.0.1:9050). Every nick, a maker's throwaway
