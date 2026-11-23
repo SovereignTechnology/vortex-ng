@@ -361,6 +361,284 @@ fn a_maker_line_out_of_place_is_ignored() {
     );
 }
 
+/// A taker and three makers (`J5makerA`, `B`, `C`), the `!fill`s queued and not yet delivered.
+struct Round {
+    chain: FakeChain,
+    makers: BTreeMap<String, Maker>,
+    taker: Taker,
+    wallet: PitWallet,
+    queue: VecDeque<(String, Outgoing)>,
+}
+
+const MAKER_C: &str = "J5makerC";
+
+fn round_of_three(min_makers: usize) -> Round {
+    let pit = Pit::Sw0;
+    let mut chain = FakeChain::default();
+    let mut makers = BTreeMap::new();
+    let mut chosen = Vec::new();
+    for (i, nick) in ["J5makerA", "J5makerB", MAKER_C].iter().enumerate() {
+        let wallet = funded(pit, nick, 500_000, 10 + i as u8, &mut chain);
+        let maker = Maker::new(MakerConfig::new(vec![offer(pit, i as u64)]), wallet).unwrap();
+        makers.insert(nick.to_string(), maker);
+        chosen.push((nick.to_string(), offer(pit, i as u64)));
+    }
+    let mut wallet = funded(pit, "taker", 600_000, 20, &mut chain);
+    let utxo = wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&wallet, 0, &utxo, 0).unwrap();
+    let cfg = TakerConfig {
+        makers: 3,
+        ..choice_cfg(AMOUNT)
+    };
+    let cj = wallet.next_receive_address(1).unwrap().script_pubkey();
+    let change = wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(cfg, 0, vec![(utxo.outpoint, utxo.txout)], podle, cj, change)
+        .unwrap()
+        .allow_fewer_makers(min_makers)
+        .unwrap();
+    let queue = taker
+        .start(chosen)
+        .unwrap()
+        .into_iter()
+        .map(|out| ("J5taker".to_string(), out))
+        .collect();
+    Round {
+        chain,
+        makers,
+        taker,
+        wallet,
+        queue,
+    }
+}
+
+impl Round {
+    /// Carry every queued line and what it leads to, except lines to the makers in `silent`.
+    fn carry(&mut self, silent: &[&str]) -> Result<Progress, TakerError> {
+        let mut progress = Progress::Waiting;
+        while let Some((from, message)) = self.queue.pop_front() {
+            let Outgoing::Private { to, command, body } = message else {
+                continue;
+            };
+            if silent.contains(&to.as_str()) {
+                continue;
+            }
+            let cmd = to_command(&command, &body);
+            if let Some(maker) = self.makers.get_mut(&to) {
+                for out in maker.handle(&from, cmd, &self.chain, NOW) {
+                    self.queue.push_back((to.clone(), out));
+                }
+            } else {
+                let (outs, now) = self.taker.handle(&from, cmd, &self.chain)?;
+                progress = now;
+                self.queue
+                    .extend(outs.into_iter().map(|o| ("J5taker".to_string(), o)));
+            }
+        }
+        Ok(progress)
+    }
+
+    fn send(&mut self, outs: Vec<Outgoing>) {
+        self.queue
+            .extend(outs.into_iter().map(|o| ("J5taker".to_string(), o)));
+    }
+
+    /// Take the queued lines to `nick` out of the queue, to deliver late.
+    fn hold(&mut self, nick: &str) -> Vec<(String, Outgoing)> {
+        let (held, rest): (Vec<_>, Vec<_>) = self
+            .queue
+            .drain(..)
+            .partition(|(_, out)| matches!(out, Outgoing::Private { to, .. } if to == nick));
+        self.queue = rest.into();
+        held
+    }
+
+    /// `MAKER_C` as a maker whose `!ioauth` decrypts and is nonsense: only it could have written that.
+    fn bad_ioauth(&mut self) -> Result<(Vec<Outgoing>, Progress), TakerError> {
+        let key = vortex_ng_core::nacl::NaclKeypair::generate();
+        let pubkey = to_command("pubkey", &key.public_hex());
+        let (auth, _) = self.taker.handle(MAKER_C, pubkey, &self.chain).unwrap();
+        assert_eq!(auth.len(), 1);
+        let session = key.session(&self.taker.nacl.public_hex()).unwrap();
+        let ioauth = Command::Encrypted {
+            name: "ioauth".into(),
+            ciphertext: session.encrypt("not an ioauth").unwrap(),
+        };
+        self.taker.handle(MAKER_C, ioauth, &self.chain)
+    }
+
+    /// The finished round has the taker and two makers in it, each with an equal output.
+    fn assert_two_makers_signed(mut self) {
+        assert_eq!(self.taker.makers_in_round(), 2);
+        let tx = self.taker.finish(&self.wallet).unwrap();
+        assert_eq!(tx.input.len(), 3);
+        assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+        let equal = tx
+            .output
+            .iter()
+            .filter(|o| o.value.to_sat() == AMOUNT)
+            .count();
+        assert_eq!(equal, 3);
+    }
+}
+
+#[test]
+fn a_silent_maker_is_left_out_once_its_time_is_up() {
+    let mut round = round_of_three(2);
+    assert_eq!(round.carry(&[MAKER_C]).unwrap(), Progress::Waiting);
+    let txs = round.taker.go_on_without_silent(&round.chain).unwrap();
+    assert_eq!(txs.len(), 2, "one !tx for each maker that answered");
+    round.send(txs);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::MakersSigned);
+    round.assert_two_makers_signed();
+}
+
+#[test]
+fn by_default_a_round_waits_for_every_maker() {
+    let mut round = round_of_three(3);
+    let late = round.hold(MAKER_C);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::Waiting);
+    assert!(
+        round
+            .taker
+            .go_on_without_silent(&round.chain)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(round.taker.makers_in_round(), 3);
+    round.queue.extend(late);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::MakersSigned);
+    let tx = round.taker.finish(&round.wallet).unwrap();
+    assert_eq!(tx.input.len(), 4);
+}
+
+#[test]
+fn too_few_answers_wait_for_a_late_one() {
+    let mut round = round_of_three(2);
+    let late_b = round.hold("J5makerB");
+    let _never = round.hold(MAKER_C);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::Waiting);
+    // One answer of the two needed: nobody is dropped yet.
+    assert!(
+        round
+            .taker
+            .go_on_without_silent(&round.chain)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(round.taker.makers_in_round(), 3);
+    round.queue.extend(late_b);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::Waiting);
+    let txs = round.taker.go_on_without_silent(&round.chain).unwrap();
+    assert_eq!(txs.len(), 2);
+    round.send(txs);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::MakersSigned);
+    round.assert_two_makers_signed();
+}
+
+#[test]
+fn a_maker_whose_ioauth_does_not_hold_up_is_left_out() {
+    // It fails first: the others then finish the round.
+    let mut round = round_of_three(2);
+    let (outs, _) = round.bad_ioauth().unwrap();
+    assert!(outs.is_empty());
+    assert_eq!(round.taker.makers_in_round(), 2);
+    assert_eq!(round.carry(&[MAKER_C]).unwrap(), Progress::MakersSigned);
+    round.assert_two_makers_signed();
+
+    // It fails last: dropping it is what lets the transaction go out.
+    let mut round = round_of_three(2);
+    assert_eq!(round.carry(&[MAKER_C]).unwrap(), Progress::Waiting);
+    let (txs, _) = round.bad_ioauth().unwrap();
+    assert_eq!(txs.len(), 2);
+    round.send(txs);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::MakersSigned);
+    round.assert_two_makers_signed();
+
+    // Without room to lose it, the round ends and names it.
+    let mut round = round_of_three(3);
+    match round.bad_ioauth() {
+        Err(TakerError::Maker(nick, _)) => assert_eq!(nick, MAKER_C),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_maker_that_says_error_is_left_out_and_not_heard_again() {
+    let mut round = round_of_three(2);
+    assert_eq!(round.carry(&[MAKER_C]).unwrap(), Progress::Waiting);
+    let (txs, _) = round
+        .taker
+        .handle(MAKER_C, Command::Error("no".into()), &round.chain)
+        .unwrap();
+    assert_eq!(txs.len(), 2);
+    let pubkey = to_command("pubkey", &"ab".repeat(32));
+    let (outs, _) = round.taker.handle(MAKER_C, pubkey, &round.chain).unwrap();
+    assert!(outs.is_empty(), "no !auth for a maker that left the round");
+    round.send(txs);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::MakersSigned);
+    round.assert_two_makers_signed();
+}
+
+#[test]
+fn once_the_transaction_is_out_every_maker_in_it_is_needed() {
+    let mut round = round_of_three(1);
+    assert_eq!(round.carry(&[MAKER_C]).unwrap(), Progress::Waiting);
+    assert_eq!(
+        round
+            .taker
+            .go_on_without_silent(&round.chain)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(round.taker.unsigned_tx().is_some());
+    let failed = round
+        .taker
+        .handle("J5makerA", Command::Error("no".into()), &round.chain);
+    assert!(matches!(failed, Err(TakerError::Maker(..))), "{failed:?}");
+    assert_eq!(round.taker.makers_in_round(), 2);
+}
+
+#[test]
+fn a_line_the_maker_need_not_have_written_does_not_take_it_out() {
+    let mut round = round_of_three(1);
+    for cmd in [
+        to_command("ioauth", "AAAA"),
+        to_command("sig", "AAAA"),
+        Command::Pubkey {
+            nacl_pubkey: "not a key".into(),
+            extensions: Vec::new(),
+        },
+    ] {
+        let (outs, _) = round.taker.handle(MAKER_C, cmd, &round.chain).unwrap();
+        assert!(outs.is_empty());
+    }
+    assert_eq!(round.taker.makers_in_round(), 3);
+}
+
+#[test]
+fn the_floor_is_between_one_and_the_makers_asked_for() {
+    let taker = |min| {
+        let mut chain = FakeChain::default();
+        let wallet = funded(Pit::Sw0, "taker", 600_000, 20, &mut chain);
+        let utxo = wallet.utxos(0).unwrap().remove(0);
+        let podle = podle_for(&wallet, 0, &utxo, 0).unwrap();
+        let cj = wallet.peek_address(1, false, 0).unwrap().script_pubkey();
+        let change = wallet.peek_address(0, true, 0).unwrap().script_pubkey();
+        let cfg = TakerConfig {
+            makers: 3,
+            ..choice_cfg(AMOUNT)
+        };
+        Taker::new(cfg, 0, vec![(utxo.outpoint, utxo.txout)], podle, cj, change)
+            .unwrap()
+            .allow_fewer_makers(min)
+    };
+    assert!(taker(0).is_err());
+    assert!(taker(1).is_ok());
+    assert!(taker(3).is_ok());
+    assert!(taker(4).is_err());
+}
+
 #[test]
 fn maker_selection() {
     let cfg = TakerConfig {

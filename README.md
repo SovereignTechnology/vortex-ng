@@ -68,7 +68,7 @@ vortex-ng maker     --wallet <file> where node (--fee-rel <fraction> | --fee-abs
                     [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
                     [--upkeep <seconds>]
 vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
-                    [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
+                    [--min-makers <n>] [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                     [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
                     [--allow-bondless-fees] [--yes]
 vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
@@ -110,6 +110,10 @@ daemon's SOCKS port (`--proxy`).
   and at least 2,000 sat unless `--max-maker-fee` says otherwise), takes makers without a fidelity bond only
   at a zero fee unless `--allow-bondless-fees`, shows what it is about to do and asks before sending anything
   (`--yes` skips the question). The transaction is checked with the node before it is broadcast.
+- By default `coinjoin` needs every maker it asked for. With `--min-makers <n>` it leaves out a maker that fails
+  or does not answer within 60 seconds and goes on with at least `n`, up to the moment the transaction goes out;
+  after that every maker in it has to sign. Fewer makers is a smaller anonymity set, and whoever carries the
+  lines can make a maker look silent, so `n` is also how far they could thin out a round.
 - Every PoDLE commitment sent is first written to `<wallet>.podle` (the public value makers broadcast, one
   per line): a commitment is spent even by a round that fails, and each coin has three.
 - `orderbook` lists what the makers answer, with the channel each answered on, and verifies their fidelity

@@ -386,7 +386,7 @@ pub fn podle_for(
 /// Why a round failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TakerError {
-    /// A maker misbehaved or refused (its nick and why).
+    /// A maker misbehaved or refused (its nick and why), and the round cannot go on without it.
     Maker(String, String),
     /// We cannot build the transaction (funds, fees).
     Funds(String),
@@ -432,6 +432,20 @@ struct MakerSlot {
     io: Option<MakerIo>,
 }
 
+impl MakerSlot {
+    /// What the maker gets back from inputs worth `total`: refused if they do not cover the amount, or leave
+    /// less than the change threshold.
+    fn change(&self, nick: &str, total: u64, amount: u64) -> Result<u64, TakerError> {
+        let change = (total + self.cjfee)
+            .checked_sub(amount + self.offer.txfee)
+            .ok_or_else(|| err(nick, "inputs do not cover the amount"))?;
+        if change < MAKER_CHANGE_THRESHOLD_SAT {
+            return Err(err(nick, "maker change below the threshold"));
+        }
+        Ok(change)
+    }
+}
+
 /// Most `!pubkey` keys answered per maker. The first ones stay and later ones are ignored, so keys harvested
 /// from the maker and delivered after its real one cannot push that one out, and each costs at most one `!auth`.
 pub const MAX_PUBKEY_CANDIDATES: usize = 16;
@@ -446,6 +460,10 @@ pub struct Taker {
     cj_script: ScriptBuf,
     change_script: ScriptBuf,
     makers: BTreeMap<String, MakerSlot>,
+    /// The fewest makers the round may go on with: all it asked for, unless [`Taker::allow_fewer_makers`]
+    /// lowered it. Whoever carries the lines can make a maker look silent, so this floor is what stops them
+    /// from whittling a round down to the makers they run.
+    min_makers: usize,
     tx: Option<Transaction>,
     prevouts: Vec<TxOut>,
     witnesses: BTreeMap<usize, Witness>,
@@ -487,6 +505,7 @@ impl Taker {
             return Err(TakerError::Funds("outputs must be of the pit".into()));
         }
         Ok(Taker {
+            min_makers: cfg.makers,
             cfg,
             nacl: NaclKeypair::generate(),
             podle,
@@ -499,6 +518,23 @@ impl Taker {
             prevouts: Vec::new(),
             witnesses: BTreeMap::new(),
         })
+    }
+
+    /// Let the round go on with as few as `min_makers` when others fail. Fewer makers is a smaller anonymity
+    /// set, so the default is none: every maker asked for, or no transaction.
+    pub fn allow_fewer_makers(mut self, min_makers: usize) -> Result<Taker, TakerError> {
+        if min_makers == 0 || min_makers > self.cfg.makers {
+            return Err(TakerError::Internal(
+                "the minimum of makers must be from 1 to the number asked for".into(),
+            ));
+        }
+        self.min_makers = min_makers;
+        Ok(self)
+    }
+
+    /// How many makers are still in the round.
+    pub fn makers_in_round(&self) -> usize {
+        self.makers.len()
     }
 
     /// Send `!fill` to the chosen makers.
@@ -547,9 +583,10 @@ impl Taker {
         &self.prevouts
     }
 
-    /// Handle a verified command from maker `from`. A stray line is ignored (`Ok` with nothing to send); an
-    /// error is a maker that failed the round, or `!error`. A driver on a channel that does not authenticate
-    /// senders should not pass `!error` on: anyone could have delivered it.
+    /// Handle a verified command from maker `from`. A stray line is ignored (`Ok` with nothing to send). A
+    /// maker that fails, by an `!ioauth` that does not hold up or by `!error`, leaves the round; an error means
+    /// the round cannot go on without it. A driver on a channel that does not authenticate senders should not
+    /// pass `!error` on: anyone could have delivered it.
     pub fn handle(
         &mut self,
         from: &str,
@@ -567,16 +604,16 @@ impl Taker {
             Command::Encrypted { name, ciphertext } if name == "sig" => {
                 self.on_sig(from, &ciphertext)
             }
-            Command::Error(e) => Err(err(
-                from,
-                format!(
+            Command::Error(e) => {
+                let why = format!(
                     "maker error: {}",
                     e.chars()
                         .filter(|c| c.is_ascii_graphic() || *c == ' ')
                         .take(80)
                         .collect::<String>()
-                ),
-            )),
+                );
+                self.drop_maker(from, why, chain)
+            }
             _ => Ok(self.stray()),
         }
     }
@@ -598,13 +635,14 @@ impl Taker {
         {
             return Ok(self.stray());
         }
-        let session = self
-            .nacl
-            .session(maker_nacl)
-            .map_err(|e| err(from, e.to_string()))?;
+        // The signature does not cover the command, so this may be another of the maker's lines relabelled:
+        // it says nothing against the maker.
+        let Ok(session) = self.nacl.session(maker_nacl) else {
+            return Ok(self.stray());
+        };
         let body = session
             .encrypt(&revelation)
-            .map_err(|e| err(from, e.to_string()))?;
+            .map_err(|e| TakerError::Internal(e.to_string()))?;
         slot.candidates.push((key, session));
         Ok((
             vec![Outgoing::Private {
@@ -635,30 +673,56 @@ impl Taker {
         ciphertext: &str,
         chain: &impl ChainLookup,
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
+        let Some((candidate, plaintext, maker_nacl)) = self.open_ioauth(from, ciphertext) else {
+            return Ok(self.stray());
+        };
+        // It decrypted with a session of this round, so the maker wrote it: unlike a line that merely verifies,
+        // nobody else can have made it fail these checks.
+        let io = match self.check_ioauth(from, &plaintext, &maker_nacl, chain) {
+            Ok(io) => io,
+            Err(TakerError::Maker(_, why)) => return self.drop_maker(from, why, chain),
+            Err(other) => return Err(other),
+        };
+        let slot = self
+            .makers
+            .get_mut(from)
+            .ok_or_else(|| err(from, "unknown"))?;
+        let (_, session) = slot.candidates.swap_remove(candidate);
+        slot.candidates.clear();
+        slot.session = Some(session);
+        slot.maker_nacl = maker_nacl;
+        slot.io = Some(io);
+        self.build_when_ready(chain)
+    }
+
+    /// The `!ioauth` plaintext, if the line is one this round is waiting for: which candidate session opened
+    /// it, the text, and that session's maker key.
+    fn open_ioauth(&self, from: &str, ciphertext: &str) -> Option<(usize, String, String)> {
+        let slot = self.makers.get(from)?;
+        if slot.io.is_some() {
+            return None;
+        }
+        // Before `!pubkey`, or for none of the sessions we offered: not this round's.
+        slot.candidates
+            .iter()
+            .enumerate()
+            .find_map(|(i, (key, session))| {
+                let plaintext = session.decrypt(ciphertext).ok()?;
+                Some((i, plaintext, key.clone()))
+            })
+    }
+
+    /// Everything a maker's `!ioauth` claims, against the chain and the rest of the round.
+    fn check_ioauth(
+        &self,
+        from: &str,
+        plaintext: &str,
+        maker_nacl: &str,
+        chain: &impl ChainLookup,
+    ) -> Result<MakerIo, TakerError> {
         let secp = Secp256k1::new();
         let pit = self.cfg.pit;
-        let (candidate, plaintext, maker_nacl) = {
-            let Some(slot) = self.makers.get(from) else {
-                return Ok(self.stray());
-            };
-            if slot.io.is_some() {
-                return Ok(self.stray());
-            }
-            // Before `!pubkey`, or for none of the sessions we offered: not this round's.
-            let found = slot
-                .candidates
-                .iter()
-                .enumerate()
-                .find_map(|(i, (key, session))| {
-                    let plaintext = session.decrypt(ciphertext).ok()?;
-                    Some((i, plaintext, key.clone()))
-                });
-            let Some(found) = found else {
-                return Ok(self.stray());
-            };
-            found
-        };
-        let io = Ioauth::parse(&plaintext).ok_or_else(|| err(from, "malformed !ioauth"))?;
+        let io = Ioauth::parse(plaintext).ok_or_else(|| err(from, "malformed !ioauth"))?;
         if io.utxos.len() > self.cfg.max_maker_utxos {
             return Err(err(from, "too many inputs"));
         }
@@ -732,23 +796,56 @@ impl Taker {
         if taken.contains(&&cj_script) || taken.contains(&&change_script) {
             return Err(err(from, "address already used in this round"));
         }
-        let slot = self
-            .makers
-            .get_mut(from)
-            .ok_or_else(|| err(from, "unknown"))?;
-        let (_, session) = slot.candidates.swap_remove(candidate);
-        slot.candidates.clear();
-        slot.session = Some(session);
-        slot.maker_nacl = maker_nacl;
-        slot.io = Some(MakerIo {
+        let total: u64 = utxos.iter().map(|(_, o)| o.value.to_sat()).sum();
+        self.makers
+            .get(from)
+            .ok_or_else(|| err(from, "unknown"))?
+            .change(from, total, self.cfg.amount)?;
+        Ok(MakerIo {
             utxos,
             cj_script,
             change_script,
-        });
-        if self.makers.values().all(|s| s.io.is_some()) {
+        })
+    }
+
+    /// Build and send the transaction once every maker still in the round has answered.
+    fn build_when_ready(
+        &mut self,
+        chain: &impl ChainLookup,
+    ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
+        if self.tx.is_none() && self.makers.values().all(|s| s.io.is_some()) {
             return self.build_and_send(chain);
         }
         Ok((Vec::new(), Progress::Waiting))
+    }
+
+    /// Take a failed maker out of the round. Once the transaction has gone out, every maker in it has to
+    /// sign that transaction, so the round ends; before that it goes on if enough makers remain.
+    fn drop_maker(
+        &mut self,
+        nick: &str,
+        why: impl Into<String>,
+        chain: &impl ChainLookup,
+    ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
+        if self.tx.is_some() || self.makers.len() <= self.min_makers {
+            return Err(err(nick, why));
+        }
+        self.makers.remove(nick);
+        self.build_when_ready(chain)
+    }
+
+    /// The makers have had their time to answer: go on with those that did, if they are enough, and send them
+    /// the transaction. With too few it does nothing, and a late answer can still make up the number.
+    pub fn go_on_without_silent(
+        &mut self,
+        chain: &impl ChainLookup,
+    ) -> Result<Vec<Outgoing>, TakerError> {
+        let answered = self.makers.values().filter(|s| s.io.is_some()).count();
+        if self.tx.is_some() || answered < self.min_makers || answered == self.makers.len() {
+            return Ok(Vec::new());
+        }
+        self.makers.retain(|_, slot| slot.io.is_some());
+        Ok(self.build_when_ready(chain)?.0)
     }
 
     fn build_and_send(
@@ -765,12 +862,7 @@ impl Taker {
         for (nick, slot) in &self.makers {
             let io = slot.io.as_ref().ok_or_else(|| err(nick, "no !ioauth"))?;
             let total: u64 = io.utxos.iter().map(|(_, o)| o.value.to_sat()).sum();
-            let change = (total + slot.cjfee)
-                .checked_sub(amount + slot.offer.txfee)
-                .ok_or_else(|| err(nick, "inputs do not cover the amount"))?;
-            if change < MAKER_CHANGE_THRESHOLD_SAT {
-                return Err(err(nick, "maker change below the threshold"));
-            }
+            let change = slot.change(nick, total, amount)?;
             inputs.extend(io.utxos.iter().cloned());
             outputs.push(TxOut {
                 value: Amount::from_sat(amount),

@@ -38,7 +38,7 @@ Usage:
                       [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
                       [--upkeep <seconds>]
   vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
-                      [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
+                      [--min-makers <n>] [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                       [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
                       [--allow-bondless-fees] [--yes]
   vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]

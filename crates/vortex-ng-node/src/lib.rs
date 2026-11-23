@@ -733,6 +733,11 @@ pub async fn fetch_orderbook_for<C: Channel>(
     Ok(settle(channels))
 }
 
+/// How long the chosen makers have to answer a `!fill` with their inputs before a round allowed to go on with
+/// fewer does so (reference JoinMarket's `maker_timeout_sec`). At most half the time the round has left, so
+/// that the makers still have time to sign.
+const MAKER_ANSWER_TIME: Duration = Duration::from_secs(60);
+
 /// Run one CoinJoin as the taker: ask for the orderbook, gather the makers' private answers (offers and
 /// `!tbond` proofs; offer events serve only to discover makers that missed the request) for `gather`,
 /// verify the bonds, pick makers, run the round, and return the fully signed transaction (signed last,
@@ -771,30 +776,46 @@ pub async fn run_taker<C: Channel>(
     for fill in taker.start(chosen).map_err(NodeError::Taker)? {
         deliver(client, &peers, chain, vec![fill]).await?;
     }
+    let now = Instant::now();
+    let answer_by = now + MAKER_ANSWER_TIME.min(until.saturating_duration_since(now) / 2);
     while let Some(left) = until.checked_duration_since(Instant::now()) {
-        let Next::Message(Incoming::Private { msg, route }) = client.receive(left).await else {
-            continue;
+        // Wake up for the answer time while it is still ahead.
+        let wait = match answer_by.checked_duration_since(Instant::now()) {
+            Some(to_answer) if !to_answer.is_zero() => left.min(to_answer),
+            _ => left,
         };
-        // Anyone who can reach our nick can write to us: only the round's makers are heard, so an outsider
-        // cannot abort the round.
-        if !in_round.contains(&msg.from) {
-            continue;
+        match client.receive(wait).await {
+            // Anyone who can reach our nick can write to us: only the round's makers are heard, so an outsider
+            // cannot abort the round.
+            Next::Message(Incoming::Private { msg, route }) if in_round.contains(&msg.from) => {
+                // The route stays the one the maker answered the orderbook on: a line delivered again through
+                // another directory or channel must not move the round's replies there.
+                for cmd in commands(&msg) {
+                    // Where anyone could have delivered it, a lone `!error` says nothing about the maker: the
+                    // round's deadline decides.
+                    if matches!(cmd, Command::Error(_)) && !client.authenticates(&route) {
+                        continue;
+                    }
+                    let (outgoing, progress) = blocking(|| taker.handle(&msg.from, cmd, chain))
+                        .map_err(NodeError::Taker)?;
+                    // A line that could not go (a full queue, say) does not end the round: the deadline does.
+                    let _ = deliver(client, &peers, chain, outgoing).await;
+                    if progress == Progress::MakersSigned {
+                        return taker.finish(wallet).map_err(NodeError::Taker);
+                    }
+                }
+            }
+            Next::Closed => {
+                return Err(NodeError::Channel(ChannelError::Transport(
+                    "every channel closed during the round".into(),
+                )));
+            }
+            _ => {}
         }
-        // The route stays the one the maker answered the orderbook on: a line delivered again through
-        // another directory or channel must not move the round's replies there.
-        for cmd in commands(&msg) {
-            // Where anyone could have delivered it, a lone `!error` says nothing about the maker: the round's
-            // deadline decides.
-            if matches!(cmd, Command::Error(_)) && !client.authenticates(&route) {
-                continue;
-            }
-            let (outgoing, progress) =
-                blocking(|| taker.handle(&msg.from, cmd, chain)).map_err(NodeError::Taker)?;
-            // A line that could not go (a full queue, say) does not end the round: the deadline does.
+        if Instant::now() >= answer_by {
+            let outgoing =
+                blocking(|| taker.go_on_without_silent(chain)).map_err(NodeError::Taker)?;
             let _ = deliver(client, &peers, chain, outgoing).await;
-            if progress == Progress::MakersSigned {
-                return taker.finish(wallet).map_err(NodeError::Taker);
-            }
         }
     }
     Err(NodeError::Timeout)
