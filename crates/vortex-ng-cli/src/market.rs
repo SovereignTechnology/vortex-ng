@@ -331,7 +331,10 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let channel = channel_network(network);
     let (us, seen_on, book) = runtime()?.block_on(async {
         let (mut client, labels) = channels(channel, &meeting, &outbound, Role::Taker).await?;
-        let usable = |offer: &Offer| only.is_none_or(|pit| offer.offer_type.pit == pit);
+        let usable = |offer: &Offer| {
+            only.is_none_or(|pit| offer.offer_type.pit == pit)
+                .then_some(0)
+        };
         let gather = Duration::from_secs(wait.into());
         let book = fetch_orderbook_for(&mut client, channel, gather, usable)
             .await
@@ -610,6 +613,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         "pit",
         "amount",
         "makers",
+        "min-makers",
         "mixdepth",
         "destination",
         "fee-rate",
@@ -626,6 +630,10 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         _ => return Err(usage("`--amount <sats>` is required")),
     };
     let makers = args.number("makers", 3, 1..=20).map_err(Failure::Usage)? as usize;
+    // Off by default: going on with fewer makers than asked for is a smaller anonymity set.
+    let min_makers = args
+        .number("min-makers", makers as u32, 1..=makers as u32)
+        .map_err(Failure::Usage)? as usize;
     let mixdepth = args
         .number("mixdepth", 0, 0..=MIXDEPTHS - 1)
         .map_err(Failure::Usage)?;
@@ -743,6 +751,11 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
             "may charge a fee"
         }
     );
+    if min_makers < makers {
+        println!(
+            "If makers fail, the round goes on with as few as {min_makers}: a smaller anonymity set."
+        );
+    }
     if !args.flag("yes") && !secret::confirm("Proceed?").map_err(failed)? {
         return Err(failed("not confirmed: nothing was sent"));
     }
@@ -757,6 +770,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         cj_script,
         change.clone(),
     )
+    .and_then(|taker| taker.allow_fewer_makers(min_makers))
     .map_err(taker_failed)?;
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
@@ -793,6 +807,12 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         .map(|out| out.value.to_sat())
         .sum();
     println!("Broadcast {txid}");
+    if taker.makers_in_round() < makers {
+        println!(
+            "{} of the {makers} makers asked for took part.",
+            taker.makers_in_round()
+        );
+    }
     println!(
         "{amount} sat to {to}; {} sat in maker and mining fees; {kept} sat change.",
         total.saturating_sub(amount).saturating_sub(kept)

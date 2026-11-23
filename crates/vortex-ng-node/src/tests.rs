@@ -1119,6 +1119,184 @@ async fn a_whole_coinjoin_over_direct_connections() {
     }
 }
 
+/// A third maker announces an offer and then never answers its `!fill`: a taker allowed to go on with two does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_round_goes_on_without_a_maker_that_never_answers() {
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let pit = Pit::Sw0;
+    let mut utxos = HashMap::new();
+    let maker_wallets: Vec<PitWallet> = (0..2u8)
+        .map(|i| funded(pit, &format!("left{i}"), 500_000, None, 100 + i, &mut utxos))
+        .collect();
+    let mut taker_wallet = funded(pit, "left-taker", 600_000, None, 110, &mut utxos);
+    let chain = SharedChain(Arc::new(utxos));
+    let until = Instant::now() + Duration::from_secs(24);
+    let mut handles = Vec::new();
+    for (i, wallet) in maker_wallets.into_iter().enumerate() {
+        let (chain, url) = (chain.clone(), url.clone());
+        handles.push(tokio::spawn(async move {
+            let offer =
+                Offer::parse("sw0absoffer", &format!("{i} 10000 10000000 100 500")).unwrap();
+            let mut maker = Maker::new(MakerConfig::new(vec![offer]), wallet).unwrap();
+            let keys = NickKeys::generate();
+            let mut client = NickClient::connect(keys, "regtest", &[url], None, CONNECT_TIMEOUT)
+                .await
+                .unwrap();
+            run_maker(&mut maker, &mut client, &chain, "regtest", until).await
+        }));
+    }
+    // Answers `!orderbook` like any maker, and nothing else.
+    let mut silent = NickClient::connect(
+        NickKeys::generate(),
+        "regtest",
+        std::slice::from_ref(&url),
+        None,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    silent.listen(false, true).await.unwrap();
+    let quiet = tokio::spawn(async move {
+        while Instant::now() < until {
+            let next = silent.receive(Duration::from_millis(200)).await;
+            if let Next::Message(Incoming::Public {
+                nick,
+                commands,
+                route,
+            }) = next
+                && commands.iter().any(|c| matches!(c, Command::Orderbook))
+            {
+                let body = "2 10000 10000000 100 500";
+                let _ = silent
+                    .send_private(&route, &nick, "sw0absoffer", body)
+                    .await;
+            }
+        }
+    });
+
+    let utxo = taker_wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+    let cfg = TakerConfig {
+        pit,
+        makers: 3,
+        bondless_require_zero_fee: false,
+        ..pit_config()
+    };
+    let cj = taker_wallet
+        .next_receive_address(1)
+        .unwrap()
+        .script_pubkey();
+    let change = taker_wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(
+        cfg.clone(),
+        0,
+        vec![(utxo.outpoint, utxo.txout.clone())],
+        podle,
+        cj,
+        change,
+    )
+    .unwrap()
+    .allow_fewer_makers(2)
+    .unwrap();
+    let mut client = NickClient::connect(
+        NickKeys::generate(),
+        "regtest",
+        std::slice::from_ref(&url),
+        None,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let tx = run_taker(
+        &mut taker,
+        &taker_wallet,
+        &mut client,
+        &chain,
+        &cfg,
+        Duration::from_secs(3),
+        until,
+    )
+    .await
+    .unwrap();
+    assert_eq!(taker.makers_in_round(), 2);
+    assert_eq!(tx.input.len(), 3);
+    assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+    quiet.abort();
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_round_ends_when_its_channels_close() {
+    use vortex_ng_channel::testing::{Sent, mock_channel};
+    use vortex_ng_core::nick::NickIdentity;
+
+    let pit = Pit::Sw0;
+    let mut utxos = HashMap::new();
+    let mut taker_wallet = funded(pit, "closing-taker", 600_000, None, 120, &mut utxos);
+    let chain = SharedChain(Arc::new(utxos));
+    let utxo = taker_wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+    let cfg = TakerConfig {
+        pit,
+        makers: 1,
+        bondless_require_zero_fee: false,
+        ..pit_config()
+    };
+    let cj = taker_wallet
+        .next_receive_address(1)
+        .unwrap()
+        .script_pubkey();
+    let change = taker_wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(
+        cfg.clone(),
+        0,
+        vec![(utxo.outpoint, utxo.txout.clone())],
+        podle,
+        cj,
+        change,
+    )
+    .unwrap();
+    let (mut channel, handle) = mock_channel("J5taker", true);
+    let maker = NickIdentity::generate();
+    handle.deliver_private(
+        &maker,
+        "J5taker",
+        "sw0absoffer",
+        "0 10000 10000000 100 500",
+        "a",
+    );
+    let closer = handle.clone();
+    tokio::spawn(async move {
+        loop {
+            let filled = closer
+                .sent()
+                .iter()
+                .any(|s| matches!(s, Sent::Private { command, .. } if command == "fill"));
+            if filled {
+                closer.close();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let started = Instant::now();
+    let round = run_taker(
+        &mut taker,
+        &taker_wallet,
+        &mut channel,
+        &chain,
+        &cfg,
+        Duration::from_millis(200),
+        started + Duration::from_secs(30),
+    )
+    .await;
+    assert!(matches!(round, Err(NodeError::Channel(_))), "{round:?}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
 #[test]
 fn a_flood_of_orderbook_requests_leaves_room_for_real_takers() {
     let start = Instant::now();
@@ -1200,7 +1378,7 @@ async fn a_line_relabelled_on_one_channel_does_not_take_the_maker_off_another() 
         tokio::time::sleep(Duration::from_millis(100)).await;
         later.deliver_private(&late_maker, "J5takerOnB", "sw0absoffer", body, "b");
     });
-    let usable = |offer: &Offer| offer.offer_type.pit == Pit::Sw0;
+    let usable = |offer: &Offer| (offer.offer_type.pit == Pit::Sw0).then_some(0);
     let book = fetch_orderbook_for(&mut set, "regtest", Duration::from_millis(400), usable)
         .await
         .unwrap();
@@ -1226,13 +1404,35 @@ async fn offers_a_taker_cannot_use_do_not_take_the_place_of_one_it_can() {
         let real = "99 10000 100000000 0 500";
         handle.deliver_private(&maker, "J5taker", "sw0absoffer", real, "a");
     }
-    let usable = |offer: &Offer| offer.offer_type.pit == Pit::Sw0;
+    let usable = |offer: &Offer| (offer.offer_type.pit == Pit::Sw0).then_some(0);
     let book = fetch_orderbook_for(&mut channel, "regtest", Duration::from_millis(300), usable)
         .await
         .unwrap();
     assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
     assert_eq!(book.offers[0].1.oid, 99);
     assert!(book.route(maker.nick()).is_some());
+}
+
+#[tokio::test]
+async fn an_older_dearer_offer_delivered_first_does_not_replace_the_real_one() {
+    use vortex_ng_channel::testing::mock_channel;
+    use vortex_ng_core::nick::NickIdentity;
+    use vortex_ng_core::offer::CjFee;
+
+    let (dear, cheap) = ("0 10000 100000000 0 900", "0 10000 100000000 0 500");
+    for order in [[dear, cheap], [cheap, dear]] {
+        let (mut channel, handle) = mock_channel("J5taker", false);
+        let maker = NickIdentity::generate();
+        for body in order {
+            handle.deliver_private(&maker, "J5taker", "sw0absoffer", body, "a");
+        }
+        let cost = |offer: &Offer| offer.fee_for(100_000);
+        let book = fetch_orderbook_for(&mut channel, "regtest", Duration::from_millis(200), cost)
+            .await
+            .unwrap();
+        assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
+        assert_eq!(book.offers[0].1.cjfee, CjFee::Absolute(500));
+    }
 }
 
 #[tokio::test]
