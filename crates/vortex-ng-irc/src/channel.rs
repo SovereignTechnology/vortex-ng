@@ -9,6 +9,9 @@
 //! The server, and anyone it forwards to, sees every private line's sender, recipient and size, and the
 //! plain-text steps of a round; the encrypted steps stay encrypted. Public lines are vouched for by the
 //! server's prefix only; private lines are JMP-0001 lines signed over the server's domain.
+//!
+//! The connection to the server is TLS with certificate checks, except to an onion host (Tor already encrypts
+//! and authenticates it) and on loopback. A failed check ends the attempt: it never falls back to plain text.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use vortex_ng_channel::socks::{NickConnector, Outbound};
 use vortex_ng_channel::{Channel, ChannelError, Incoming, MAX_UNLINKED, Next, SideTasks};
 use vortex_ng_core::bitcoin::secp256k1::Secp256k1;
@@ -59,12 +63,32 @@ pub struct IrcServer {
     pub port: u16,
     /// The `NETWORK=` name it is expected to announce; a server announcing another is refused.
     pub expected_network: Option<String>,
+    /// Whether the connection is TLS, with the server's certificate checked against its host name.
+    pub tls: bool,
+}
+
+/// Whether the way to `host` is private without TLS: Tor's for an onion, this machine's for loopback.
+fn private_without_tls(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host.ends_with(".onion")
+        || host == "localhost"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 impl IrcServer {
-    /// From `host:port`.
+    /// From `host:port`, which is TLS unless the host is an onion or loopback; or from `ircs://host:port`
+    /// (always TLS) or `irc://host:port` (plain text, for regtest).
     pub fn parse(text: &str) -> Option<IrcServer> {
-        let (host, port) = text.trim().rsplit_once(':')?;
+        let text = text.trim();
+        let (scheme, address) = match text.split_once("://") {
+            Some(("ircs", address)) => (Some(true), address),
+            Some(("irc", address)) => (Some(false), address),
+            Some(_) => return None,
+            None => (None, text),
+        };
+        let (host, port) = address.rsplit_once(':')?;
         let valid = !host.is_empty()
             && host.len() <= 255
             && host
@@ -75,7 +99,13 @@ impl IrcServer {
             host: host.to_string(),
             port,
             expected_network: None,
+            tls: scheme.unwrap_or_else(|| !private_without_tls(host)),
         })
+    }
+
+    /// Whether lines to this server would cross a network in the clear.
+    pub fn is_exposed(&self) -> bool {
+        !self.tls && !private_without_tls(&self.host)
     }
 }
 
@@ -104,6 +134,8 @@ struct Shared {
     config: IrcConfig,
     channel: String,
     connector: NickConnector,
+    /// The TLS settings, for a server reached over TLS.
+    tls: Option<Arc<ClientConfig>>,
     hostid: Mutex<String>,
     writer: Mutex<Option<Writers>>,
     inbox: mpsc::Sender<Arrived>,
@@ -189,6 +221,11 @@ async fn register(shared: &Shared) -> Result<(Reader, Writer), String> {
         .connect(&server.host, server.port)
         .await
         .map_err(|e| e.to_string())?;
+    // Nothing is said to the server before its certificate has checked out.
+    let stream = match &shared.tls {
+        Some(tls) => crate::tls::secure(stream, &server.host, tls).await?,
+        None => stream,
+    };
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
     let nick = shared.identity.nick();
@@ -381,12 +418,41 @@ async fn supervise(shared: Arc<Shared>, ready: mpsc::Sender<Result<(), String>>)
 impl IrcChannel {
     /// Connect `identity`'s nick to the server in `config`, through its own way out from `outbound`. Returns
     /// once the nick has joined the pit channel (later drops are reconnected in the background), or fails if
-    /// the first attempt does.
+    /// the first attempt does. A server's certificate is checked against the Mozilla root store.
     pub async fn connect(
         identity: NickIdentity,
         config: IrcConfig,
         outbound: &Outbound,
     ) -> Result<IrcChannel, ChannelError> {
+        Self::connect_trusting(identity, config, outbound, crate::tls::web_roots()).await
+    }
+
+    /// [`IrcChannel::connect`], trusting only the certificate authorities in `roots`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn connect_with_roots(
+        identity: NickIdentity,
+        config: IrcConfig,
+        outbound: &Outbound,
+        roots: RootCertStore,
+    ) -> Result<IrcChannel, ChannelError> {
+        Self::connect_trusting(identity, config, outbound, roots).await
+    }
+
+    async fn connect_trusting(
+        identity: NickIdentity,
+        config: IrcConfig,
+        outbound: &Outbound,
+        roots: RootCertStore,
+    ) -> Result<IrcChannel, ChannelError> {
+        if config.server.is_exposed() && config.network != "regtest" {
+            return Err(ChannelError::Invalid(
+                "plain-text IRC is for regtest: use TLS, or an onion server through Tor",
+            ));
+        }
+        let tls = match config.server.tls {
+            true => Some(crate::tls::client_config(roots).map_err(transport)?),
+            false => None,
+        };
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX);
         let timeout = config.timeout;
         let shared = Arc::new(Shared {
@@ -395,6 +461,7 @@ impl IrcChannel {
             identity,
             config,
             connector: outbound.connector(),
+            tls,
             writer: Mutex::new(None),
             inbox: inbox_tx,
             stop: AtomicBool::new(false),

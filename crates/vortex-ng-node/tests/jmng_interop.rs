@@ -119,7 +119,12 @@ impl Harness {
     /// Where the sides meet, for the log.
     fn place(&self, url: &str) -> String {
         match (&self.irc, &self.directory) {
-            (Some(irc), _) => format!("IRC server at {}:{}", irc.host, irc.port),
+            (Some(irc), _) => format!(
+                "IRC server at {}:{}{}",
+                irc.host,
+                irc.port,
+                if irc.tls { " over TLS" } else { "" }
+            ),
             (None, Some(directory)) => {
                 format!("directory at {}:{}", directory.host, directory.port)
             }
@@ -157,17 +162,23 @@ async fn meet(harness: &Harness, url: &str, serve: bool) -> ChannelSet {
     let channel: Box<dyn vortex_ng_channel::set::DynChannel> =
         match (&harness.irc, &harness.directory) {
             (Some(server), _) => {
-                let channel = IrcChannel::connect(
-                    NickIdentity::generate(),
-                    IrcConfig {
-                        server: server.clone(),
-                        network: "regtest".into(),
-                        timeout: Duration::from_secs(60),
-                    },
-                    &Outbound::Direct,
-                )
-                .await
-                .unwrap_or_else(|e| panic!("the IRC server: {e}"));
+                let config = IrcConfig {
+                    server: server.clone(),
+                    network: "regtest".into(),
+                    timeout: Duration::from_secs(60),
+                };
+                let identity = NickIdentity::generate();
+                // A server with a certificate from the harness's own authority.
+                let connected = match std::env::var("VORTEX_NG_INTEROP_IRC_CA") {
+                    Ok(path) => {
+                        let der = std::fs::read(&path).expect("the CA certificate");
+                        let roots = vortex_ng_irc::testing::roots_from_der(&der);
+                        IrcChannel::connect_with_roots(identity, config, &Outbound::Direct, roots)
+                            .await
+                    }
+                    Err(_) => IrcChannel::connect(identity, config, &Outbound::Direct).await,
+                };
+                let channel = connected.unwrap_or_else(|e| panic!("the IRC server: {e}"));
                 println!("IRC signature domain {:?}", channel.hostid());
                 Box::new(channel)
             }

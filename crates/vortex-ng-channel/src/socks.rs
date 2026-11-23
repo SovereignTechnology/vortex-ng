@@ -43,8 +43,22 @@ pub struct DirectConnector;
 impl Connector for DirectConnector {
     type Stream = TcpStream;
     async fn connect(&self, host: String, port: u16) -> io::Result<TcpStream> {
+        // The system's resolver would be asked for the name, telling whoever runs it where we are going.
+        if is_onion(&host) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an onion address needs a Tor proxy",
+            ));
+        }
         TcpStream::connect((host.as_str(), port)).await
     }
+}
+
+/// Whether `host` is an onion name, however it is written.
+fn is_onion(host: &str) -> bool {
+    host.trim_end_matches('.')
+        .to_ascii_lowercase()
+        .ends_with(".onion")
 }
 
 /// Outbound through another SOCKS5 proxy, normally under a username and password of this connector's own.
@@ -462,6 +476,19 @@ async fn serve<C: Connector>(mut conn: TcpStream, connector: Arc<C>) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_onion_name_never_reaches_the_system_resolver() {
+        for host in ["abcdef.onion", "ABCDEF.ONION", "abcdef.onion."] {
+            let refused = DirectConnector.connect(host.to_string(), 80).await;
+            assert_eq!(
+                refused.err().map(|e| e.kind()),
+                Some(io::ErrorKind::InvalidInput),
+                "{host}"
+            );
+        }
+        assert!(!is_onion("onion.example.org"));
+    }
 
     async fn echo_server() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();

@@ -119,7 +119,7 @@ fn meeting(args: &Args) -> Result<Meeting, Failure> {
                 Some(list) if !list.is_empty() && list.len() <= MAX_IRC => list,
                 _ => {
                     return Err(usage(
-                        "`--irc` is one to four host:port, separated by commas",
+                        "`--irc` is one to four host:port (or irc://, ircs://), separated by commas",
                     ));
                 }
             }

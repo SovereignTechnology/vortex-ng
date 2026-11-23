@@ -11,7 +11,7 @@ use vortex_ng_core::nick::NickIdentity;
 use vortex_ng_core::offer::{Offer, Pit};
 
 use crate::codec::private_lines;
-use crate::testing::TestIrc;
+use crate::testing::{TestIrc, other_roots, test_roots};
 use crate::{IrcChannel, IrcConfig, IrcServer};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -254,4 +254,115 @@ async fn a_rounds_lines_go_before_orderbook_answers() {
             .is_err();
     }
     assert!(refused);
+}
+
+#[test]
+fn a_server_address_says_how_it_is_protected() {
+    let tls = |text: &str| IrcServer::parse(text).unwrap().tls;
+    assert!(tls("irc.example.org:6697"));
+    assert!(tls("198.51.100.7:6697"));
+    assert!(!tls("abcdefghijklmnop.onion:6667"), "Tor encrypts it");
+    assert!(!tls("127.0.0.1:6667"));
+    assert!(!tls("localhost:6667"));
+    assert!(!tls("irc://irc.example.org:6667"));
+    assert!(tls("ircs://127.0.0.1:6697"));
+    assert!(tls("ircs://abcdefghijklmnop.onion:6697"));
+    assert!(IrcServer::parse("http://irc.example.org:6667").is_none());
+    assert!(IrcServer::parse("ircs://:6697").is_none());
+    // A name that merely looks private is not.
+    assert!(tls("127.0.0.1.example.org:6697"));
+    assert!(tls("onion.example.org:6697"));
+    assert!(
+        IrcServer::parse("irc://irc.example.org:6667")
+            .unwrap()
+            .is_exposed()
+    );
+    assert!(
+        !IrcServer::parse("irc://127.0.0.1:6667")
+            .unwrap()
+            .is_exposed()
+    );
+    assert!(
+        !IrcServer::parse("irc.example.org:6697")
+            .unwrap()
+            .is_exposed()
+    );
+}
+
+#[tokio::test]
+async fn plain_text_to_a_remote_server_is_refused_off_regtest() {
+    let server = IrcServer::parse("irc://irc.example.invalid:6667").unwrap();
+    let refused = IrcChannel::connect(
+        NickIdentity::generate(),
+        IrcConfig {
+            network: "signet".into(),
+            ..config(server)
+        },
+        &Outbound::Direct,
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(vortex_ng_channel::ChannelError::Invalid(_))
+    ));
+}
+
+async fn over_tls(
+    server: IrcServer,
+    roots: tokio_rustls::rustls::RootCertStore,
+) -> Result<IrcChannel, vortex_ng_channel::ChannelError> {
+    IrcChannel::connect_with_roots(
+        NickIdentity::generate(),
+        config(server),
+        &Outbound::Direct,
+        roots,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_round_trip_over_tls() {
+    let irc = TestIrc::start_tls(Some("TestNet")).await;
+    let mut maker = over_tls(irc.server(), test_roots()).await.unwrap();
+    let taker = over_tls(irc.server(), test_roots()).await.unwrap();
+    assert_eq!(maker.hostid(), "TestNet");
+    maker.listen(false, true).await.unwrap();
+    taker.ask_orderbook().await.unwrap();
+    let Next::Message(Incoming::Public { nick, commands, .. }) = maker.receive(WAIT).await else {
+        panic!("the request")
+    };
+    assert_eq!(
+        (nick.as_str(), commands),
+        (taker.nick(), vec![Command::Orderbook])
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_from_an_authority_we_do_not_trust_is_refused() {
+    let irc = TestIrc::start_tls(None).await;
+    assert!(over_tls(irc.server(), other_roots()).await.is_err());
+    assert!(irc.nicks().is_empty(), "nothing was said to the server");
+}
+
+#[tokio::test]
+async fn a_certificate_for_another_name_is_refused() {
+    let irc = TestIrc::start_tls(None).await;
+    let server = IrcServer {
+        host: "localhost".into(),
+        ..irc.server()
+    };
+    assert!(over_tls(server, test_roots()).await.is_err());
+    assert!(irc.nicks().is_empty(), "nothing was said to the server");
+}
+
+#[tokio::test]
+async fn a_server_without_tls_gets_no_plain_text_from_a_tls_client() {
+    let irc = TestIrc::start(None).await;
+    let server = IrcServer {
+        tls: true,
+        ..irc.server()
+    };
+    assert!(over_tls(server, test_roots()).await.is_err());
+    assert!(irc.nicks().is_empty());
+    assert!(irc.received().is_empty());
 }

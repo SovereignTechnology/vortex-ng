@@ -76,7 +76,8 @@ vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
 
 `where` is any of `--relays <url[,url...]>` (Nostr relays), `--directories <host:port[,...]>` (JoinMarket's
 onion directory nodes) and `--irc <host:port[,...]>` (JoinMarket's IRC pit, as joinmarket-clientserver uses it);
-the last two are regtest only in this pre-release (ADR 0007). On several channels at once a maker uses one nick on
+the last two are regtest only in this pre-release (ADR 0007). IRC uses TLS with certificate checks unless the
+host is an onion (Tor encrypts it) or loopback; `irc://host:port` asks for plain text and works on regtest only. On several channels at once a maker uses one nick on
 all of them and a taker a different nick on each; a peer stays on the channel it first spoke on. An IRC server
 whose signature domain (its `NETWORK` name) could be mistaken for another channel's is refused.
 

@@ -14,7 +14,9 @@
 # directory node is one of its bots that never offers anything; vortex-ng meets it there, with `testnet` in the
 # handshake. With CHANNEL=irc everyone meets in #joinmarket-pit-test on a local IRC server: IRCD=miniircd (the
 # default; the reference's own test server, which announces no NETWORK, so the signature domain is host and
-# port) or IRCD=ngircd (Debian's, announcing NETWORK=VortexRefTest).
+# port) or IRCD=ngircd (Debian's, announcing NETWORK=VortexRefTest). With IRCD=ngircd TLS=1, vortex-ng connects
+# to the server's TLS port, checking a certificate from a throwaway authority, and the reference stays on the
+# plain port of the same server.
 #
 # Two rounds:
 #   A. two reference makers (YieldGeneratorBasic, sw0reloffer) and a vortex-ng taker, which does a sw0 round
@@ -38,12 +40,18 @@ CHANNEL=${CHANNEL:-onion}
 IRCD=${IRCD:-miniircd}
 DIRECTORY_PORT=18081
 IRC_PORT=16667
+IRC_TLS_PORT=16697
+TLS=${TLS:-0}
 IRC_NETWORK=VortexRefTest
 AMOUNT=1000000  # crates/vortex-ng-node/tests/jmng_interop.rs AMOUNT
 case "$CHANNEL" in onion|irc) ;; *) echo "CHANNEL=$CHANNEL: onion or irc" >&2; exit 97 ;; esac
 case "$IRCD" in miniircd|ngircd) ;; *) echo "IRCD=$IRCD: miniircd or ngircd" >&2; exit 97 ;; esac
 label=$CHANNEL
 [ "$CHANNEL" = irc ] && label="irc, $IRCD"
+if [ "$TLS" = 1 ]; then
+  { [ "$CHANNEL" = irc ] && [ "$IRCD" = ngircd ]; } || { echo "TLS=1 needs CHANNEL=irc IRCD=ngircd" >&2; exit 97; }
+  label="$label, TLS"
+fi
 
 here=$(cd "$(dirname "$0")" && pwd)
 tree=$(cd "$here/../.." && pwd)
@@ -70,6 +78,7 @@ export DEBIAN_FRONTEND=noninteractive
 packages=(python3 python3-venv python3-dev build-essential autoconf automake libtool pkg-config libffi-dev
   libssl-dev libsodium23 git curl ca-certificates)
 [ "$CHANNEL" = irc ] && [ "$IRCD" = ngircd ] && packages+=(ngircd)
+[ "$TLS" = 1 ] && packages+=(openssl)
 apt-get update -qq >/dev/null
 apt-get install -y -qq --no-install-recommends "${packages[@]}" >/dev/null 2>&1
 
@@ -167,8 +176,32 @@ PAM = no
 Ident = no
 DNS = no
 EOF
-    ngircd -n -f "$work/ngircd.conf" >"$logs/ircd.log" 2>&1 &
     meet_env=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT" "VORTEX_NG_INTEROP_IRC_NETWORK=$IRC_NETWORK")
+    if [ "$TLS" = 1 ]; then
+      # A throwaway authority and a certificate for 127.0.0.1, which only this run trusts.
+      mkdir -p "$work/tls"
+      openssl ecparam -genkey -name prime256v1 -noout -out "$work/tls/ca.key" 2>/dev/null
+      openssl req -x509 -new -key "$work/tls/ca.key" -days 2 -subj "/CN=vortex-ng interop CA" \
+        -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" -out "$work/tls/ca.pem"
+      openssl x509 -in "$work/tls/ca.pem" -outform DER -out "$work/tls/ca.der"
+      openssl ecparam -genkey -name prime256v1 -noout -out "$work/tls/server.ec" 2>/dev/null
+      openssl pkcs8 -topk8 -nocrypt -in "$work/tls/server.ec" -out "$work/tls/server.key"
+      openssl req -new -key "$work/tls/server.key" -subj "/CN=127.0.0.1" -out "$work/tls/server.csr"
+      printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n' >"$work/tls/ext"
+      openssl x509 -req -in "$work/tls/server.csr" -CA "$work/tls/ca.pem" -CAkey "$work/tls/ca.key" -CAcreateserial \
+        -days 2 -extfile "$work/tls/ext" -out "$work/tls/server.pem" 2>/dev/null
+      rm -f "$work/tls/ca.key"
+      chmod 755 "$work/tls" && chmod 644 "$work/tls/server.key" "$work/tls/server.pem"
+      cat >>"$work/ngircd.conf" <<EOF
+[SSL]
+CertFile = $work/tls/server.pem
+KeyFile = $work/tls/server.key
+Ports = $IRC_TLS_PORT
+EOF
+      meet_env=("VORTEX_NG_INTEROP_IRC=ircs://127.0.0.1:$IRC_TLS_PORT" "VORTEX_NG_INTEROP_IRC_NETWORK=$IRC_NETWORK"
+        "VORTEX_NG_INTEROP_IRC_CA=$work/tls/ca.der")
+    fi
+    ngircd -n -f "$work/ngircd.conf" >"$logs/ircd.log" 2>&1 &
   else
     fetch https://github.com/JoinMarket-Org/miniircd/archive/master.tar.gz "$MINIIRCD_SHA256" "$work/miniircd.tar.gz"
     mkdir -p "$work/miniircd"
@@ -180,6 +213,10 @@ EOF
   pids+=($!)
   for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/$IRC_PORT) 2>/dev/null && break; sleep 1; done
   (exec 3<>/dev/tcp/127.0.0.1/$IRC_PORT) 2>/dev/null || { show "$logs/ircd.log" 30; exit 26; }
+  if [ "$TLS" = 1 ]; then
+    for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/$IRC_TLS_PORT) 2>/dev/null && break; sleep 1; done
+    (exec 3<>/dev/tcp/127.0.0.1/$IRC_TLS_PORT) 2>/dev/null || { show "$logs/ircd.log" 30; exit 26; }
+  fi
   echo "$IRCD on 127.0.0.1:$IRC_PORT"
 fi
 
