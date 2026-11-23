@@ -373,12 +373,22 @@ struct Round {
 const MAKER_C: &str = "J5makerC";
 
 fn round_of_three(min_makers: usize) -> Round {
+    round_with(min_makers, false)
+}
+
+/// With `twins`, `MAKER_C` runs `J5makerA`'s wallet, so the two declare the same coin and addresses.
+fn round_with(min_makers: usize, twins: bool) -> Round {
     let pit = Pit::Sw0;
     let mut chain = FakeChain::default();
     let mut makers = BTreeMap::new();
     let mut chosen = Vec::new();
     for (i, nick) in ["J5makerA", "J5makerB", MAKER_C].iter().enumerate() {
-        let wallet = funded(pit, nick, 500_000, 10 + i as u8, &mut chain);
+        let (who, salt) = if twins && *nick == MAKER_C {
+            ("J5makerA", 10)
+        } else {
+            (*nick, 10 + i as u8)
+        };
+        let wallet = funded(pit, who, 500_000, salt, &mut chain);
         let maker = Maker::new(MakerConfig::new(vec![offer(pit, i as u64)]), wallet).unwrap();
         makers.insert(nick.to_string(), maker);
         chosen.push((nick.to_string(), offer(pit, i as u64)));
@@ -597,6 +607,20 @@ fn once_the_transaction_is_out_every_maker_in_it_is_needed() {
         .handle("J5makerA", Command::Error("no".into()), &round.chain);
     assert!(matches!(failed, Err(TakerError::Maker(..))), "{failed:?}");
     assert_eq!(round.taker.makers_in_round(), 2);
+}
+
+#[test]
+fn two_makers_claiming_one_coin_both_leave() {
+    // Which of them lied cannot be told, so neither stays: the first to claim a coin gains nothing.
+    let mut round = round_with(1, true);
+    assert_eq!(round.carry(&[]).unwrap(), Progress::MakersSigned);
+    assert_eq!(round.taker.makers_in_round(), 1);
+    let tx = round.taker.finish(&round.wallet).unwrap();
+    assert_eq!(tx.input.len(), 2, "the taker and the one maker left");
+
+    // Without room to lose both, the round ends.
+    let mut round = round_with(2, true);
+    assert!(matches!(round.carry(&[]), Err(TakerError::Maker(..))));
 }
 
 #[test]

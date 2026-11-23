@@ -171,17 +171,12 @@ fn ranked_offers<'a>(
 
 /// The fee `offer` asks for this round, if the taker would consider it: of the pit, covering the amount, within
 /// the fee limit.
-fn usable_fee(offer: &Offer, cfg: &TakerConfig) -> Option<u64> {
+pub fn usable_fee(offer: &Offer, cfg: &TakerConfig) -> Option<u64> {
     if offer.offer_type.pit != cfg.pit {
         return None;
     }
     let fee = offer.fee_for(cfg.amount)?;
     (fee <= cfg.max_cjfee && fee >= offer.txfee).then_some(fee)
-}
-
-/// Whether the taker would consider `offer` for this round.
-pub fn offer_fits(offer: &Offer, cfg: &TakerConfig) -> bool {
-    usable_fee(offer, cfg).is_some()
 }
 
 /// The nicks with an offer the taker would consider. Only these are worth a bond lookup.
@@ -417,6 +412,18 @@ struct MakerIo {
     change_script: ScriptBuf,
 }
 
+impl MakerIo {
+    /// Whether two makers claim one coin or one address.
+    fn collides(&self, other: &MakerIo) -> bool {
+        self.utxos
+            .iter()
+            .any(|(ours, _)| other.utxos.iter().any(|(theirs, _)| ours == theirs))
+            || [&self.cj_script, &self.change_script]
+                .into_iter()
+                .any(|script| *script == other.cj_script || *script == other.change_script)
+    }
+}
+
 struct MakerSlot {
     offer: Offer,
     cjfee: u64,
@@ -461,8 +468,8 @@ pub struct Taker {
     change_script: ScriptBuf,
     makers: BTreeMap<String, MakerSlot>,
     /// The fewest makers the round may go on with: all it asked for, unless [`Taker::allow_fewer_makers`]
-    /// lowered it. Whoever carries the lines can make a maker look silent, so this floor is what stops them
-    /// from whittling a round down to the makers they run.
+    /// lowered it. Whoever carries the lines, or another maker in the round, can get an honest maker left
+    /// out, so this floor is what stops them from whittling a round down to the makers they run.
     min_makers: usize,
     tx: Option<Transaction>,
     prevouts: Vec<TxOut>,
@@ -677,12 +684,26 @@ impl Taker {
             return Ok(self.stray());
         };
         // It decrypted with a session of this round, so the maker wrote it: unlike a line that merely verifies,
-        // nobody else can have made it fail these checks.
+        // nobody else can have made it fail these checks, which look at nothing another maker declared.
         let io = match self.check_ioauth(from, &plaintext, &maker_nacl, chain) {
             Ok(io) => io,
             Err(TakerError::Maker(_, why)) => return self.drop_maker(from, why, chain),
             Err(other) => return Err(other),
         };
+        // Only one key need control a maker's inputs, so a maker can declare another's coin. Who lied cannot
+        // be told from here, and keeping the first to claim it would let a liar push out an honest maker.
+        let mut claimants: Vec<String> = self
+            .makers
+            .iter()
+            .filter(|(nick, slot)| {
+                nick.as_str() != from && slot.io.as_ref().is_some_and(|other| other.collides(&io))
+            })
+            .map(|(nick, _)| nick.clone())
+            .collect();
+        if !claimants.is_empty() {
+            claimants.push(from.to_string());
+            return self.drop_makers(&claimants, "two makers claim one coin or address", chain);
+        }
         let slot = self
             .makers
             .get_mut(from)
@@ -736,13 +757,8 @@ impl Taker {
         ) {
             return Err(err(from, "auth signature"));
         }
-        // Every declared UTXO: unique in the round, on chain, confirmed, of the pit's family.
+        // Every declared UTXO: none of ours, none twice, on chain, confirmed, of the pit's family.
         let mut seen: BTreeSet<OutPoint> = self.inputs.iter().map(|(o, _)| *o).collect();
-        for slot in self.makers.values() {
-            if let Some(other) = &slot.io {
-                seen.extend(other.utxos.iter().map(|(o, _)| *o));
-            }
-        }
         let mut utxos = Vec::with_capacity(io.utxos.len());
         for op in &io.utxos {
             if !seen.insert(*op) {
@@ -785,14 +801,8 @@ impl Taker {
         if cj_script == change_script {
             return Err(err(from, "same coinjoin and change address"));
         }
-        // No script may appear twice in the round (address reuse would link outputs).
-        let mut taken = vec![&self.cj_script, &self.change_script];
-        for slot in self.makers.values() {
-            if let Some(other) = &slot.io {
-                taken.push(&other.cj_script);
-                taken.push(&other.change_script);
-            }
-        }
+        // None of our scripts either (address reuse would link outputs).
+        let taken = [&self.cj_script, &self.change_script];
         if taken.contains(&&cj_script) || taken.contains(&&change_script) {
             return Err(err(from, "address already used in this round"));
         }
@@ -827,10 +837,24 @@ impl Taker {
         why: impl Into<String>,
         chain: &impl ChainLookup,
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
-        if self.tx.is_some() || self.makers.len() <= self.min_makers {
-            return Err(err(nick, why));
+        self.drop_makers(&[nick.to_string()], why, chain)
+    }
+
+    /// [`Taker::drop_maker`] for several at once: all of them leave, or the round ends.
+    fn drop_makers(
+        &mut self,
+        nicks: &[String],
+        why: impl Into<String>,
+        chain: &impl ChainLookup,
+    ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
+        let left = self.makers.keys().filter(|n| !nicks.contains(n)).count();
+        if self.tx.is_some() || left < self.min_makers {
+            let named = nicks.first().map_or("", String::as_str);
+            return Err(err(named, why));
         }
-        self.makers.remove(nick);
+        for nick in nicks {
+            self.makers.remove(nick);
+        }
         self.build_when_ready(chain)
     }
 

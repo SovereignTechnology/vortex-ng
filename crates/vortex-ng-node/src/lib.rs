@@ -25,8 +25,8 @@ use vortex_ng_maker::Maker;
 pub use vortex_ng_nostr::channel::{CONNECT_TIMEOUT, OFFER_TTL};
 use vortex_ng_nostr::client::unix_now;
 use vortex_ng_taker::{
-    Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, offer_fits,
-    select_makers, verify_bond,
+    Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, select_makers,
+    usable_fee, verify_bond,
 };
 use vortex_ng_wallet::PitWallet;
 use vortex_ng_wallet::sync::BlockSource;
@@ -654,17 +654,18 @@ pub async fn fetch_orderbook<C: Channel>(
     network: &str,
     gather: Duration,
 ) -> Result<Orderbook<C::Route>, NodeError> {
-    fetch_orderbook_for(client, network, gather, |_| true).await
+    fetch_orderbook_for(client, network, gather, |_| Some(0)).await
 }
 
-/// [`fetch_orderbook`] for a taker that will only consider offers that are `usable`. Only those are kept, one per
-/// offer type and id. The command of a signed line is not signed, so anyone can show a maker's lines under an
-/// offer type it never offered; kept, they could use up the maker's place for offers before its real one came.
+/// [`fetch_orderbook`] for a taker that will only consider offers `cost` puts a price on. Only those are kept,
+/// one per offer type and id, the cheapest. The command of a signed line is not signed, so anyone can show a
+/// maker's lines under an offer type it never offered, or deliver an older offer first; kept, they could use up
+/// the maker's place for offers before its real one came, or stand in for it at a higher fee.
 pub async fn fetch_orderbook_for<C: Channel>(
     client: &mut C,
     network: &str,
     gather: Duration,
-    usable: impl Fn(&Offer) -> bool,
+    cost: impl Fn(&Offer) -> Option<u64>,
 ) -> Result<Orderbook<C::Route>, NodeError> {
     let _ = network;
     client.listen(true, false).await?;
@@ -694,7 +695,7 @@ pub async fn fetch_orderbook_for<C: Channel>(
                 // cannot grow the taker's state.
                 let has_usable = line
                     .iter()
-                    .any(|c| matches!(c, Command::Offer(offer) if usable(offer)));
+                    .any(|c| matches!(c, Command::Offer(offer) if cost(offer).is_some()));
                 let answer = if has_usable {
                     arrived += 1;
                     let draw = u64::from_be_bytes(vortex_ng_core::tx::random_bytes::<8>());
@@ -707,14 +708,24 @@ pub async fn fetch_orderbook_for<C: Channel>(
                 };
                 for cmd in line {
                     match cmd {
-                        Command::Offer(offer)
-                            if usable(&offer)
-                                && answer.offers.len() < MAX_OFFERS_PER_NICK
-                                && !answer.offers.iter().any(|known| {
-                                    known.oid == offer.oid && known.offer_type == offer.offer_type
-                                }) =>
-                        {
-                            answer.offers.push(offer);
+                        Command::Offer(offer) => {
+                            let Some(price) = cost(&offer) else {
+                                continue;
+                            };
+                            let same = answer.offers.iter().position(|known| {
+                                known.oid == offer.oid && known.offer_type == offer.offer_type
+                            });
+                            match same {
+                                Some(index) => {
+                                    if cost(&answer.offers[index]).is_none_or(|old| price < old) {
+                                        answer.offers[index] = offer;
+                                    }
+                                }
+                                None if answer.offers.len() < MAX_OFFERS_PER_NICK => {
+                                    answer.offers.push(offer);
+                                }
+                                None => {}
+                            }
                         }
                         Command::Tbond(proof)
                             if answer.proof.is_none()
@@ -756,7 +767,7 @@ pub async fn run_taker<C: Channel>(
         offers,
         proofs,
         peers,
-    } = fetch_orderbook_for(client, network, gather, |offer| offer_fits(offer, cfg)).await?;
+    } = fetch_orderbook_for(client, network, gather, |offer| usable_fee(offer, cfg)).await?;
     let candidates = candidate_nicks(&offers, cfg);
     // Each maker made its proof out to the nick it knows us by, on the channel it answered on.
     let me = |maker: &str| match peers.get(maker) {

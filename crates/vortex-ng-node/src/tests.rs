@@ -1378,7 +1378,7 @@ async fn a_line_relabelled_on_one_channel_does_not_take_the_maker_off_another() 
         tokio::time::sleep(Duration::from_millis(100)).await;
         later.deliver_private(&late_maker, "J5takerOnB", "sw0absoffer", body, "b");
     });
-    let usable = |offer: &Offer| offer.offer_type.pit == Pit::Sw0;
+    let usable = |offer: &Offer| (offer.offer_type.pit == Pit::Sw0).then_some(0);
     let book = fetch_orderbook_for(&mut set, "regtest", Duration::from_millis(400), usable)
         .await
         .unwrap();
@@ -1404,13 +1404,35 @@ async fn offers_a_taker_cannot_use_do_not_take_the_place_of_one_it_can() {
         let real = "99 10000 100000000 0 500";
         handle.deliver_private(&maker, "J5taker", "sw0absoffer", real, "a");
     }
-    let usable = |offer: &Offer| offer.offer_type.pit == Pit::Sw0;
+    let usable = |offer: &Offer| (offer.offer_type.pit == Pit::Sw0).then_some(0);
     let book = fetch_orderbook_for(&mut channel, "regtest", Duration::from_millis(300), usable)
         .await
         .unwrap();
     assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
     assert_eq!(book.offers[0].1.oid, 99);
     assert!(book.route(maker.nick()).is_some());
+}
+
+#[tokio::test]
+async fn an_older_dearer_offer_delivered_first_does_not_replace_the_real_one() {
+    use vortex_ng_channel::testing::mock_channel;
+    use vortex_ng_core::nick::NickIdentity;
+    use vortex_ng_core::offer::CjFee;
+
+    let (dear, cheap) = ("0 10000 100000000 0 900", "0 10000 100000000 0 500");
+    for order in [[dear, cheap], [cheap, dear]] {
+        let (mut channel, handle) = mock_channel("J5taker", false);
+        let maker = NickIdentity::generate();
+        for body in order {
+            handle.deliver_private(&maker, "J5taker", "sw0absoffer", body, "a");
+        }
+        let cost = |offer: &Offer| offer.fee_for(100_000);
+        let book = fetch_orderbook_for(&mut channel, "regtest", Duration::from_millis(200), cost)
+            .await
+            .unwrap();
+        assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
+        assert_eq!(book.offers[0].1.cjfee, CjFee::Absolute(500));
+    }
 }
 
 #[tokio::test]

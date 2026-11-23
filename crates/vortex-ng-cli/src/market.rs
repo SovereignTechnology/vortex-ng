@@ -331,7 +331,10 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let channel = channel_network(network);
     let (us, seen_on, book) = runtime()?.block_on(async {
         let (mut client, labels) = channels(channel, &meeting, &outbound, Role::Taker).await?;
-        let usable = |offer: &Offer| only.is_none_or(|pit| offer.offer_type.pit == pit);
+        let usable = |offer: &Offer| {
+            only.is_none_or(|pit| offer.offer_type.pit == pit)
+                .then_some(0)
+        };
         let gather = Duration::from_secs(wait.into());
         let book = fetch_orderbook_for(&mut client, channel, gather, usable)
             .await
