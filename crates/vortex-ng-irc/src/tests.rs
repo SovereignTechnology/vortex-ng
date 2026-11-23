@@ -338,6 +338,23 @@ async fn a_round_trip_over_tls() {
 }
 
 #[tokio::test]
+async fn an_unlinked_line_trusts_the_authorities_its_channel_trusts() {
+    let irc = TestIrc::start_tls(Some("TestNet")).await;
+    let maker = over_tls(irc.server(), test_roots()).await.unwrap();
+    let mut watcher = over_tls(irc.server(), test_roots()).await.unwrap();
+    watcher.listen(false, true).await.unwrap();
+    maker
+        .publish_unlinked(&format!("!hp2 {}", "cd".repeat(32)))
+        .await
+        .unwrap();
+    let Next::Message(Incoming::Public { nick, commands, .. }) = watcher.receive(WAIT).await else {
+        panic!("the commitment")
+    };
+    assert_ne!(nick, maker.nick());
+    assert!(matches!(commands.as_slice(), [Command::Hp2(_)]));
+}
+
+#[tokio::test]
 async fn a_certificate_from_an_authority_we_do_not_trust_is_refused() {
     let irc = TestIrc::start_tls(None).await;
     assert!(over_tls(irc.server(), other_roots()).await.is_err());

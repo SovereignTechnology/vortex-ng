@@ -16,6 +16,7 @@
 # rounds, each on a relay run by vortex-ng's test crates/vortex-ng-node/tests/jmng_interop.rs:
 #   A. joinmarket-ng's two test makers (`jm-maker start`, Core's wallet backend, the relay as their only
 #      message channel) and a vortex-ng taker, which does a sw0 round with them and checks it on the node;
+#      then a vortex-ng maker announces a commitment, and both joinmarket-ng makers must refuse it;
 # PIT=sw0 (the default) or PIT=tr0 picks the pit both sides trade in; tr0 needs a joinmarket-ng checkout that
 # has the Taproot pit (its PR #643) under the Nostr channel.
 # With BONDS=1 (the default) every maker holds a fidelity bond and each taker runs joinmarket-ng's default
@@ -157,7 +158,7 @@ start_vortex() {  # $1 = role, $2 = its directory
   for _ in $(seq 1 600); do [ -s "$2/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
   [ -s "$2/relay.url" ] || { echo "vortex-ng ($1) did not start its relay"; show "$logs/vortex-$1.log" 40; return 1; }
 }
-report() { grep -E 'relay at|directory at|answered on the directory|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
+report() { grep -E 'relay at|directory at|answered on the directory|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|Commitment announced|answered !error|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
 
 # ---- A: joinmarket-ng makers, vortex-ng taker ------------------------------------------------------------
 rc_a=0

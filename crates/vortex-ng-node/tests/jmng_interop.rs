@@ -15,7 +15,9 @@
 //! `taker_with_joinmarket_ng_makers` (`VORTEX_NG_INTEROP_ROLE=taker`): a vortex-ng taker waits until the
 //! joinmarket-ng makers have announced their offers, asks them for the orderbook, and runs a round with them
 //! in the pit `VORTEX_NG_INTEROP_PIT` names (`sw0`, the default, or `tr0`). The transaction must pass `testmempoolaccept`, confirm, and pay the taker its coinjoin output. Its
-//! txid goes to `<dir>/taker.txid`.
+//! txid goes to `<dir>/taker.txid`. With those makers still up, a vortex-ng maker is then handed a commitment
+//! to announce: it must reach the channel from a nick that is not the maker's, and each of the other side's
+//! makers must refuse a `!fill` that uses it while still accepting a fresh one.
 //!
 //! `makers_with_joinmarket_ng_taker` (`VORTEX_NG_INTEROP_ROLE=makers`): two vortex-ng makers serve offers on
 //! the relay until the harness, having run joinmarket-ng's taker against them and mined a block, writes the
@@ -34,12 +36,16 @@ use vortex_ng_chain::{Auth, CoreRpc};
 use vortex_ng_channel::set::ChannelSet;
 use vortex_ng_channel::socks::Outbound;
 use vortex_ng_channel::{Channel, Incoming as Arrived, Next};
+use vortex_ng_core::bitcoin::hex::DisplayHex;
 use vortex_ng_core::bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
+use vortex_ng_core::command::Command;
+use vortex_ng_core::nacl::NaclKeypair;
 use vortex_ng_core::nick::NickIdentity;
 use vortex_ng_core::offer::{Offer, Pit};
+use vortex_ng_core::tx::random_bytes;
 use vortex_ng_irc::{IrcChannel, IrcConfig, IrcServer};
 use vortex_ng_maker::{Maker, MakerConfig};
-use vortex_ng_node::{CONNECT_TIMEOUT, run_maker, run_taker};
+use vortex_ng_node::{CONNECT_TIMEOUT, fetch_orderbook, run_maker, run_taker};
 use vortex_ng_nostr::client::{Incoming, NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy, Serve};
@@ -401,6 +407,196 @@ async fn taker_with_joinmarket_ng_makers() {
         tx.input.len(),
         tx.output.len()
     );
+    announced_commitment_is_refused(&harness, &url).await;
+}
+
+/// How long a maker has to answer a `!fill`.
+const FILL_ANSWER_TIME: Duration = Duration::from_secs(20);
+
+/// A new nick that has heard the other side's makers and the vortex-ng maker.
+struct Prober {
+    client: ChannelSet,
+    /// The other side's makers: nick, the id of an offer that fits [`AMOUNT`], and the way to reach it.
+    makers: Vec<(String, u64, <ChannelSet as Channel>::Route)>,
+    /// The way to the vortex-ng maker.
+    to_announcer: <ChannelSet as Channel>::Route,
+}
+
+impl Prober {
+    async fn new(harness: &Harness, url: &str, announcer: &str) -> Prober {
+        let mut client = meet(harness, url, false).await;
+        let until = Instant::now() + Duration::from_secs(120);
+        loop {
+            let book = fetch_orderbook(&mut client, "regtest", Duration::from_secs(12))
+                .await
+                .unwrap();
+            let mut makers: Vec<(String, u64, <ChannelSet as Channel>::Route)> = Vec::new();
+            for (nick, offer) in &book.offers {
+                if nick != announcer
+                    && offer.offer_type.pit == harness.pit
+                    && (offer.minsize..=offer.maxsize).contains(&AMOUNT)
+                    && !makers.iter().any(|(known, ..)| known == nick)
+                {
+                    let route = book.route(nick).expect("a maker's route").clone();
+                    makers.push((nick.clone(), offer.oid, route));
+                }
+            }
+            if makers.len() >= harness.makers
+                && let Some(to_announcer) = book.route(announcer).cloned()
+            {
+                return Prober {
+                    client,
+                    makers,
+                    to_announcer,
+                };
+            }
+            assert!(
+                Instant::now() < until,
+                "{} of {} makers and the announcer did not answer",
+                makers.len(),
+                harness.makers
+            );
+        }
+    }
+
+    /// Send each of the other side's makers a `!fill` with `commitment`.
+    async fn fill(&self, commitment: &[u8; 32]) {
+        let nacl = NaclKeypair::generate().public_hex();
+        let commitment = commitment.to_lower_hex_string();
+        for (nick, oid, route) in &self.makers {
+            self.client
+                .send_private(
+                    route,
+                    nick,
+                    "fill",
+                    &format!("{oid} {AMOUNT} {nacl} P{commitment}"),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The makers that answered a `!fill` with `!pubkey` within `wait`.
+    async fn accepted(&mut self, wait: Duration) -> HashSet<String> {
+        let until = Instant::now() + wait;
+        let mut accepted = HashSet::new();
+        while accepted.len() < self.makers.len() {
+            let Some(left) = until.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match self.client.receive(left).await {
+                Next::Message(Arrived::Private { msg, .. })
+                    if self.makers.iter().any(|(nick, ..)| *nick == msg.from) =>
+                {
+                    match msg.command.as_str() {
+                        "pubkey" => {
+                            accepted.insert(msg.from);
+                        }
+                        "error" => println!("maker {} answered !error {}", msg.from, msg.body),
+                        _ => {}
+                    }
+                }
+                Next::Closed => break,
+                _ => {}
+            }
+        }
+        accepted
+    }
+
+    /// Every maker takes a commitment nobody has seen. A maker that has just finished a round may not be
+    /// taking new ones yet, so it gets a few tries.
+    async fn assert_fresh_commitment_accepted(&mut self) {
+        let mut accepted = HashSet::new();
+        for _ in 0..6 {
+            self.fill(&random_bytes::<32>()).await;
+            accepted.extend(self.accepted(FILL_ANSWER_TIME).await);
+            if accepted.len() == self.makers.len() {
+                return;
+            }
+        }
+        panic!(
+            "only {} of {} makers accepted a fresh commitment",
+            accepted.len(),
+            self.makers.len()
+        );
+    }
+}
+
+/// A commitment handed to a vortex-ng maker reaches the channel from a nick that is not the maker's, and the
+/// other side's makers then refuse it. A fresh commitment before and after shows that a maker that stays
+/// silent has refused this one and is not simply gone.
+async fn announced_commitment_is_refused(harness: &Harness, url: &str) {
+    let mut channel = meet(harness, url, true).await;
+    let announcer = channel.nick().to_string();
+    let announcer_wallet = wallet("interop-announcer", harness.pit);
+    let offer_type = match harness.pit {
+        Pit::Tr0 => "tr0absoffer",
+        _ => "sw0absoffer",
+    };
+    let offer = Offer::parse(offer_type, &format!("0 10000 100000000 {TXFEE} {CJFEE}")).unwrap();
+    let rpc = harness.rpc();
+    let announcing = tokio::spawn(async move {
+        let mut maker = Maker::new(MakerConfig::new(vec![offer]), announcer_wallet).unwrap();
+        let until = Instant::now() + Duration::from_secs(600);
+        run_maker(&mut maker, &mut channel, &rpc, "regtest", until).await
+    });
+    let mut watcher = meet(harness, url, false).await;
+    watcher.listen(false, true).await.unwrap();
+
+    let mut before = Prober::new(harness, url, &announcer).await;
+    before.assert_fresh_commitment_accepted().await;
+
+    let commitment = random_bytes::<32>();
+    before
+        .client
+        .send_private(
+            &before.to_announcer,
+            &announcer,
+            "hp2",
+            &commitment.to_lower_hex_string(),
+        )
+        .await
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(60);
+    let from = loop {
+        let left = until
+            .checked_duration_since(Instant::now())
+            .expect("the commitment handed to the vortex-ng maker reaches the channel");
+        match watcher.receive(left).await {
+            Next::Message(Arrived::Public { nick, commands, .. })
+                if commands.contains(&Command::Hp2(commitment)) =>
+            {
+                break nick;
+            }
+            Next::Closed => panic!("the watcher's channel closed"),
+            _ => {}
+        }
+    };
+    assert_ne!(
+        from, announcer,
+        "the announcement is not linked to the maker"
+    );
+    // It arrived here; give the makers, on the same channel, a moment to act on it.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut refused = Prober::new(harness, url, &announcer).await;
+    refused.fill(&commitment).await;
+    let took = refused.accepted(FILL_ANSWER_TIME).await;
+    assert!(took.is_empty(), "these makers took it: {took:?}");
+
+    let mut after = Prober::new(harness, url, &announcer).await;
+    after.assert_fresh_commitment_accepted().await;
+    let late = refused.accepted(Duration::from_secs(1)).await;
+    assert!(late.is_empty(), "these makers took it late: {late:?}");
+
+    println!(
+        "Commitment announced by a vortex-ng maker: refused by {} makers of the other implementation, which still accept a fresh one",
+        refused.makers.len()
+    );
+    announcing.abort();
+    for client in [&before.client, &refused.client, &after.client, &watcher] {
+        client.shutdown().await;
+    }
 }
 
 /// Every equal-amount output is the pit's kind of output: the round really was in that pit.

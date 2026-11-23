@@ -169,6 +169,8 @@ pub struct IrcChannel {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Unlinked lines being published.
     unlinked: SideTasks,
+    /// The certificate authorities this channel trusts, for the throwaway nicks of unlinked lines.
+    roots: RootCertStore,
 }
 
 impl std::fmt::Debug for IrcChannel {
@@ -450,7 +452,7 @@ impl IrcChannel {
             ));
         }
         let tls = match config.server.tls {
-            true => Some(crate::tls::client_config(roots).map_err(transport)?),
+            true => Some(crate::tls::client_config(roots.clone()).map_err(transport)?),
             false => None,
         };
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX);
@@ -477,6 +479,7 @@ impl IrcChannel {
             announced: Mutex::new(HashMap::new()),
             tasks: Mutex::new(vec![task]),
             unlinked: SideTasks::new(MAX_UNLINKED),
+            roots,
         };
         match tokio::time::timeout(timeout + Duration::from_secs(1), ready_rx.recv()).await {
             Ok(Some(Ok(()))) => Ok(channel),
@@ -674,9 +677,12 @@ impl Channel for IrcChannel {
             timeout: self.shared.config.timeout,
         };
         let outbound = self.outbound.clone();
+        let roots = self.roots.clone();
         let line = line.to_string();
         self.unlinked.spawn(async move {
-            let Ok(temporary) = IrcChannel::connect(throwaway, config, &outbound).await else {
+            let Ok(temporary) =
+                IrcChannel::connect_trusting(throwaway, config, &outbound, roots).await
+            else {
                 return;
             };
             if temporary.public(&line).is_ok() {
