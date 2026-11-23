@@ -1,8 +1,11 @@
-"""joinmarket-ng's taker, through its own API, doing one CoinJoin with the makers on a Nostr relay.
+"""joinmarket-ng's taker, through its own API, doing one CoinJoin with the makers on a Nostr relay or a
+directory node.
 
 Run by run.sh inside the VM, with joinmarket-ng installed:
 
-    python3 jmng_taker.py <relay url> <rpc url> <cookie file> <data dir> [bonds: 1|0] [pit: sw0|tr0]
+    python3 jmng_taker.py <directory> <rpc url> <cookie file> <data dir> [bonds: 1|0] [pit: sw0|tr0]
+
+<directory> is a joinmarket-ng directory entry as given: `nostr:<relay url>` or `<host>:<port>`.
 
 It uses joinmarket-ng's own regtest test wallet for the taker, Bitcoin Core's wallet backend, and the
 relay as the only message channel. With bonds (1) it keeps joinmarket-ng's default policy: a maker that
@@ -23,7 +26,7 @@ AMOUNT = 1_000_000
 
 
 async def main() -> int:
-    relay, rpc_url, cookie_file, data = sys.argv[1:5]
+    directory, rpc_url, cookie_file, data = sys.argv[1:5]
     bonds = len(sys.argv) > 5 and sys.argv[5] == "1"
     taproot = len(sys.argv) > 6 and sys.argv[6] == "tr0"
     user, password = Path(cookie_file).read_text().strip().split(":", 1)
@@ -65,7 +68,7 @@ async def main() -> int:
         bitcoin_network=NetworkType.REGTEST,
         backend_type="descriptor_wallet",
         backend_config={"rpc_url": rpc_url, "rpc_user": user, "rpc_password": password},
-        directory_servers=[f"nostr:{relay}"],
+        directory_servers=[directory],
         allow_clearnet_connections=True,
         counterparty_count=2,
         minimum_makers=2,

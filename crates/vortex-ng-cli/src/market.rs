@@ -6,19 +6,26 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use vortex_ng_chain::{Auth, CoreRpc};
+use vortex_ng_channel::Channel;
+use vortex_ng_channel::set::{ChannelSet, DynChannel};
 use vortex_ng_core::bitcoin::{Address, Network, OutPoint, TxOut};
 use vortex_ng_core::bond::BondValueParams;
 use vortex_ng_core::lnclose::CloseEvidence;
+use vortex_ng_core::nick::NickIdentity;
 use vortex_ng_core::offer::{CjFee, Offer, Pit, RelativeFee};
+use vortex_ng_core::protocol::{NOSTR_HOSTID, ONION_HOSTID};
 use vortex_ng_core::sig::InputSigner;
+use vortex_ng_irc::codec::Hostid;
+use vortex_ng_irc::{IrcChannel, IrcConfig, IrcServer};
 use vortex_ng_maker::{Maker, MakerConfig};
 use vortex_ng_node::{
     CONNECT_TIMEOUT, MAX_BOND_LOOKUPS, MakerReport, MakerService, NodeError, OfferFee, OfferPolicy,
-    channel_network, fetch_orderbook, run_taker, serve_maker,
+    channel_network, fetch_orderbook_for, run_taker, serve_maker,
 };
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_nostr::socks::Outbound;
+use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy, Serve};
 use vortex_ng_taker::{
     Coin, DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, TakerError, choose_coins, podle_for,
     verify_bond,
@@ -48,9 +55,10 @@ fn usage(why: &str) -> Failure {
 /// The relays `--relays` names: one to eight `ws://` or `wss://` URLs, separated by commas.
 fn relays(args: &Args) -> Result<Vec<String>, Failure> {
     let wrong = || usage("`--relays` is one to eight ws:// or wss:// URLs, separated by commas");
-    let relays: Vec<String> = args
-        .required("relays")
-        .map_err(Failure::Usage)?
+    let Some(given) = args.get("relays") else {
+        return Ok(Vec::new());
+    };
+    let relays: Vec<String> = given
         .split(',')
         .map(|relay| relay.trim().to_string())
         .collect();
@@ -64,6 +72,86 @@ fn relays(args: &Args) -> Result<Vec<String>, Failure> {
         return Err(wrong());
     }
     Ok(relays)
+}
+
+/// Directory nodes a command may use at most.
+const MAX_DIRECTORIES: usize = 16;
+
+/// Where a command meets other peers: Nostr relays, JoinMarket's onion directory nodes, IRC servers.
+struct Meeting {
+    relays: Vec<String>,
+    directories: Vec<Directory>,
+    irc: Vec<IrcServer>,
+}
+
+impl Meeting {
+    fn describe(&self) -> String {
+        format!(
+            "{} relay(s), {} directory node(s), {} IRC server(s)",
+            self.relays.len(),
+            self.directories.len(),
+            self.irc.len()
+        )
+    }
+}
+
+/// IRC servers a command may use at most.
+const MAX_IRC: usize = 4;
+
+/// `--relays`, `--directories` and `--irc`: at least one of them.
+fn meeting(args: &Args) -> Result<Meeting, Failure> {
+    let relays = relays(args)?;
+    let directories = match args.get("directories") {
+        None => Vec::new(),
+        Some(given) => {
+            let parsed: Option<Vec<Directory>> = given.split(',').map(Directory::parse).collect();
+            match parsed {
+                Some(list) if !list.is_empty() && list.len() <= MAX_DIRECTORIES => list,
+                _ => {
+                    return Err(usage(
+                        "`--directories` is one to sixteen host:port, separated by commas",
+                    ));
+                }
+            }
+        }
+    };
+    let irc = match args.get("irc") {
+        None => Vec::new(),
+        Some(given) => {
+            let parsed: Option<Vec<IrcServer>> = given.split(',').map(IrcServer::parse).collect();
+            match parsed {
+                Some(list) if !list.is_empty() && list.len() <= MAX_IRC => list,
+                _ => {
+                    return Err(usage(
+                        "`--irc` is one to four host:port, separated by commas",
+                    ));
+                }
+            }
+        }
+    };
+    if relays.is_empty() && directories.is_empty() && irc.is_empty() {
+        return Err(usage(
+            "give at least one of `--relays`, `--directories`, `--irc`",
+        ));
+    }
+    Ok(Meeting {
+        relays,
+        directories,
+        irc,
+    })
+}
+
+impl Meeting {
+    /// The onion directories are for regtest only in this pre-release (ADR 0007): nothing here has been
+    /// tried on a live network.
+    fn allowed_on(&self, network: Network) -> Result<(), Failure> {
+        if (!self.directories.is_empty() || !self.irc.is_empty()) && network != Network::Regtest {
+            return Err(failed(
+                "JoinMarket's onion directories and IRC are enabled on regtest only in this pre-release",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The node `--rpc-url` names, authenticated with its cookie file or with a user and password, and checked
@@ -143,13 +231,110 @@ fn fee_text(offer: &Offer) -> String {
     }
 }
 
+/// Who the channels speak for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// One nick on every channel: takers and bond checks know a maker by its nick.
+    Maker,
+    /// A different nick on each channel, so the channels cannot be linked through it.
+    Taker,
+}
+
+/// The command's channels, as one set: Nostr relays and onion directory nodes, as given.
+/// The channels a command uses, and a label for each, in the set's order (what `channel_of` indexes).
+async fn channels(
+    network: &str,
+    meeting: &Meeting,
+    outbound: &Outbound,
+    role: Role,
+) -> Result<(ChannelSet, Vec<String>), Failure> {
+    let maker = NickIdentity::generate();
+    let identity = || match role {
+        Role::Maker => maker.clone(),
+        Role::Taker => NickIdentity::generate(),
+    };
+    let mut set: Vec<Box<dyn DynChannel>> = Vec::new();
+    let mut labels = Vec::new();
+    if !meeting.relays.is_empty() {
+        let keys = NickKeys::from_identity(identity()).map_err(failed)?;
+        let nostr =
+            NickClient::connect_via(keys, network, &meeting.relays, outbound, CONNECT_TIMEOUT)
+                .await
+                .map_err(failed)?;
+        set.push(Box::new(nostr));
+        labels.push("nostr".to_string());
+    }
+    if !meeting.directories.is_empty() {
+        let config = OnionConfig {
+            directories: meeting.directories.clone(),
+            network: network.to_string(),
+            timeout: Duration::from_secs(60),
+            // A taker connects directly to makers that serve an onion; on regtest, where setups run without
+            // Tor, to loopback addresses too.
+            peers: if network == "regtest" {
+                PeerPolicy::Local
+            } else {
+                PeerPolicy::Onion
+            },
+            // Not yet: serving needs an onion published through Tor's control port, which the commands do not
+            // take yet. A loopback location is only for joinmarket-clientserver's regtest testing mode:
+            // JoinMarket-NG's directories refuse a location that is not a v3 onion.
+            serve: Serve::None,
+        };
+        let onion = OnionChannel::connect(identity(), config, outbound)
+            .await
+            .map_err(failed)?;
+        set.push(Box::new(onion));
+        labels.push("onion".to_string());
+    }
+    // The signature domains of all the channels must stay apart: a line signed for one must never verify on
+    // another (IRC's is the server's NETWORK name; see vortex_ng_irc::codec::Hostid).
+    let mut domains: Vec<String> = Vec::new();
+    if !meeting.relays.is_empty() {
+        domains.push(NOSTR_HOSTID.to_string());
+    }
+    if !meeting.directories.is_empty() {
+        domains.push(ONION_HOSTID.to_string());
+    }
+    for server in &meeting.irc {
+        let config = IrcConfig {
+            server: server.clone(),
+            network: network.to_string(),
+            timeout: Duration::from_secs(60),
+        };
+        let irc = IrcChannel::connect(identity(), config, outbound)
+            .await
+            .map_err(failed)?;
+        let domain = irc.hostid();
+        if let Some(other) = domains.iter().find(|d| Hostid::confusable(d, &domain)) {
+            return Err(failed(format!(
+                "the IRC server {}:{} signs as \"{domain}\", which could be mistaken for \"{other}\"",
+                server.host, server.port
+            )));
+        }
+        domains.push(domain);
+        set.push(Box::new(irc));
+        labels.push(format!("irc {}:{}", server.host, server.port));
+    }
+    Ok((ChannelSet::new(set).map_err(failed)?, labels))
+}
+
 /// `vortex-ng orderbook`: ask the makers on the relays what they offer.
 pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
-    let mut valued = vec!["network", "relays", "pit", "wait", "proxy"];
+    let mut valued = vec![
+        "network",
+        "relays",
+        "directories",
+        "irc",
+        "pit",
+        "wait",
+        "proxy",
+    ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
     let network = wallet::network(&args)?;
-    let relays = relays(&args)?;
+    let meeting = meeting(&args)?;
+    meeting.allowed_on(network)?;
     let only = match args.get("pit") {
         Some(_) => Some(wallet::pit(&args)?.0),
         None => None,
@@ -162,22 +347,34 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     };
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
-    let (me, book) = runtime()?.block_on(async {
-        let mut client = NickClient::connect_via(
-            NickKeys::generate(),
-            channel,
-            &relays,
-            &outbound,
-            CONNECT_TIMEOUT,
-        )
-        .await
-        .map_err(failed)?;
-        let book = fetch_orderbook(&mut client, channel, Duration::from_secs(wait.into()))
+    let (us, seen_on, book) = runtime()?.block_on(async {
+        let (mut client, labels) = channels(channel, &meeting, &outbound, Role::Taker).await?;
+        let usable = |offer: &Offer| only.is_none_or(|pit| offer.offer_type.pit == pit);
+        let gather = Duration::from_secs(wait.into());
+        let book = fetch_orderbook_for(&mut client, channel, gather, usable)
             .await
             .map_err(failed)?;
-        let me = client.keys().nick().to_string();
+        // The nick each maker knows us by (a bond proof is made out to it).
+        let us: std::collections::HashMap<String, String> = book
+            .offers
+            .iter()
+            .filter_map(|(nick, _)| {
+                let route = book.route(nick)?;
+                Some((nick.clone(), client.nick_on(route).to_string()))
+            })
+            .collect();
+        // The channel each maker answered on.
+        let seen_on: std::collections::HashMap<String, String> = book
+            .offers
+            .iter()
+            .filter_map(|(nick, _)| {
+                let route = book.route(nick)?;
+                let label = labels.get(client.channel_of(route))?;
+                Some((nick.clone(), label.clone()))
+            })
+            .collect();
         client.shutdown().await;
-        Ok::<_, Failure>((me, book))
+        Ok::<_, Failure>((us, seen_on, book))
     })?;
 
     let offers: Vec<&(String, Offer)> = book
@@ -187,9 +384,9 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
         .collect();
     if offers.is_empty() {
         println!(
-            "No offers on {} within {wait} s ({} relay(s)).",
+            "No offers on {} within {wait} s ({}).",
             network_name(network),
-            relays.len()
+            meeting.describe()
         );
         return Ok(());
     }
@@ -200,7 +397,7 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     };
     let mut lookups = 0;
     let mut bond_of = |nick: &str| -> String {
-        let Some(proof) = book.proofs.get(nick) else {
+        let (Some(proof), Some(me)) = (book.proofs.get(nick), us.get(nick)) else {
             return "-".into();
         };
         let (Some(chain), Some(height)) = (&chain, height) else {
@@ -212,7 +409,7 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
         lookups += 1;
         match verify_bond(
             proof,
-            &me,
+            me,
             nick,
             chain,
             height,
@@ -224,8 +421,8 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
         }
     };
     println!(
-        "{:<18} {:<12} {:>12} {:>14} {:>7} {:>10}  bond",
-        "maker", "offer", "min (sat)", "max (sat)", "txfee", "fee"
+        "{:<18} {:<12} {:>12} {:>14} {:>7} {:>10}  {:<12} channel",
+        "maker", "offer", "min (sat)", "max (sat)", "txfee", "fee", "bond"
     );
     let mut bonds: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for (nick, offer) in offers {
@@ -234,14 +431,15 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
             bonds.insert(nick, bond);
         }
         println!(
-            "{:<18} {:<12} {:>12} {:>14} {:>7} {:>10}  {}",
+            "{:<18} {:<12} {:>12} {:>14} {:>7} {:>10}  {:<12} {}",
             nick,
             offer.offer_type.command(),
             offer.minsize,
             offer.maxsize,
             offer.txfee,
             fee_text(offer),
-            bonds.get(nick.as_str()).map_or("-", String::as_str)
+            bonds.get(nick.as_str()).map_or("-", String::as_str),
+            seen_on.get(nick.as_str()).map_or("-", String::as_str)
         );
     }
     Ok(())
@@ -253,6 +451,8 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         "wallet",
         "password-file",
         "relays",
+        "directories",
+        "irc",
         "pit",
         "fee-rel",
         "fee-abs",
@@ -264,7 +464,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
-    let relays = relays(&args)?;
+    let meeting = meeting(&args)?;
     let (pit, pit_name) = wallet::pit(&args)?;
     let fee = match (
         args.get("fee-rel"),
@@ -306,6 +506,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
 
     let file = wallet::open(&args)?;
     let network = file.network();
+    meeting.allowed_on(network)?;
     let chain = node(&args, network)?;
     let (pit_wallet, _) = open_pit_wallet(&args, &file, pit, pit_name)?;
     let mut maker = Maker::new(MakerConfig::new(Vec::new()), pit_wallet).map_err(failed)?;
@@ -317,20 +518,12 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     runtime()?.block_on(async {
-        let mut client = NickClient::connect_via(
-            NickKeys::generate(),
-            channel,
-            &relays,
-            &outbound,
-            CONNECT_TIMEOUT,
-        )
-        .await
-        .map_err(failed)?;
+        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Maker).await?;
         println!(
-            "maker {} in the {pit_name} pit on {}, {} relay(s)",
-            client.keys().nick(),
+            "maker {} in the {pit_name} pit on {}, {}",
+            client.nick(),
             network_name(network),
-            relays.len()
+            meeting.describe()
         );
         let mut report = |report: MakerReport| match report {
             MakerReport::Offering {
@@ -561,6 +754,8 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         "wallet",
         "password-file",
         "relays",
+        "directories",
+        "irc",
         "pit",
         "amount",
         "makers",
@@ -606,7 +801,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
             "`--lnd-*` and `--merge-closes` only go with `--from-lnd`",
         ));
     }
-    let relays = relays(&args)?;
+    let meeting = meeting(&args)?;
     let (pit, pit_name) = wallet::pit(&args)?;
     let amount = match args.sats("amount").map_err(Failure::Usage)? {
         Some(amount) if amount > 0 => amount,
@@ -636,6 +831,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let wallet_path = Path::new(args.required("wallet").map_err(Failure::Usage)?);
     let file = wallet::open(&args)?;
     let network = file.network();
+    meeting.allowed_on(network)?;
     let chain = node(&args, network)?;
     let (mut pit_wallet, mut issued) = open_pit_wallet(&args, &file, pit, pit_name)?;
     let height = pit_wallet.sync(&chain, file.birthday()).map_err(failed)?;
@@ -788,15 +984,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let tx = runtime()?.block_on(async {
-        let mut client = NickClient::connect_via(
-            NickKeys::generate(),
-            channel,
-            &relays,
-            &outbound,
-            CONNECT_TIMEOUT,
-        )
-        .await
-        .map_err(failed)?;
+        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Taker).await?;
         let gather = Duration::from_secs(wait.into());
         let round = run_taker(
             &mut taker,

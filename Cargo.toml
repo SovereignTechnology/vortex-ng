@@ -2,9 +2,12 @@
 resolver = "3"
 members = [
     "crates/vortex-ng-autct",
+    "crates/vortex-ng-channel",
     "crates/vortex-ng-core",
+    "crates/vortex-ng-irc",
     "crates/vortex-ng-joinstr",
     "crates/vortex-ng-nostr",
+    "crates/vortex-ng-onion",
     "crates/vortex-ng-wallet",
     "crates/vortex-ng-chain",
     "crates/vortex-ng-ln",
@@ -26,9 +29,12 @@ publish = false
 
 [workspace.dependencies]
 vortex-ng-core = { path = "crates/vortex-ng-core" }
+vortex-ng-irc = { path = "crates/vortex-ng-irc" }
 vortex-ng-autct = { path = "crates/vortex-ng-autct" }
+vortex-ng-channel = { path = "crates/vortex-ng-channel" }
 vortex-ng-joinstr = { path = "crates/vortex-ng-joinstr" }
 vortex-ng-nostr = { path = "crates/vortex-ng-nostr" }
+vortex-ng-onion = { path = "crates/vortex-ng-onion" }
 vortex-ng-wallet = { path = "crates/vortex-ng-wallet" }
 vortex-ng-chain = { path = "crates/vortex-ng-chain" }
 vortex-ng-ln = { path = "crates/vortex-ng-ln" }

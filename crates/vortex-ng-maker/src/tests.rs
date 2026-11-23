@@ -343,24 +343,118 @@ fn sessions_expire_and_never_block_new_takers() {
         oid: 0,
         amount: AMOUNT,
         nacl_pubkey: NaclKeypair::generate().public_hex(),
-        commitment: [i as u8 + 1; 32],
+        commitment: numbered_commitment(i),
     };
-    // The table fills with takers that never continue.
-    for i in 0..MAX_SESSIONS {
+    // The table fills with takers that never continue. More of them than could ever finish a round fit, so
+    // a burst between a real taker's `!fill` and its `!auth` does not push it out.
+    for i in 0..MAX_WAITING_SESSIONS {
         let out = maker.handle(&format!("J5quiet{i}"), fill(i), &chain, NOW);
         assert_eq!(private(&out[0]).0, "pubkey", "fill {i}");
+        if i == MAX_SESSIONS {
+            assert!(maker.in_session("J5quiet0", NOW), "past the old limit");
+        }
     }
-    let out = maker.handle("J5late", fill(200), &chain, NOW + SESSION_TTL);
-    assert_eq!(
-        private(&out[0]).0,
-        "error",
-        "the table is full while they are in time"
-    );
-    // Once they are out of time they are forgotten, and a new taker is served.
-    let out = maker.handle("J5late", fill(201), &chain, NOW + SESSION_TTL + 1);
+    // A full table does not lock a new taker out: one session waiting for `!auth` gives way.
+    let out = maker.handle("J5late", fill(MAX_WAITING_SESSIONS), &chain, NOW + 1);
+    assert_eq!(private(&out[0]).0, "pubkey", "a new taker is served");
+    assert_eq!(maker.sessions.len(), MAX_WAITING_SESSIONS);
+    assert!(maker.in_session("J5late", NOW + 1));
+    // Once they are out of time they no longer count as open, before anything has pruned them.
+    assert!(!maker.in_session("J5late", NOW + 1 + FILLED_TTL + 1));
+    let later = fill(MAX_WAITING_SESSIONS + 1);
+    let out = maker.handle("J5later", later, &chain, NOW + FILLED_TTL + 2);
     assert_eq!(private(&out[0]).0, "pubkey");
     assert_eq!(maker.sessions.len(), 1);
     assert_eq!(maker.started.len(), 1);
+}
+
+fn numbered_commitment(i: usize) -> [u8; 32] {
+    let mut commitment = [0x5a; 32];
+    commitment[..8].copy_from_slice(&(i as u64).to_be_bytes());
+    commitment
+}
+
+#[test]
+fn one_commitment_opens_one_session() {
+    let mut maker = funded_maker();
+    let (_, chain) = new_taker();
+    let fill = || Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: NaclKeypair::generate().public_hex(),
+        commitment: numbered_commitment(1),
+    };
+    let out = maker.handle("J5first", fill(), &chain, NOW);
+    assert_eq!(private(&out[0]).0, "pubkey");
+    // The same commitment under another nick gets nothing, and the first session is left alone.
+    assert!(maker.handle("J5copy", fill(), &chain, NOW).is_empty());
+    assert!(!maker.in_session("J5copy", NOW));
+    assert!(maker.in_session("J5first", NOW));
+}
+
+#[test]
+fn a_flood_of_announcements_cannot_free_a_verified_commitment() {
+    let key = |i: usize| {
+        let mut c = [0xee; 32];
+        c[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        c
+    };
+    let mut commitments = Commitments::default();
+    commitments.insert_verified([1; 32]);
+    for i in 0..=MAX_COMMITMENTS {
+        commitments.insert(key(i));
+    }
+    assert!(commitments.contains(&[1; 32]), "still refused");
+    assert!(!commitments.contains(&key(0)), "announcements are bounded");
+    assert!(!commitments.insert([1; 32]), "not new");
+}
+
+#[test]
+fn a_line_relabelled_to_another_step_leaves_the_session() {
+    let secp = Secp256k1::new();
+    let (taker, chain) = new_taker();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    let mut maker = funded_maker();
+    let fill = Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: taker.nacl.public_hex(),
+        commitment: podle.commitment(),
+    };
+    let out = maker.handle("J5taker", fill, &chain, NOW);
+    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    let encrypted = |name: &str, text: &str| Command::Encrypted {
+        name: name.into(),
+        ciphertext: session.encrypt(text).unwrap(),
+    };
+    // It decrypts, but is not a revelation: nothing happens, and the real `!auth` still works.
+    assert!(
+        maker
+            .handle(
+                "J5taker",
+                encrypted("auth", "not a revelation"),
+                &chain,
+                NOW
+            )
+            .is_empty()
+    );
+    let out = maker.handle(
+        "J5taker",
+        encrypted("auth", &podle.revelation()),
+        &chain,
+        NOW,
+    );
+    assert_eq!(private(&out[0]).0, "ioauth");
+    // The `!auth` again, relabelled `!tx`: it decrypts, is no transaction, and ends nothing.
+    assert!(
+        maker
+            .handle("J5taker", encrypted("tx", &podle.revelation()), &chain, NOW)
+            .is_empty()
+    );
+    assert!(matches!(
+        maker.sessions.get("J5taker"),
+        Some(Stage::Authed(_))
+    ));
 }
 
 /// Run `!fill` and `!auth` for `amount`: the maker's `!ioauth`, or `None` when it refused.
@@ -431,6 +525,161 @@ fn liquidity_and_offers_follow_the_wallet() {
 }
 
 #[test]
+fn a_commitment_handed_over_privately_is_announced_once_and_sparingly() {
+    let mut maker = funded_maker();
+    let (taker, chain) = new_taker();
+    let hp2 = |c: [u8; 32]| Command::Hp2(c);
+    let announce = |c: [u8; 32]| {
+        vec![Outgoing::PublicEphemeral(format!(
+            "!hp2 {}",
+            c.to_lower_hex_string()
+        ))]
+    };
+    // A new commitment from another maker: announced, unlinked from our nick.
+    assert_eq!(
+        maker.handle("J5other", hp2([1; 32]), &chain, NOW),
+        announce([1; 32])
+    );
+    // The same again, or one already seen in public, is not announced again.
+    assert!(
+        maker
+            .handle("J5other", hp2([1; 32]), &chain, NOW)
+            .is_empty()
+    );
+    maker.on_hp2([2; 32]);
+    assert!(
+        maker
+            .handle("J5other", hp2([2; 32]), &chain, NOW)
+            .is_empty()
+    );
+    // At most HP2_RELAYS_PER_WINDOW in a window; later, again.
+    for i in 1..HP2_RELAYS_PER_WINDOW {
+        let c = [10 + i as u8; 32];
+        assert_eq!(
+            maker.handle("J5other", hp2(c), &chain, NOW + 1),
+            announce(c)
+        );
+    }
+    assert!(
+        maker
+            .handle("J5other", hp2([99; 32]), &chain, NOW + 2)
+            .is_empty()
+    );
+    let later = NOW + HP2_RELAY_WINDOW + 1;
+    assert_eq!(
+        maker.handle("J5other", hp2([100; 32]), &chain, later),
+        announce([100; 32])
+    );
+    // Whatever was handed over, announced or not, is refused in a fill.
+    let secp = Secp256k1::new();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    assert!(
+        maker
+            .handle("J5x", hp2(podle.commitment()), &chain, later)
+            .len()
+            <= 1
+    );
+    let out = maker.handle(
+        "J5taker",
+        Command::Fill {
+            oid: 0,
+            amount: AMOUNT,
+            nacl_pubkey: taker.nacl.public_hex(),
+            commitment: podle.commitment(),
+        },
+        &chain,
+        later,
+    );
+    assert_eq!(private(&out[0]).0, "error");
+}
+
+#[test]
+fn remembered_commitments_are_bounded() {
+    let mut commitments = Commitments::default();
+    let key = |i: usize| {
+        let mut c = [0u8; 32];
+        c[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        c
+    };
+    for i in 0..=MAX_COMMITMENTS {
+        assert!(commitments.insert(key(i)));
+    }
+    assert!(!commitments.insert(key(MAX_COMMITMENTS)));
+    // The oldest went first.
+    assert!(!commitments.contains(&key(0)));
+    assert!(commitments.contains(&key(1)));
+    assert_eq!(commitments.announced.seen.len(), MAX_COMMITMENTS);
+}
+
+#[test]
+fn a_stray_line_leaves_the_session_as_it_was() {
+    let secp = Secp256k1::new();
+    let mut maker = funded_maker();
+    let (taker, chain) = new_taker();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    let fill = Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: taker.nacl.public_hex(),
+        commitment: podle.commitment(),
+    };
+    let garbage = |name: &str| Command::Encrypted {
+        name: name.into(),
+        ciphertext: "AAAA".into(),
+    };
+    // Before any `!fill`: nothing is sent and nothing is started.
+    for stray in [garbage("auth"), garbage("tx"), Command::Error("x".into())] {
+        assert!(maker.handle("J5taker", stray, &chain, NOW).is_empty());
+    }
+    assert!(maker.sessions.is_empty());
+
+    let out = maker.handle("J5taker", fill.clone(), &chain, NOW);
+    assert_eq!(private(&out[0]).0, "pubkey");
+    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    // Filled: the same `!fill` again, lines not encrypted for this session, lines out of order.
+    for stray in [
+        fill.clone(),
+        garbage("auth"),
+        garbage("tx"),
+        garbage("sig"),
+        Command::Error("x".into()),
+    ] {
+        assert!(maker.handle("J5taker", stray, &chain, NOW).is_empty());
+        assert!(matches!(
+            maker.sessions.get("J5taker"),
+            Some(Stage::Filled(_))
+        ));
+    }
+    // An `!auth` encrypted for another session (another maker's, or an old one) is not this session's.
+    let elsewhere = NaclKeypair::generate();
+    let foreign = taker.nacl.session(&elsewhere.public_hex()).unwrap();
+    let foreign_auth = Command::Encrypted {
+        name: "auth".into(),
+        ciphertext: foreign.encrypt(&podle.revelation()).unwrap(),
+    };
+    assert!(
+        maker
+            .handle("J5taker", foreign_auth, &chain, NOW)
+            .is_empty()
+    );
+
+    // The real `!auth` still works, and afterwards its copy is stray too.
+    let auth = Command::Encrypted {
+        name: "auth".into(),
+        ciphertext: session.encrypt(&podle.revelation()).unwrap(),
+    };
+    let out = maker.handle("J5taker", auth.clone(), &chain, NOW);
+    assert_eq!(private(&out[0]).0, "ioauth");
+    for stray in [auth, fill, garbage("tx")] {
+        assert!(maker.handle("J5taker", stray, &chain, NOW).is_empty());
+        assert!(matches!(
+            maker.sessions.get("J5taker"),
+            Some(Stage::Authed(_))
+        ));
+    }
+}
+
+#[test]
 fn refusals_end_the_session_with_a_fixed_error() {
     let secp = Secp256k1::new();
     let (taker, chain) = new_taker();
@@ -447,15 +696,17 @@ fn refusals_end_the_session_with_a_fixed_error() {
         body: ERROR_TEXT.into(),
     }];
 
-    // Out of range, unknown oid, auth before fill.
+    // Out of range, unknown oid.
     let mut maker = funded_maker();
     assert_eq!(maker.handle("J5taker", fill(5_000), &chain, NOW), error);
     assert_eq!(
         maker.handle(
             "J5taker",
-            Command::Encrypted {
-                name: "auth".into(),
-                ciphertext: "AAAA".into()
+            Command::Fill {
+                oid: 7,
+                amount: AMOUNT,
+                nacl_pubkey: taker.nacl.public_hex(),
+                commitment: podle.commitment(),
             },
             &chain,
             NOW

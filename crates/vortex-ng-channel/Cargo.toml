@@ -1,0 +1,24 @@
+[package]
+name = "vortex-ng-channel"
+description = "The message-channel abstraction vortex-ng's makers and takers are driven over"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vortex-ng-core = { workspace = true }
+tokio = { workspace = true }
+arti-client = { workspace = true, optional = true }
+tor-rtcompat = { workspace = true, optional = true }
+
+[features]
+# In-process Tor (arti): one isolated client per nick.
+tor = ["dep:arti-client", "dep:tor-rtcompat"]
+# Test helpers for other crates' tests (`vortex_ng_channel::testing`). Never needed to run vortex-ng.
+test-util = []

@@ -1,0 +1,24 @@
+[package]
+name = "vortex-ng-irc"
+description = "JoinMarket's IRC message channel, as joinmarket-clientserver speaks it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vortex-ng-core = { workspace = true }
+vortex-ng-channel = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+# Test helpers for other crates' tests (`vortex_ng_irc::testing`): an IRC server in memory.
+test-util = []
+
+[dev-dependencies]
+vortex-ng-channel = { workspace = true, features = ["test-util"] }

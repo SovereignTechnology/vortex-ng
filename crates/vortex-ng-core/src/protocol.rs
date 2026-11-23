@@ -24,5 +24,9 @@ pub const COMMAND_PREFIX: char = '!';
 /// never verifies on the other.
 pub const NOSTR_HOSTID: &str = "nostr-network";
 
+/// The `hostid` of JoinMarket's onion message channel (directory nodes and direct onion connections), as
+/// joinmarket-clientserver (`jmdaemon/onionmc.py`) and JoinMarket-NG use it.
+pub const ONION_HOSTID: &str = "onion-network";
+
 /// JMP-0001's fixed maker-change coordination threshold, in satoshis.
 pub const MAKER_CHANGE_THRESHOLD_SAT: u64 = 27_300;

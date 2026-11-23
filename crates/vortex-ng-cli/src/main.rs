@@ -36,12 +36,12 @@ Usage:
   vortex-ng wallet info         --wallet <file>
   vortex-ng wallet addresses    --wallet <file> [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--count <n>] [--change]
   vortex-ng wallet bond-address --wallet <file> --locktime <YYYY-MM>
-  vortex-ng orderbook --network <network> --relays <url[,url...]> [--pit sw0|tr0|wsh0] [--wait <seconds>]
+  vortex-ng orderbook --network <network> where [--pit sw0|tr0|wsh0] [--wait <seconds>]
                       [node]
-  vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fraction> | --fee-abs <sats>)
+  vortex-ng maker     --wallet <file> where node (--fee-rel <fraction> | --fee-abs <sats>)
                       [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
                       [--upkeep <seconds>]
-  vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
+  vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
                       [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                       [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
                       [--allow-bondless-fees] [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
@@ -50,6 +50,11 @@ Usage:
                       [--outpoints]
   vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
   vortex-ng --version
+
+where: any of --relays <url[,url...]> (Nostr relays), --directories <host:port[,...]> (JoinMarket's onion
+directory nodes) and --irc <host:port[,...]> (JoinMarket's IRC pit; onion IRC hosts reach the server through
+the proxy); the last two on regtest only in this pre-release. A maker uses one nick on all of them, a taker a
+different nick on each. Who sees what on each channel: the README, section 'Command line'.
 
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.

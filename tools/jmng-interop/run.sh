@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# A CoinJoin between vortex-ng and joinmarket-ng over the Nostr message channel, on regtest.
+# A CoinJoin between vortex-ng and joinmarket-ng on regtest, over the Nostr message channel (CHANNEL=nostr, the
+# default) or over JoinMarket's onion directory channel (CHANNEL=onion).
 #
-# Run from a joinmarket-ng checkout that has the Nostr channel (jmcore.nostr), in a throwaway VM: it
-# installs packages, runs joinmarket-ng and a regtest Bitcoin Core, and builds vortex-ng at the given commit.
+# Run from a joinmarket-ng checkout in a throwaway VM: it installs packages, runs joinmarket-ng and a regtest
+# Bitcoin Core, and builds vortex-ng at the given commit. CHANNEL=nostr needs a checkout with the Nostr channel
+# (jmcore.nostr); CHANNEL=onion works with any, and runs joinmarket-ng's own directory server
+# (`jm-directory-server`, on loopback, with a JMP-0005 identity so nick authentication is exercised): both sides
+# meet there instead of on a relay.
 #
 #   cp -r ~/Projects/vortex-ng/tools/jmng-interop <joinmarket-ng checkout>/.interop
 #   VORTEX_NG_COMMIT=<sha> kata-run --net --cwd <joinmarket-ng checkout> -- bash .interop/run.sh
@@ -35,6 +39,10 @@ CORE_SHA256=61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963
 PORT=18443
 BONDS=${BONDS:-1}
 PIT=${PIT:-sw0}
+CHANNEL=${CHANNEL:-nostr}
+DIRECTORY_PORT=15222
+DIRECTORY_ID=test:jm-directory-$DIRECTORY_PORT
+case "$CHANNEL" in nostr|onion) ;; *) echo "CHANNEL=$CHANNEL: nostr or onion" >&2; exit 97 ;; esac
 case "$PIT" in
   sw0) address_type=p2wpkh ;;
   tr0) address_type=p2tr ;;
@@ -53,7 +61,9 @@ TAKER_MNEMONIC="burden notable love elephant orbit couch message galaxy elevator
 
 jmng=$(pwd)
 here=$(cd "$(dirname "$0")" && pwd)
-[ -d "$jmng/jmcore/src/jmcore/nostr" ] || { echo "run from a joinmarket-ng checkout with jmcore.nostr" >&2; exit 97; }
+if [ "$CHANNEL" = nostr ] && [ ! -d "$jmng/jmcore/src/jmcore/nostr" ]; then
+  echo "CHANNEL=nostr: run from a joinmarket-ng checkout with jmcore.nostr" >&2; exit 97
+fi
 work=$(mktemp -d)
 logs=$work/logs
 mkdir -p "$logs" "$work/a" "$work/b" "$work/core"
@@ -80,7 +90,7 @@ python3 -m venv "$work/venv"
 . "$work/venv/bin/activate"
 # jmswap exists only in a checkout with the Taproot pit; its maker and taker import it.
 editable=()
-for c in jmcore jmwallet jmswap maker taker; do
+for c in jmcore jmwallet jmswap maker taker directory_server; do
   [ -d "$jmng/$c" ] || continue
   pip install -q --disable-pip-version-check --require-hashes -r "$jmng/$c/requirements.txt"
   editable+=(-e "$jmng/$c")
@@ -125,10 +135,28 @@ done
 cli generatetoaddress 6 "$funder" >/dev/null
 echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcount); joinmarket-ng wallets funded"
 
+# With CHANNEL=onion: joinmarket-ng's directory server, for both rounds.
+if [ "$CHANNEL" = onion ]; then
+  HOME="$work/directory" NETWORK_CONFIG__NETWORK=regtest DIRECTORY_SERVER__HOST=127.0.0.1 \
+    DIRECTORY_SERVER__PORT=$DIRECTORY_PORT DIRECTORY_SERVER__NICK_AUTH_DIRECTORY_ID=$DIRECTORY_ID \
+    LOGGING__LEVEL=DEBUG jm-directory-server >"$logs/directory.log" 2>&1 &
+  pids+=($!)
+  for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null && break; sleep 1; done
+  (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null || { show "$logs/directory.log" 30; exit 26; }
+  echo "joinmarket-ng's directory server on 127.0.0.1:$DIRECTORY_PORT ($DIRECTORY_ID)"
+fi
+# What tells vortex-ng's test to meet on the directory.
+onion_env=()
+if [ "$CHANNEL" = onion ]; then
+  onion_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" "VORTEX_NG_INTEROP_DIRECTORY_ID=$DIRECTORY_ID")
+fi
+# Where joinmarket-ng's side meets ours: the relay vortex-ng's test runs, or the directory.
+meeting() { if [ "$CHANNEL" = onion ]; then echo "127.0.0.1:$DIRECTORY_PORT"; else echo "nostr:$1"; fi; }
+
 # The vortex-ng side of a round: the relay plus the taker or the makers. Prints the relay URL once it is up.
 vortex_pid=
 start_vortex() {  # $1 = role, $2 = its directory
-  (cd "$work/vortex-ng" && VORTEX_NG_INTEROP_ROLE="$1" VORTEX_NG_INTEROP_DIR="$2" VORTEX_NG_INTEROP_BONDS="$BONDS" \
+  (cd "$work/vortex-ng" && env "${onion_env[@]}" VORTEX_NG_INTEROP_ROLE="$1" VORTEX_NG_INTEROP_DIR="$2" VORTEX_NG_INTEROP_BONDS="$BONDS" \
     VORTEX_NG_INTEROP_PIT="$PIT" \
     VORTEX_NG_INTEROP_BOND_MNEMONICS="${MAKER_MNEMONICS[0]}|${MAKER_MNEMONICS[1]}" \
     VORTEX_NG_INTEROP_MAKERS=${#MAKER_MNEMONICS[@]} VORTEX_NG_REGTEST_RPC="http://127.0.0.1:$PORT" \
@@ -139,7 +167,7 @@ start_vortex() {  # $1 = role, $2 = its directory
   for _ in $(seq 1 600); do [ -s "$2/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
   [ -s "$2/relay.url" ] || { echo "vortex-ng ($1) did not start its relay"; show "$logs/vortex-$1.log" 40; return 1; }
 }
-report() { grep -E 'relay at|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
+report() { grep -E 'relay at|directory at|answered on the directory|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
 
 # ---- A: joinmarket-ng makers, vortex-ng taker ------------------------------------------------------------
 rc_a=0
@@ -162,7 +190,7 @@ if [ "$rc_a" -eq 0 ]; then
     env "${bond_env[@]}" \
     HOME="$home" JOINMARKET_DATA_DIR="$home/.joinmarket-ng" MNEMONIC="$mnemonic" \
       NETWORK_CONFIG__NETWORK=regtest NETWORK_CONFIG__BITCOIN_NETWORK=regtest \
-      NETWORK_CONFIG__ALLOW_CLEARNET_CONNECTIONS=true DIRECTORY_SERVERS="nostr:$relay" \
+      NETWORK_CONFIG__ALLOW_CLEARNET_CONNECTIONS=true DIRECTORY_SERVERS="$(meeting "$relay")" \
       BITCOIN__BACKEND_TYPE=descriptor_wallet BITCOIN__RPC_URL="http://127.0.0.1:$PORT" \
       BITCOIN__RPC_COOKIE_FILE="$cookie" TOR__CONTROL_ENABLED=false LOGGING__LEVEL=DEBUG \
       MAKER__MIN_SIZE=10000 MAKER__TX_FEE_CONTRIBUTION=500 MAKER__CJ_FEE_RELATIVE=0.001 \
@@ -182,9 +210,9 @@ if [ "$rc_a" -eq 0 ]; then
     [ "$rc_a" -eq 0 ] || break
     sleep 2
   done
-  wait "$vortex_pid" || { [ "$rc_a" -ne 0 ] || rc_a=$?; }
+  wait "$vortex_pid" || { rc=$?; [ "$rc_a" -ne 0 ] || rc_a=$rc; }
 fi
-echo "== A ($PIT, bonds $BONDS): vortex-ng taker with joinmarket-ng makers (exit $rc_a)"
+echo "== A ($CHANNEL, $PIT, bonds $BONDS): vortex-ng taker with joinmarket-ng makers (exit $rc_a)"
 report "$logs/vortex-taker.log"
 if [ "$rc_a" -ne 0 ]; then
   show "$logs/vortex-taker.log" 40
@@ -207,7 +235,7 @@ start_vortex makers "$work/b" || rc_b=22
 if [ "$rc_b" -eq 0 ]; then
   relay=$(cat "$work/b/relay.url")
   sleep 5  # the makers publish their offers right after the relay URL is written
-  HOME="$work/taker" JMNG_TAKER_MNEMONIC="$TAKER_MNEMONIC" python3 "$here/jmng_taker.py" "$relay" "http://127.0.0.1:$PORT" "$cookie" \
+  HOME="$work/taker" JMNG_TAKER_MNEMONIC="$TAKER_MNEMONIC" python3 "$here/jmng_taker.py" "$(meeting "$relay")" "http://127.0.0.1:$PORT" "$cookie" \
     "$work/taker/.joinmarket-ng" "$BONDS" "$PIT" >"$logs/jmng-taker.log" 2>&1 || rc_b=$?
   txid=$(sed -n 's/^JMNG_TXID=//p' "$logs/jmng-taker.log" | tail -1)
   if [ "$rc_b" -eq 0 ] && [ -n "$txid" ] && [ "$txid" != None ]; then
@@ -222,7 +250,7 @@ if [ "$rc_b" -eq 0 ]; then
     kill "$vortex_pid" 2>/dev/null || true
   fi
 fi
-echo "== B ($PIT, bonds $BONDS): joinmarket-ng taker with vortex-ng makers (exit $rc_b)"
+echo "== B ($CHANNEL, $PIT, bonds $BONDS): joinmarket-ng taker with vortex-ng makers (exit $rc_b)"
 report "$logs/vortex-makers.log"
 if [ "$rc_b" -ne 0 ]; then
   grep -v -E 'utxo_metadata|wallet\.sync|history_reconstruction' "$logs/jmng-taker.log" | tail -n 70 | cut -c1-400 || true
@@ -232,5 +260,13 @@ else
   grep -E -i 'bond' "$logs/jmng-taker.log" | grep -v -E 'utxo_metadata|registry' | tail -6 | cut -c1-260 || true
 fi
 
+if [ "$CHANNEL" = onion ]; then
+  # What the directory saw: connections, nick authentication (ours authenticates; joinmarket-ng's makers,
+  # connecting by address, do not), relayed private messages.
+  echo "directory: $(grep -c -i 'handshake' "$logs/directory.log") handshake lines," \
+    "$(grep -c -i 'nick.auth.*\(verified\|ok\)' "$logs/directory.log") nick-authentication successes"
+  grep -i 'nick.auth' "$logs/directory.log" | tail -4 | cut -c1-240 || true
+  [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] || show "$logs/directory.log" 40
+fi
 [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] && { echo "== both directions passed"; exit 0; }
 exit 1

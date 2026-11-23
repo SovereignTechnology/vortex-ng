@@ -14,6 +14,9 @@ workspace = true
 [dependencies]
 vortex-ng-core = { workspace = true }
 vortex-ng-wallet = { workspace = true }
+vortex-ng-channel = { workspace = true }
+vortex-ng-onion = { workspace = true }
+vortex-ng-irc = { workspace = true }
 vortex-ng-chain = { workspace = true }
 vortex-ng-ln = { workspace = true }
 vortex-ng-nostr = { workspace = true }

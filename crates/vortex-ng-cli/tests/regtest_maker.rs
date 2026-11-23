@@ -379,10 +379,10 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     assert_eq!(
         listing
             .lines()
-            .filter(|line| line.contains(" sw0absoffer "))
+            .filter(|line| line.contains(" sw0absoffer ") && line.trim_end().ends_with(" nostr"))
             .count(),
         MAKERS,
-        "{listing}"
+        "every offer, and the channel it came on: {listing}"
     );
     let other = vortex(&[
         "orderbook",

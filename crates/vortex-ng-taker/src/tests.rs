@@ -113,7 +113,21 @@ fn offer(pit: Pit, oid: u64) -> Offer {
 }
 
 /// Run one CoinJoin in `pit`; returns the final transaction and the taker's wallet.
-fn coinjoin(pit: Pit) -> (Transaction, PitWallet) {
+/// Whether a reply is the maker's fixed refusal.
+fn is_refusal(out: &Outgoing) -> bool {
+    matches!(out, Outgoing::Private { command, .. } if command == "error")
+}
+
+/// A round between the taker and two makers. With `noisy`, the channel misbehaves as a directory or IRC
+/// server may: every line arrives twice, every line seen so far is delivered again after each step, and every
+/// line the taker sent also reaches the other maker. None of that may change the round.
+fn coinjoin_with(pit: Pit, noisy: bool) -> (Transaction, PitWallet) {
+    coinjoin_after(pit, noisy, 0)
+}
+
+/// As [`coinjoin_with`]. `stale_pubkeys` `!pubkey` lines of each maker from other exchanges (keys the round
+/// does not use) reach the taker before anything else.
+fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkeys: usize) -> (Transaction, PitWallet) {
     let mut chain = FakeChain::default();
     let mut makers: BTreeMap<String, Maker> = BTreeMap::new();
     for (i, nick) in ["J5makerA", "J5makerB"].iter().enumerate() {
@@ -170,7 +184,20 @@ fn coinjoin(pit: Pit) -> (Transaction, PitWallet) {
         .into_iter()
         .map(|o| ("J5taker".to_string(), o))
         .collect();
+    for _ in 0..stale_pubkeys {
+        for nick in makers.keys() {
+            queue.push_front((
+                nick.clone(),
+                Outgoing::Private {
+                    to: "J5taker".into(),
+                    command: "pubkey".into(),
+                    body: vortex_ng_core::nacl::NaclKeypair::generate().public_hex(),
+                },
+            ));
+        }
+    }
     let mut progress = Progress::Waiting;
+    let mut seen: Vec<(String, String, String, String)> = Vec::new();
     while let Some((from, message)) = queue.pop_front() {
         let Outgoing::Private { to, command, body } = message else {
             continue;
@@ -186,6 +213,37 @@ fn coinjoin(pit: Pit) -> (Transaction, PitWallet) {
             progress = p;
             queue.extend(outs.into_iter().map(|o| ("J5taker".to_string(), o)));
         }
+        if !noisy {
+            continue;
+        }
+        seen.push((from, to, command, body));
+        for (from, to, command, body) in &seen {
+            let mut targets = vec![to.clone()];
+            if from == "J5taker" {
+                targets.extend(makers.keys().filter(|nick| *nick != to).cloned());
+            }
+            for target in targets {
+                let cmd = to_command(command, body);
+                if let Some(maker) = makers.get_mut(&target) {
+                    // Nothing but a refusal of a fill that was never this maker's; the refusal goes nowhere
+                    // the taker would act on (a driver drops a lone `!error` on such a channel).
+                    let outs = maker.handle(from, cmd, &chain, NOW);
+                    assert!(
+                        outs.iter().all(is_refusal),
+                        "{pit:?}: {target} answered a stray !{command}: {outs:?}"
+                    );
+                } else {
+                    let (outs, p) = taker.handle(from, cmd, &chain).unwrap_or_else(|e| {
+                        panic!("{pit:?}: a stray !{command} ended the round: {e}")
+                    });
+                    assert!(
+                        outs.is_empty(),
+                        "{pit:?}: the taker answered a stray !{command}"
+                    );
+                    assert_eq!(p, progress, "{pit:?}: a stray !{command} moved the round");
+                }
+            }
+        }
     }
     assert_eq!(progress, Progress::MakersSigned, "{pit:?}");
     // Here a channel's funding_signed would be awaited; then the taker signs last.
@@ -195,7 +253,21 @@ fn coinjoin(pit: Pit) -> (Transaction, PitWallet) {
 }
 
 fn check(pit: Pit) {
-    let (tx, _) = coinjoin(pit);
+    check_with(pit, false);
+}
+
+#[test]
+fn a_pubkey_from_another_exchange_does_not_end_the_round() {
+    // As many as leave room for the real key, which then still wins.
+    for stale in [1, MAX_PUBKEY_CANDIDATES - 1] {
+        let (tx, _) = coinjoin_after(Pit::Sw0, false, stale);
+        assert_eq!(tx.input.len(), 3);
+        assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+    }
+}
+
+fn check_with(pit: Pit, noisy: bool) {
+    let (tx, _) = coinjoin_with(pit, noisy);
     assert_eq!(tx.input.len(), 3);
     assert!(
         tx.input.iter().all(|i| !i.witness.is_empty()),
@@ -242,6 +314,51 @@ fn tr0_coinjoin_end_to_end() {
 #[test]
 fn wsh0_coinjoin_end_to_end() {
     check(Pit::Wsh0);
+}
+
+#[test]
+fn duplicated_and_replayed_lines_do_not_change_the_round() {
+    for pit in [Pit::Sw0, Pit::Tr0, Pit::Wsh0] {
+        check_with(pit, true);
+    }
+}
+
+#[test]
+fn a_maker_line_out_of_place_is_ignored() {
+    // Garbage where a maker's encrypted lines go, before anything was asked of it: no error, nothing sent.
+    let (taker, chain) = {
+        let mut chain = FakeChain::default();
+        let wallet = funded(Pit::Sw0, "taker", 600_000, 20, &mut chain);
+        let utxo = wallet.utxos(0).unwrap().remove(0);
+        let podle = podle_for(&wallet, 0, &utxo, 0).unwrap();
+        let cj = wallet.peek_address(1, false, 0).unwrap().script_pubkey();
+        let change = wallet.peek_address(0, true, 0).unwrap().script_pubkey();
+        let cfg = choice_cfg(AMOUNT);
+        let taker =
+            Taker::new(cfg, 0, vec![(utxo.outpoint, utxo.txout)], podle, cj, change).unwrap();
+        (taker, chain)
+    };
+    let mut taker = taker;
+    let chosen = vec![
+        ("J5makerA".to_string(), offer(Pit::Sw0, 0)),
+        ("J5makerB".to_string(), offer(Pit::Sw0, 1)),
+    ];
+    assert_eq!(taker.start(chosen).unwrap().len(), 2);
+    for (from, cmd) in [
+        ("J5makerA", to_command("ioauth", "AAAA")),
+        ("J5makerA", to_command("sig", "AAAA")),
+        ("J5makerA", Command::Orderbook),
+        ("J5stranger", to_command("pubkey", &"ab".repeat(32))),
+    ] {
+        let (outs, p) = taker.handle(from, cmd, &chain).unwrap();
+        assert!(outs.is_empty() && p == Progress::Waiting);
+    }
+    // A maker's `!error` is still an error to the state machine; whether to pass it on is the driver's call.
+    assert!(
+        taker
+            .handle("J5makerA", Command::Error("no".into()), &chain)
+            .is_err()
+    );
 }
 
 #[test]

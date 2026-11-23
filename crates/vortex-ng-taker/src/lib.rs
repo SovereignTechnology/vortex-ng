@@ -153,15 +153,9 @@ fn ranked_offers<'a>(
 ) -> Vec<(&'a str, u64, &'a Offer)> {
     let mut best: BTreeMap<&str, (u64, &Offer)> = BTreeMap::new();
     for (nick, offer) in offers {
-        if offer.offer_type.pit != cfg.pit {
-            continue;
-        }
-        let Some(fee) = offer.fee_for(cfg.amount) else {
+        let Some(fee) = usable_fee(offer, cfg) else {
             continue;
         };
-        if fee > cfg.max_cjfee || fee < offer.txfee {
-            continue;
-        }
         let entry = best.entry(nick.as_str()).or_insert((fee, offer));
         if fee < entry.0 {
             *entry = (fee, offer);
@@ -173,6 +167,21 @@ fn ranked_offers<'a>(
         .collect();
     ranked.sort_by_key(|(_, fee, _)| *fee);
     ranked
+}
+
+/// The fee `offer` asks for this round, if the taker would consider it: of the pit, covering the amount, within
+/// the fee limit.
+fn usable_fee(offer: &Offer, cfg: &TakerConfig) -> Option<u64> {
+    if offer.offer_type.pit != cfg.pit {
+        return None;
+    }
+    let fee = offer.fee_for(cfg.amount)?;
+    (fee <= cfg.max_cjfee && fee >= offer.txfee).then_some(fee)
+}
+
+/// Whether the taker would consider `offer` for this round.
+pub fn offer_fits(offer: &Offer, cfg: &TakerConfig) -> bool {
+    usable_fee(offer, cfg).is_some()
 }
 
 /// The nicks with an offer the taker would consider. Only these are worth a bond lookup.
@@ -461,11 +470,21 @@ struct MakerIo {
 struct MakerSlot {
     offer: Offer,
     cjfee: u64,
+    /// The session the maker's `!ioauth` proved.
     session: Option<Session>,
-    /// The maker's NaCl public key from `!pubkey`, lowercase hex: what its `!ioauth` signature covers.
+    /// That session's NaCl public key from `!pubkey`, lowercase hex: what its `!ioauth` signature covers.
     maker_nacl: String,
+    /// Every distinct key signed by this maker that reached us as a `!pubkey`, with its session, each
+    /// answered with an `!auth`. A signed `!pubkey` from another exchange can be delivered here, since the
+    /// signature does not cover the recipient, so the first one is not necessarily this round's; the one that
+    /// decrypts the maker's `!ioauth` is.
+    candidates: Vec<(String, Session)>,
     io: Option<MakerIo>,
 }
+
+/// Most `!pubkey` keys answered per maker. The first ones stay and later ones are ignored, so keys harvested
+/// from the maker and delivered after its real one cannot push that one out, and each costs at most one `!auth`.
+pub const MAX_PUBKEY_CANDIDATES: usize = 16;
 
 /// A taker running one CoinJoin.
 pub struct Taker {
@@ -560,6 +579,7 @@ impl Taker {
                     cjfee,
                     session: None,
                     maker_nacl: String::new(),
+                    candidates: Vec::new(),
                     io: None,
                 },
             );
@@ -577,7 +597,9 @@ impl Taker {
         &self.prevouts
     }
 
-    /// Handle a verified command from maker `from`.
+    /// Handle a verified command from maker `from`. A stray line is ignored (`Ok` with nothing to send); an
+    /// error is a maker that failed the round, or `!error`. A driver on a channel that does not authenticate
+    /// senders should not pass `!error` on: anyone could have delivered it.
     pub fn handle(
         &mut self,
         from: &str,
@@ -585,7 +607,7 @@ impl Taker {
         chain: &impl ChainLookup,
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
         if !self.makers.contains_key(from) {
-            return Err(err(from, "not one of our makers"));
+            return Ok(self.stray());
         }
         match command {
             Command::Pubkey { nacl_pubkey, .. } => self.on_pubkey(from, &nacl_pubkey),
@@ -605,7 +627,7 @@ impl Taker {
                         .collect::<String>()
                 ),
             )),
-            _ => Err(err(from, "unexpected command")),
+            _ => Ok(self.stray()),
         }
     }
 
@@ -619,8 +641,12 @@ impl Taker {
             .makers
             .get_mut(from)
             .ok_or_else(|| err(from, "unknown"))?;
-        if slot.session.is_some() {
-            return Err(err(from, "second !pubkey"));
+        let key = maker_nacl.to_ascii_lowercase();
+        if slot.session.is_some()
+            || slot.candidates.len() >= MAX_PUBKEY_CANDIDATES
+            || slot.candidates.iter().any(|(known, _)| *known == key)
+        {
+            return Ok(self.stray());
         }
         let session = self
             .nacl
@@ -629,8 +655,7 @@ impl Taker {
         let body = session
             .encrypt(&revelation)
             .map_err(|e| err(from, e.to_string()))?;
-        slot.session = Some(session);
-        slot.maker_nacl = maker_nacl.to_ascii_lowercase();
+        slot.candidates.push((key, session));
         Ok((
             vec![Outgoing::Private {
                 to: from.to_string(),
@@ -662,23 +687,27 @@ impl Taker {
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
         let secp = Secp256k1::new();
         let pit = self.cfg.pit;
-        let (plaintext, already, maker_nacl) = {
-            let slot = self.makers.get(from).ok_or_else(|| err(from, "unknown"))?;
-            let session = slot
-                .session
-                .as_ref()
-                .ok_or_else(|| err(from, "!ioauth before !pubkey"))?;
-            (
-                session
-                    .decrypt(ciphertext)
-                    .map_err(|e| err(from, e.to_string()))?,
-                slot.io.is_some(),
-                slot.maker_nacl.clone(),
-            )
+        let (candidate, plaintext, maker_nacl) = {
+            let Some(slot) = self.makers.get(from) else {
+                return Ok(self.stray());
+            };
+            if slot.io.is_some() {
+                return Ok(self.stray());
+            }
+            // Before `!pubkey`, or for none of the sessions we offered: not this round's.
+            let found = slot
+                .candidates
+                .iter()
+                .enumerate()
+                .find_map(|(i, (key, session))| {
+                    let plaintext = session.decrypt(ciphertext).ok()?;
+                    Some((i, plaintext, key.clone()))
+                });
+            let Some(found) = found else {
+                return Ok(self.stray());
+            };
+            found
         };
-        if already {
-            return Err(err(from, "second !ioauth"));
-        }
         let io = Ioauth::parse(&plaintext).ok_or_else(|| err(from, "malformed !ioauth"))?;
         if io.utxos.len() > self.cfg.max_maker_utxos {
             return Err(err(from, "too many inputs"));
@@ -757,6 +786,10 @@ impl Taker {
             .makers
             .get_mut(from)
             .ok_or_else(|| err(from, "unknown"))?;
+        let (_, session) = slot.candidates.swap_remove(candidate);
+        slot.candidates.clear();
+        slot.session = Some(session);
+        slot.maker_nacl = maker_nacl;
         slot.io = Some(MakerIo {
             utxos,
             cj_script,
@@ -867,19 +900,18 @@ impl Taker {
         from: &str,
         ciphertext: &str,
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| err(from, "!sig before !tx"))?;
-        let slot = self.makers.get(from).ok_or_else(|| err(from, "unknown"))?;
-        let session = slot
-            .session
-            .as_ref()
-            .ok_or_else(|| err(from, "no session"))?;
-        let io = slot.io.as_ref().ok_or_else(|| err(from, "no !ioauth"))?;
-        let payload = session
-            .decrypt(ciphertext)
-            .map_err(|e| err(from, e.to_string()))?;
+        let Some(tx) = self.tx.as_ref() else {
+            return Ok(self.stray());
+        };
+        let Some(slot) = self.makers.get(from) else {
+            return Ok(self.stray());
+        };
+        let (Some(session), Some(io)) = (slot.session.as_ref(), slot.io.as_ref()) else {
+            return Ok(self.stray());
+        };
+        let Ok(payload) = session.decrypt(ciphertext) else {
+            return Ok(self.stray());
+        };
         let secp = Secp256k1::verification_only();
         let theirs: BTreeSet<OutPoint> = io.utxos.iter().map(|(o, _)| *o).collect();
         let mut placed = false;
@@ -895,21 +927,36 @@ impl Taker {
                 break;
             }
         }
+        // A signature already taken (a duplicate delivery) or one that fits none of the maker's inputs. A maker
+        // that never sends a good one fails the round at its deadline.
         if !placed {
-            return Err(err(from, "signature fits none of its inputs"));
+            return Ok(self.stray());
         }
+        Ok((Vec::new(), self.progress()))
+    }
+
+    /// Where the round is: every maker input signed, or still waiting.
+    pub fn progress(&self) -> Progress {
         let maker_inputs: usize = self
             .makers
             .values()
             .filter_map(|s| s.io.as_ref())
             .map(|io| io.utxos.len())
             .sum();
-        let progress = if self.witnesses.len() == maker_inputs {
+        if self.tx.is_some() && self.witnesses.len() == maker_inputs {
             Progress::MakersSigned
         } else {
             Progress::Waiting
-        };
-        Ok((Vec::new(), progress))
+        }
+    }
+
+    /// A line that verifies but does not belong to the round as it stands: a duplicate, a line from another
+    /// exchange, one out of order, or an encrypted line that does not decrypt with the maker's session. It
+    /// is ignored, and the round stays where it is (ADR 0007: on channels where a directory or server
+    /// forwards lines, anyone who saw a line can deliver it again). A maker that really fails to answer is
+    /// caught by the round's deadline.
+    fn stray(&self) -> (Vec<Outgoing>, Progress) {
+        (Vec::new(), self.progress())
     }
 
     /// Sign our own inputs (after every maker's, and after any channel's `funding_signed`) and return the

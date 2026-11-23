@@ -43,6 +43,7 @@ unaudited: mainnet wallets are refused. Do not use it with real funds.**
 | crate | role |
 |---|---|
 | `vortex-ng-core` | Protocol logic with no I/O: codec, nicks, offers, PoDLE, bonds, per-pit rules |
+| `vortex-ng-channel` | The message-channel trait the drivers run over (Nostr today; onion directories and IRC next) |
 | `vortex-ng-nostr` | The Nostr message channel |
 | `vortex-ng-wallet` | JoinMarket-compatible wallet (mixdepths per pit, fidelity bonds) |
 | `vortex-ng-chain` | Chain backend over Core-compatible JSON-RPC (Bitcoin Core or rbitcoin) |
@@ -67,11 +68,11 @@ vortex-ng wallet restore      --wallet <file> --network <network> [--mnemonic-fi
 vortex-ng wallet info         --wallet <file>
 vortex-ng wallet addresses    --wallet <file> [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--count <n>] [--change]
 vortex-ng wallet bond-address --wallet <file> --locktime <YYYY-MM>
-vortex-ng orderbook --network <network> --relays <url[,url...]> [--pit sw0|tr0|wsh0] [--wait <seconds>] [node]
-vortex-ng maker     --wallet <file> --relays <url[,url...]> node (--fee-rel <fraction> | --fee-abs <sats>)
+vortex-ng orderbook --network <network> where [--pit sw0|tr0|wsh0] [--wait <seconds>] [node]
+vortex-ng maker     --wallet <file> where node (--fee-rel <fraction> | --fee-abs <sats>)
                     [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
                     [--upkeep <seconds>]
-vortex-ng coinjoin  --wallet <file> --relays <url[,url...]> node --amount <sats> [--makers <n>]
+vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
                     [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                     [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
                     [--allow-bondless-fees] [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
@@ -79,6 +80,24 @@ vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
 vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only] [--outpoints]
 vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
 ```
+
+`where` is any of `--relays <url[,url...]>` (Nostr relays), `--directories <host:port[,...]>` (JoinMarket's
+onion directory nodes) and `--irc <host:port[,...]>` (JoinMarket's IRC pit, as joinmarket-clientserver uses it);
+the last two are regtest only in this pre-release (ADR 0007). On several channels at once a maker uses one nick on
+all of them and a taker a different nick on each; a peer stays on the channel it first spoke on. An IRC server
+whose signature domain (its `NETWORK` name) could be mistaken for another channel's is refused.
+
+What each channel shows, and to whom (ADR 0007 has the reasons):
+
+| channel | its operator sees | others on it see |
+|---|---|---|
+| Nostr relays | the recipient key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
+| onion directory nodes (vortex-ng never serves an onion yet, so they relay its private messages) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
+| an IRC server | everything a directory node sees, in its own logs | the same as on the directories |
+
+A maker's single nick, and the nick key its private lines carry, link its presence on all its channels, as in
+JoinMarket. A taker's nicks differ per channel. Outside regtest the onion directories and IRC will need a Tor
+daemon's SOCKS port (`--proxy`).
 
 `node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
 `--rpc-password-file <file>`): a Bitcoin Core compatible node on the wallet's network.
@@ -135,7 +154,8 @@ vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
   failed or unconfirmed round's addresses do not come back in the next one.
 - Every PoDLE commitment sent is first written to `<wallet>.podle` (the public value makers broadcast, one
   per line): a commitment is spent even by a round that fails, and each coin has three.
-- `orderbook` lists what the makers on the relays answer, and verifies their fidelity bonds when given a node.
+- `orderbook` lists what the makers answer, with the channel each answered on, and verifies their fidelity
+  bonds when given a node.
 - `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
   username and password, such as a Tor daemon's SOCKS port (`127.0.0.1:9050`). Every nick then reaches the
   relays under credentials of its own, so Tor gives it circuits of its own: a maker and the throwaway nick it
