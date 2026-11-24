@@ -55,8 +55,9 @@ only as trustworthy as the directory or server that forwarded the line.
    end the round. On channels without sender authentication, a received `!error` is logged, not acted on.
 4. **Tor.** The legacy channels reach `.onion` hosts through a Tor daemon's SOCKS port (`--proxy`), each nick
    under its own SOCKS credentials, since the in-process Tor client is built without onion support. Whether
-   arti's onion support can replace the daemon is investigated separately (issue #49). A taker connects
-   directly to the makers it chose that serve an onion, each connection on a circuit of its own, and falls back
+   arti's onion support can replace the daemon was investigated in issue #49: not yet (addendum below). A
+   taker connects directly to the makers it chose that serve an onion, each connection on a circuit of its
+   own, and falls back
    to directory relay for a maker it cannot reach or whose connection drops (issue #45). A maker can serve
    an onion of its own, the project's first inbound listener (issue #46): published through Tor's control
    port with `SAFECOOKIE` authentication, or one the operator's Tor already forwards to it. Takers of both
@@ -103,3 +104,27 @@ What each channel shows, and to whom:
 - The Nostr channel draft's rule that a nick key is used nowhere else now reads: nowhere outside JoinMarket's
   message channels; a maker may use its nick on other JoinMarket channels, a taker should use a different
   nick on each.
+
+## Addendum: in-process Tor for onions (issue #49, 2026-11-24)
+
+Investigated on arti 0.47, our pin, by building the workspace in a throwaway VM with arti-client's
+`onion-service-client`, `onion-service-service` and `vanguards` features added to the opt-in `tor` feature, and
+running `cargo deny` on the result.
+
+- **Connecting to onions** (`onion-service-client`, a stable feature) builds and adds one crate, `tor-hsclient`
+  (MIT or Apache-2.0). `cargo deny` finds nothing new, and arti accepts onion addresses by default.
+- **Hosting an onion** (`onion-service-service`, also stable) builds and adds five more: `tor-hsservice`,
+  `growable-bloom-filter`, `k12`, `serde_bytes` and `xxhash-rust`. The last is under the Boost licence
+  (BSL-1.0), which `deny.toml` does not allow yet. Two of its properties matter for a maker. The proof-of-work
+  defence against floods of introduction requests (`hs-pow-full`) is behind arti's `experimental` flag and links
+  LGPL code. And a service's keys go to arti's keystore on disk unless the experimental ephemeral keystore is
+  used. C Tor has had that defence since 0.4.8, and `ADD_ONION` gives a service whose keys are never written.
+- **Long-lived connections.** A failed circuit ends the streams on it; the onion channel already treats that
+  as a dropped connection and reconnects to each directory with back-off (5 seconds, doubling to 10 minutes).
+  What has not been tried is arti reaching an onion directory at all: that needs a Tor network, either the live
+  one (decision 7: the owner's call) or a private test network in a VM, which needs C Tor's relays.
+
+Decision: keep the Tor daemon, for both directions, for now. Connecting through arti is the next step when it is
+wanted: `onion-service-client` in the `tor` feature, so the legacy channels can reach `.onion` hosts without a
+daemon, once there is a Tor network to test it on. A maker's onion stays with the operator's Tor
+(`--serve-onion`, or later the control port) until arti's proof-of-work defence leaves `experimental`.
