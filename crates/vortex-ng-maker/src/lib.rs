@@ -54,6 +54,27 @@ impl MakerConfig {
     }
 }
 
+/// How a commitment came to be known as used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// This maker verified it, then showed its coins.
+    Verified,
+    /// Someone announced it (`!hp2`); nothing proves it was used.
+    Announced,
+}
+
+/// Where a maker keeps the PoDLE commitments it has seen used, so that a restarted maker still refuses them
+/// (issue #52). The maker does no I/O itself: the keeper does, called as each commitment is first seen.
+pub trait CommitmentKeeper: Send {
+    /// Keep `commitment`. A [`Seen::Verified`] one must be durable when this returns: the maker shows its
+    /// coins next, and does not when this fails.
+    fn keep(&mut self, seen: Seen, commitment: &[u8; 32]) -> Result<(), String>;
+    /// Whether the store has grown enough that it should be rewritten from what the maker remembers.
+    fn wants_rewrite(&self) -> bool;
+    /// Replace what is kept with `remembered`, oldest first.
+    fn rewrite(&mut self, remembered: &[(Seen, [u8; 32])]) -> Result<(), String>;
+}
+
 /// Why the maker dropped a session, or did nothing. Only a fixed `!error` reaches the taker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MakerError {
@@ -133,6 +154,8 @@ pub struct Maker {
     /// forget, and a flood of commands must not pay for a walk over the whole table each.
     pruned_at: Option<u64>,
     used_commitments: Commitments,
+    /// Where seen commitments are kept beyond this process, if anywhere.
+    keeper: Option<Box<dyn CommitmentKeeper>>,
     /// When we announced commitments handed to us privately, within the last window.
     hp2_relayed: std::collections::VecDeque<u64>,
     bond: Option<BondTemplate>,
@@ -218,6 +241,13 @@ impl Commitments {
     fn insert_verified(&mut self, commitment: [u8; 32]) {
         self.verified.insert(commitment);
     }
+
+    /// Everything remembered, oldest first: the verified ones, then the announced ones.
+    fn remembered(&self) -> Vec<(Seen, [u8; 32])> {
+        let verified = self.verified.order.iter().map(|c| (Seen::Verified, *c));
+        let announced = self.announced.order.iter().map(|c| (Seen::Announced, *c));
+        verified.chain(announced).collect()
+    }
 }
 
 /// Most of our UTXOs looked up on the node while picking coins for one fill.
@@ -243,6 +273,7 @@ impl Maker {
             started: HashMap::new(),
             pruned_at: None,
             used_commitments: Commitments::default(),
+            keeper: None,
             hp2_relayed: std::collections::VecDeque::new(),
             bond: None,
         })
@@ -260,7 +291,54 @@ impl Maker {
 
     /// Record a commitment another maker broadcast (`!hp2`).
     pub fn on_hp2(&mut self, commitment: [u8; 32]) {
-        self.used_commitments.insert(commitment);
+        if self.used_commitments.insert(commitment) {
+            self.keep_announced(&commitment);
+        }
+    }
+
+    /// Remember `remembered` (what `keeper` holds from earlier runs, oldest first), and from now on hand
+    /// `keeper` every commitment seen used for the first time.
+    pub fn keep_commitments(
+        &mut self,
+        remembered: impl IntoIterator<Item = (Seen, [u8; 32])>,
+        keeper: Box<dyn CommitmentKeeper>,
+    ) {
+        for (seen, commitment) in remembered {
+            match seen {
+                Seen::Verified => self.used_commitments.insert_verified(commitment),
+                Seen::Announced => {
+                    self.used_commitments.insert(commitment);
+                }
+            }
+        }
+        self.keeper = Some(keeper);
+        self.rewrite_if_wanted();
+    }
+
+    /// How many commitments are remembered as used: verified, announced.
+    pub fn remembered_commitments(&self) -> (usize, usize) {
+        (
+            self.used_commitments.verified.seen.len(),
+            self.used_commitments.announced.seen.len(),
+        )
+    }
+
+    /// Hand an announced commitment to the keeper. Losing one costs little, so a failure is let go.
+    fn keep_announced(&mut self, commitment: &[u8; 32]) {
+        if let Some(keeper) = self.keeper.as_mut() {
+            let _ = keeper.keep(Seen::Announced, commitment);
+        }
+        self.rewrite_if_wanted();
+    }
+
+    /// Rewrite the keeper's store from what is remembered, when it asks. A failure leaves the store as it
+    /// was, only larger; the keeper decides when to try again.
+    fn rewrite_if_wanted(&mut self) {
+        if let Some(keeper) = self.keeper.as_mut()
+            && keeper.wants_rewrite()
+        {
+            let _ = keeper.rewrite(&self.used_commitments.remembered());
+        }
     }
 
     /// A commitment another maker handed to us privately to announce (joinmarket-clientserver's way on IRC:
@@ -271,6 +349,7 @@ impl Maker {
         if !self.used_commitments.insert(commitment) {
             return Vec::new();
         }
+        self.keep_announced(&commitment);
         while self
             .hp2_relayed
             .front()
@@ -612,7 +691,14 @@ impl Maker {
         {
             return Err(MakerError::Podle("utxo too small".into()));
         }
+        // Kept before the coins are shown: a maker restarted after this must still refuse it.
+        if let Some(keeper) = self.keeper.as_mut() {
+            keeper
+                .keep(Seen::Verified, &filled.commitment)
+                .map_err(|e| MakerError::Internal(format!("the commitment was not kept: {e}")))?;
+        }
         self.used_commitments.insert_verified(filled.commitment);
+        self.rewrite_if_wanted();
         let commitment_hex = filled.commitment.to_lower_hex_string();
 
         let cjfee = filled

@@ -1105,3 +1105,127 @@ fn without_a_bond_offers_carry_no_tbond() {
             .is_empty()
     );
 }
+
+/// A keeper in memory, shared with the test: what it was given, and whether it fails.
+#[derive(Clone, Default)]
+struct MemoryKeeper(std::sync::Arc<std::sync::Mutex<KeeperState>>);
+
+#[derive(Default)]
+struct KeeperState {
+    kept: Vec<(Seen, [u8; 32])>,
+    failing: bool,
+    rewrite_at: Option<usize>,
+    rewrites: usize,
+}
+
+impl MemoryKeeper {
+    fn kept(&self) -> Vec<(Seen, [u8; 32])> {
+        self.0.lock().unwrap().kept.clone()
+    }
+}
+
+impl CommitmentKeeper for MemoryKeeper {
+    fn keep(&mut self, seen: Seen, commitment: &[u8; 32]) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap();
+        if state.failing {
+            return Err("the disk is full".into());
+        }
+        state.kept.push((seen, *commitment));
+        Ok(())
+    }
+
+    fn wants_rewrite(&self) -> bool {
+        let state = self.0.lock().unwrap();
+        state.rewrite_at.is_some_and(|at| state.kept.len() >= at)
+    }
+
+    fn rewrite(&mut self, remembered: &[(Seen, [u8; 32])]) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap();
+        state.kept = remembered.to_vec();
+        state.rewrite_at = state.rewrite_at.map(|at| at + remembered.len());
+        state.rewrites += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn a_restarted_maker_still_refuses_the_commitments_it_saw() {
+    let (taker, chain) = new_taker();
+    let keeper = MemoryKeeper::default();
+    let mut maker = funded_maker();
+    maker.keep_commitments(Vec::new(), Box::new(keeper.clone()));
+    maker.on_hp2([7; 32]);
+    maker.on_hp2([7; 32]);
+    assert!(auth_round(&mut maker, &taker, &chain, AMOUNT).is_some());
+    // Each kept once, the announced one as announced, the round's as verified.
+    let kept = keeper.kept();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert_eq!(kept[0], (Seen::Announced, [7; 32]));
+    assert_eq!(kept[1].0, Seen::Verified);
+
+    // The same wallet in a new process that was handed what was kept: neither opens a session.
+    let mut again = funded_maker();
+    again.keep_commitments(kept, Box::new(MemoryKeeper::default()));
+    assert_eq!(again.remembered_commitments(), (1, 1));
+    assert!(auth_round(&mut again, &taker, &chain, AMOUNT).is_none());
+    let fill = Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: NaclKeypair::generate().public_hex(),
+        commitment: [7; 32],
+    };
+    let out = again.handle("J5other", fill, &chain, NOW);
+    assert_eq!(private(&out[0]).0, "error");
+    // Without what was kept, the very same round goes ahead.
+    assert!(auth_round(&mut funded_maker(), &taker, &chain, AMOUNT).is_some());
+}
+
+#[test]
+fn coins_are_not_shown_when_the_commitment_cannot_be_kept() {
+    let (taker, chain) = new_taker();
+    let keeper = MemoryKeeper::default();
+    let mut maker = funded_maker();
+    maker.keep_commitments(Vec::new(), Box::new(keeper.clone()));
+    keeper.0.lock().unwrap().failing = true;
+    // An announcement is still remembered in memory: losing it on disk costs little.
+    maker.on_hp2([8; 32]);
+    assert_eq!(maker.remembered_commitments(), (0, 1));
+    // The round's commitment is not on disk, so no `!ioauth`, and the commitment is not counted as used.
+    assert!(auth_round(&mut maker, &taker, &chain, AMOUNT).is_none());
+    assert_eq!(maker.remembered_commitments(), (0, 1));
+    assert!(!maker.in_session("J5taker", NOW));
+    // Once the disk is back, the taker can try again with the same commitment.
+    keeper.0.lock().unwrap().failing = false;
+    assert!(auth_round(&mut maker, &taker, &chain, AMOUNT).is_some());
+    assert_eq!(
+        keeper
+            .kept()
+            .iter()
+            .filter(|(seen, _)| *seen == Seen::Verified)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn the_keeper_is_rewritten_from_what_is_remembered_when_it_asks() {
+    let keeper = MemoryKeeper::default();
+    keeper.0.lock().unwrap().rewrite_at = Some(3);
+    let mut maker = funded_maker();
+    // Loaded at start, with a duplicate the maker remembers once.
+    let earlier = vec![
+        (Seen::Verified, [1; 32]),
+        (Seen::Announced, [2; 32]),
+        (Seen::Announced, [2; 32]),
+    ];
+    keeper.0.lock().unwrap().kept = earlier.clone();
+    maker.keep_commitments(earlier, Box::new(keeper.clone()));
+    assert_eq!(keeper.0.lock().unwrap().rewrites, 1);
+    assert_eq!(
+        keeper.kept(),
+        vec![(Seen::Verified, [1; 32]), (Seen::Announced, [2; 32])]
+    );
+    maker.on_hp2([3; 32]);
+    assert_eq!(keeper.0.lock().unwrap().rewrites, 1);
+    assert_eq!(keeper.kept().len(), 3);
+}

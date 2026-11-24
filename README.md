@@ -133,6 +133,10 @@ JoinMarket. A taker's nicks differ per channel.
   out a round.
 - Every PoDLE commitment sent is first written to `<wallet>.podle` (the public value makers broadcast, one
   per line): a commitment is spent even by a round that fails, and each coin has three.
+- `maker` keeps the commitments it has seen used in `<wallet>.commitments`, so a restarted maker still
+  refuses them: the ones it verified before showing its coins (on disk first; if that write fails, the round
+  is refused) and the ones others announced (`!hp2`). The file holds the public values only, and is rewritten
+  from what the maker remembers when it grows, so a flood of announcements cannot fill the disk.
 - `orderbook` lists what the makers answer, with the channel each answered on, and verifies their fidelity
   bonds when given a node.
 - `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by

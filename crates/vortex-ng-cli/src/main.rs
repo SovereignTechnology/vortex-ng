@@ -10,6 +10,7 @@ mod args;
 mod market;
 mod podle_log;
 mod secret;
+mod seen_log;
 mod wallet;
 
 use std::process::ExitCode;

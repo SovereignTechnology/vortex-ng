@@ -32,6 +32,7 @@ use vortex_ng_wallet::{MIXDEPTHS, PitWallet};
 
 use crate::args::Args;
 use crate::podle_log::PodleLog;
+use crate::seen_log::SeenLog;
 use crate::wallet::{failed, network_name, parse};
 use crate::{Failure, secret, wallet};
 
@@ -533,6 +534,11 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     let chain = node(&args, network)?;
     let pit_wallet = PitWallet::new(&file.seed().map_err(failed)?, pit).map_err(failed)?;
     let mut maker = Maker::new(MakerConfig::new(Vec::new()), pit_wallet).map_err(failed)?;
+    // The commitments seen used in earlier runs are still refused (`<wallet>.commitments`).
+    let wallet_path = Path::new(args.required("wallet").map_err(Failure::Usage)?);
+    let (log, remembered) = SeenLog::open(wallet_path).map_err(failed)?;
+    maker.keep_commitments(remembered, Box::new(log));
+    let (verified, announced) = maker.remembered_commitments();
     let service = MakerService {
         policy,
         birthday: file.birthday(),
@@ -556,6 +562,11 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         );
         if let Some(serving) = serving {
             println!("{serving}");
+        }
+        if verified + announced > 0 {
+            println!(
+                "remembering {verified} commitment(s) it verified and {announced} announced, from earlier runs"
+            );
         }
         let mut report = |report: MakerReport| match report {
             MakerReport::Offering {
