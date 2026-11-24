@@ -27,6 +27,8 @@
 #      taker's `!fill`, `!auth`, `!tx`;
 #   B. two vortex-ng makers and the reference's taker, which does a round with them and asks them to broadcast
 #      it (`!push`, tx_broadcast = not-self); vortex-ng then checks the transaction and its makers' wallets.
+#      Our makers serve on loopback; with CHANNEL=onion the directory may carry only the taker's first line to
+#      each (`!fill`, which is when the reference connects) and the `!pubkey` answering it, none of the rest.
 # Fidelity bonds are not used yet (BONDS=0 on the vortex-ng side).
 set -euo pipefail
 
@@ -323,6 +325,26 @@ if [ "$rc_b" -ne 0 ]; then
   show "$logs/vortex-makers.log" 30
 else
   echo "txid $txid at height $(cli getblockcount)"
+  if [ "$CHANNEL" = onion ]; then
+    # The reference's taker sends its first line to a maker (`!fill`) by the directory and opens a connection
+    # to the maker as it does; the rest of the round must go over that connection, both ways.
+    makers=$(sed -n 's/^maker [0-9]* nick \(J[0-9A-Za-z]*\)$/\1/p' "$logs/vortex-makers.log" | paste -sd'|' -)
+    if [ -z "$makers" ]; then
+      echo "our makers' nicks are not in the log"; rc_b=27
+    else
+      fills=$(grep -c -E "\"line\": \"J[0-9A-Za-z]+!($makers)!fill " "$logs/directory.log" || true)
+      to=$(grep -c -E "\"line\": \"J[0-9A-Za-z]+!($makers)!(auth|tx) " "$logs/directory.log" || true)
+      pubkeys=$(grep -c -E "\"line\": \"($makers)!J[0-9A-Za-z]+!pubkey " "$logs/directory.log" || true)
+      from=$(grep -c -E "\"line\": \"($makers)!J[0-9A-Za-z]+!(ioauth|sig) " "$logs/directory.log" || true)
+      echo "the directory relayed the taker's $fills !fill and $to !auth/!tx to our makers," \
+        "and their $pubkeys !pubkey and $from !ioauth/!sig to it"
+      if [ "$to" -eq 0 ] && [ "$from" -eq 0 ]; then
+        echo "Direct connection: the reference taker reached both our makers directly after its !fill"
+      else
+        echo "Direct connection: the round's later lines went through the directory"; rc_b=28
+      fi
+    fi
+  fi
 fi
 
 if [ "$CHANNEL" != irc ]; then

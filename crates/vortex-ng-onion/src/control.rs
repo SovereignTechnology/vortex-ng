@@ -1,14 +1,17 @@
 //! Just enough of Tor's control protocol (control-spec.txt) to publish an ephemeral onion service: a maker's
 //! address for direct connections (issue #46).
 //!
-//! `PROTOCOLINFO`, then `AUTHENTICATE` with the configured cookie file (method `COOKIE`) or with nothing
-//! (method `NULL`), then `ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port=<virtual>,127.0.0.1:<local>`. The service
-//! lives as long as the control connection: [`OnionService`] keeps it open, and dropping it removes the
+//! `PROTOCOLINFO`, then authentication with nothing (method `NULL`) or with the configured cookie file (method
+//! `SAFECOOKIE`), then `ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port=<virtual>,127.0.0.1:<local>`. The
+//! service lives as long as the control connection: [`OnionService`] keeps it open, and dropping it removes the
 //! service. The key is discarded: a new address each time, which is what a nick that changes each run wants.
-//! A path the port itself names is never read: whatever answered on that port could otherwise have any
-//! 32-byte file sent to it. `COOKIE` still shows the cookie to whatever listens on the port, so this must move
-//! to `SAFECOOKIE` before the commands use it. `SAFECOOKIE` and password authentication are not supported yet;
-//! configure Tor with `CookieAuthentication 1` (offers `COOKIE`) and make the cookie readable.
+//!
+//! The cookie itself never goes to the port. With `SAFECOOKIE` the port first proves it holds the cookie
+//! (`AUTHCHALLENGE`: an HMAC of the cookie and both sides' nonces), and only then is it sent our HMAC, which is
+//! good for that one connection. So something else listening on the port learns nothing, and plain `COOKIE`,
+//! which would send the cookie to it, is refused. A path the port names is never read either: only the
+//! configured file is. Password authentication is not supported; configure Tor with `CookieAuthentication 1`
+//! (it offers `COOKIE,SAFECOOKIE`) and make the cookie readable.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,9 +20,25 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use vortex_ng_core::bitcoin::hex::DisplayHex;
+use vortex_ng_core::bitcoin::hashes::{Hash, HashEngine, hmac, sha256};
+use vortex_ng_core::bitcoin::hex::{DisplayHex, FromHex};
+use vortex_ng_core::tx::random_bytes;
 
 use crate::wire::is_v3_onion;
+
+/// The HMAC key of the hash the port proves itself with (control-spec, `AUTHCHALLENGE`).
+const SERVER_TO_CONTROLLER: &[u8] = b"Tor safe cookie authentication server-to-controller hash";
+/// The HMAC key of the hash we authenticate with.
+const CONTROLLER_TO_SERVER: &[u8] = b"Tor safe cookie authentication controller-to-server hash";
+
+/// A `SAFECOOKIE` hash: HMAC-SHA256 under `key` of the cookie, our nonce and the port's.
+fn safecookie(key: &[u8], cookie: &[u8], ours: &[u8; 32], theirs: &[u8; 32]) -> [u8; 32] {
+    let mut engine = hmac::HmacEngine::<sha256::Hash>::new(key);
+    engine.input(cookie);
+    engine.input(ours);
+    engine.input(theirs);
+    hmac::Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
+}
 
 /// The port an onion service is published on (joinmarket-clientserver's `ONION_VIRTUAL_PORT`).
 pub const ONION_PORT: u16 = 5222;
@@ -105,7 +124,7 @@ async fn authenticate(control: &mut Control, config: &TorControl) -> Result<(), 
         command(control, "AUTHENTICATE").await?;
         return Ok(());
     }
-    if methods.contains(&"COOKIE") {
+    if methods.contains(&"SAFECOOKIE") {
         let path = config
             .cookie
             .clone()
@@ -116,15 +135,40 @@ async fn authenticate(control: &mut Control, config: &TorControl) -> Result<(), 
         if cookie.len() != 32 {
             return Err("the cookie is not 32 bytes".into());
         }
+        let ours: [u8; 32] = random_bytes();
+        let reply = command(
+            control,
+            &format!("AUTHCHALLENGE SAFECOOKIE {}", ours.to_lower_hex_string()),
+        )
+        .await?;
+        let challenge = reply
+            .iter()
+            .find_map(|line| line.strip_prefix("AUTHCHALLENGE "))
+            .ok_or("no AUTHCHALLENGE reply")?;
+        let field = |name: &str| -> Result<[u8; 32], String> {
+            challenge
+                .split(' ')
+                .find_map(|field| field.strip_prefix(name))
+                .and_then(|hex| <[u8; 32]>::from_hex(hex).ok())
+                .ok_or_else(|| format!("no {name} of 32 bytes in the AUTHCHALLENGE reply"))
+        };
+        let (proof, theirs) = (field("SERVERHASH=")?, field("SERVERNONCE=")?);
+        // The port shows it holds the cookie before we show we do.
+        if safecookie(SERVER_TO_CONTROLLER, &cookie, &ours, &theirs) != proof {
+            return Err(
+                "the control port does not hold the cookie: not Tor's, or not this Tor's".into(),
+            );
+        }
+        let answer = safecookie(CONTROLLER_TO_SERVER, &cookie, &ours, &theirs);
         command(
             control,
-            &format!("AUTHENTICATE {}", cookie.to_lower_hex_string()),
+            &format!("AUTHENTICATE {}", answer.to_lower_hex_string()),
         )
         .await?;
         return Ok(());
     }
     Err(format!(
-        "the control port offers {methods:?}; this needs COOKIE (CookieAuthentication 1) or NULL"
+        "the control port offers {methods:?}; this needs SAFECOOKIE (CookieAuthentication 1) or NULL"
     ))
 }
 
@@ -182,10 +226,15 @@ mod tests {
 
     use super::*;
 
-    /// A control port that offers `methods`, names `cookie`, and records what it was sent.
+    /// The port's nonce in [`fake_control`].
+    const THEIRS: [u8; 32] = [9; 32];
+
+    /// A control port that offers `methods`, names `named` as its cookie file, holds the cookie `holds` (or
+    /// none it could prove), and records what it was sent. It checks a `SAFECOOKIE` answer as Tor does.
     async fn fake_control(
         methods: &str,
-        cookie: Option<String>,
+        named: Option<String>,
+        holds: Option<[u8; 32]>,
     ) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -194,6 +243,8 @@ mod tests {
         tokio::spawn(async move {
             let (conn, _) = listener.accept().await.unwrap();
             let mut conn = BufReader::new(conn);
+            let cookie = holds.unwrap_or([0; 32]);
+            let mut ours = None;
             loop {
                 let mut line = String::new();
                 if conn.read_line(&mut line).await.unwrap_or(0) == 0 {
@@ -202,15 +253,39 @@ mod tests {
                 let line = line.trim_end().to_string();
                 record.lock().unwrap().push(line.clone());
                 let reply = if line.starts_with("PROTOCOLINFO") {
-                    let named = cookie
+                    let named = named
                         .as_ref()
                         .map(|c| format!(" COOKIEFILE=\"{c}\""))
                         .unwrap_or_default();
                     format!(
                         "250-PROTOCOLINFO 1\r\n250-AUTH METHODS={methods}{named}\r\n250-VERSION Tor=\"0.4.8\"\r\n250 OK\r\n"
                     )
-                } else if line.starts_with("AUTHENTICATE") {
-                    "250 OK\r\n".to_string()
+                } else if let Some(nonce) = line.strip_prefix("AUTHCHALLENGE SAFECOOKIE ") {
+                    let nonce = <[u8; 32]>::from_hex(nonce).unwrap();
+                    ours = Some(nonce);
+                    // Tor writes its hex in capitals.
+                    let proof = safecookie(SERVER_TO_CONTROLLER, &cookie, &nonce, &THEIRS);
+                    format!(
+                        "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                        proof.to_upper_hex_string(),
+                        THEIRS.to_upper_hex_string()
+                    )
+                } else if line == "AUTHENTICATE" {
+                    if methods.split(',').any(|m| m == "NULL") {
+                        "250 OK\r\n".to_string()
+                    } else {
+                        "515 Authentication failed\r\n".to_string()
+                    }
+                } else if let Some(answer) = line.strip_prefix("AUTHENTICATE ") {
+                    let expected = ours.map(|ours| {
+                        safecookie(CONTROLLER_TO_SERVER, &cookie, &ours, &THEIRS)
+                            .to_lower_hex_string()
+                    });
+                    if expected.as_deref() == Some(answer) {
+                        "250 OK\r\n".to_string()
+                    } else {
+                        "515 Authentication failed\r\n".to_string()
+                    }
                 } else if line.starts_with("ADD_ONION") {
                     format!("250-ServiceID={}\r\n250 OK\r\n", "b".repeat(56))
                 } else {
@@ -237,8 +312,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_onion_is_published_with_null_or_cookie_authentication() {
-        let (addr, seen) = fake_control("NULL", None).await;
+    async fn an_onion_is_published_with_null_authentication() {
+        let (addr, seen) = fake_control("NULL", None, None).await;
         let service = publish(&TorControl { addr, cookie: None }, 18_082)
             .await
             .unwrap();
@@ -249,30 +324,46 @@ mod tests {
             sent[2],
             "ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port=5222,127.0.0.1:18082"
         );
+    }
 
+    #[tokio::test]
+    async fn the_cookie_is_proved_never_sent() {
         let dir = std::env::temp_dir().join(format!("vortex-ng-control-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cookie = dir.join("control.authcookie");
-        std::fs::write(&cookie, [7u8; 32]).unwrap();
-        // The configured file is what is read.
-        let (addr, seen) = fake_control("COOKIE,SAFECOOKIE", None).await;
-        let config = TorControl {
+        let path = dir.join("control.authcookie");
+        let cookie = [7u8; 32];
+        std::fs::write(&path, cookie).unwrap();
+        let configured = |addr| TorControl {
             addr,
-            cookie: Some(cookie.clone()),
+            cookie: Some(path.clone()),
         };
-        publish(&config, 1).await.unwrap();
-        assert_eq!(
-            seen.lock().unwrap()[1],
-            format!("AUTHENTICATE {}", "07".repeat(32))
-        );
-        // A path the port names is not: nothing of that file goes back to it.
-        let (addr, seen) =
-            fake_control("COOKIE,SAFECOOKIE", Some(cookie.display().to_string())).await;
+        let sent_the_cookie = |seen: &Arc<Mutex<Vec<String>>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains(&cookie.to_lower_hex_string()))
+        };
+
+        // Tor offers both: SAFECOOKIE, with a nonce of our own, and an answer the port accepts.
+        let (addr, seen) = fake_control("COOKIE,SAFECOOKIE", None, Some(cookie)).await;
+        let service = publish(&configured(addr), 18_082).await.unwrap();
+        assert_eq!(service.host, format!("{}.onion", "b".repeat(56)));
+        let sent = seen.lock().unwrap().clone();
+        let nonce = sent[1].strip_prefix("AUTHCHALLENGE SAFECOOKIE ").unwrap();
+        assert_eq!(nonce.len(), 64);
         assert!(
-            publish(&TorControl { addr, cookie: None }, 1)
-                .await
-                .is_err()
+            sent[2].starts_with("AUTHENTICATE ") && sent[2].len() == "AUTHENTICATE ".len() + 64
         );
+        assert!(sent[3].starts_with("ADD_ONION "));
+        assert!(!sent_the_cookie(&seen));
+        // A new nonce each time, so an answer is good for one connection only.
+        let (addr, again) = fake_control("COOKIE,SAFECOOKIE", None, Some(cookie)).await;
+        publish(&configured(addr), 1).await.unwrap();
+        assert_ne!(again.lock().unwrap()[1], sent[1]);
+
+        // A port that does not hold the cookie cannot prove it does, and gets no answer.
+        let (addr, seen) = fake_control("COOKIE,SAFECOOKIE", None, Some([8; 32])).await;
+        assert!(publish(&configured(addr), 1).await.is_err());
         assert!(
             !seen
                 .lock()
@@ -280,14 +371,48 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("AUTHENTICATE"))
         );
-        std::fs::remove_dir_all(&dir).unwrap();
 
-        // Only what is supported.
-        let (addr, _) = fake_control("SAFECOOKIE,HASHEDPASSWORD", None).await;
+        // Plain COOKIE would send the cookie itself: refused, and nothing is sent.
+        let (addr, seen) = fake_control("COOKIE", None, Some(cookie)).await;
+        assert!(publish(&configured(addr), 1).await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // A path the port names is not read: only the configured one.
+        let (addr, seen) = fake_control(
+            "COOKIE,SAFECOOKIE",
+            Some(path.display().to_string()),
+            Some(cookie),
+        )
+        .await;
         assert!(
             publish(&TorControl { addr, cookie: None }, 1)
                 .await
                 .is_err()
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Only what is supported.
+        let (addr, _) = fake_control("HASHEDPASSWORD", None, None).await;
+        assert!(
+            publish(&TorControl { addr, cookie: None }, 1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn safecookie_hashes_are_hmac_sha256_of_cookie_and_nonces() {
+        // As control-spec defines them: HMAC-SHA256, keyed with the constant, of the cookie, then the
+        // controller's nonce, then the server's. Expected values from Python's `hmac` module.
+        let (cookie, ours, theirs) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        assert_eq!(
+            safecookie(CONTROLLER_TO_SERVER, &cookie, &ours, &theirs).to_lower_hex_string(),
+            "8d81b806c8314911da68057896783b1f28f640a588c9a2cfe902d371806bbf1a"
+        );
+        assert_eq!(
+            safecookie(SERVER_TO_CONTROLLER, &cookie, &ours, &theirs).to_lower_hex_string(),
+            "1830d2de6e061e60adfa2c0c2a9257b7126e51b074f39bd4519d89229df08827"
         );
     }
 }

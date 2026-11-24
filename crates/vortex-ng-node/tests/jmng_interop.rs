@@ -15,6 +15,9 @@
 //! With `VORTEX_NG_INTEROP_ONIONS` (comma-separated onion names, possibly none) everyone but a maker reaches
 //! the directory through a test SOCKS proxy that stands in for Tor, and a taker connects directly to the
 //! makers it chose that serve an onion: the names listed are on this machine, any other onion is refused.
+//! With `VORTEX_NG_INTEROP_SERVE` this side's makers serve (`loopback`, or `<onion>:<port>,…`, one per maker);
+//! in the makers' run the proxy is then the other side's taker's way out, and its address goes to
+//! `<dir>/socks.addr` before `relay.url`.
 //!
 //! `taker_with_joinmarket_ng_makers` (`VORTEX_NG_INTEROP_ROLE=taker`): a vortex-ng taker waits until the
 //! joinmarket-ng makers have announced their offers, asks them for the orderbook, and runs a round with them
@@ -86,12 +89,61 @@ struct Harness {
     onion_network: String,
     /// `VORTEX_NG_INTEROP_IRC`: meet on this IRC server instead.
     irc: Option<IrcServer>,
-    /// `VORTEX_NG_INTEROP_SERVE=loopback`: makers on the directory serve on loopback.
-    serve_loopback: bool,
+    /// `VORTEX_NG_INTEROP_SERVE`: whether and how makers on the directory serve.
+    serve: Serving,
     /// `VORTEX_NG_INTEROP_ONIONS`: the onion names on this machine, when the way out is a test proxy.
     onions: Option<HashMap<String, IpAddr>>,
     /// That proxy, once started.
     proxy: Option<AuthSocks>,
+}
+
+/// How this side's makers on the directory serve, so that the other side's taker can reach them directly.
+#[derive(Clone, Debug)]
+enum Serving {
+    /// `VORTEX_NG_INTEROP_SERVE` unset: they do not.
+    Not,
+    /// `loopback`: each on a loopback port that is its location (joinmarket-clientserver's testing mode).
+    Loopback,
+    /// `<onion>:<port>,…`: maker `i` as the `i`th onion, listening on that port on loopback, as behind a Tor
+    /// that forwards the onion there. The test proxy stands in for that Tor.
+    Onions(Vec<(String, u16)>),
+}
+
+impl Serving {
+    fn from_env() -> Serving {
+        match std::env::var("VORTEX_NG_INTEROP_SERVE").as_deref() {
+            Err(_) => Serving::Not,
+            Ok("loopback") => Serving::Loopback,
+            Ok(list) => Serving::Onions(
+                list.split(',')
+                    .map(|entry| {
+                        let (host, port) = entry.rsplit_once(':').expect("<onion>:<port>");
+                        assert!(
+                            vortex_ng_onion::wire::is_v3_onion(host),
+                            "{host}: a v3 onion"
+                        );
+                        (host.to_string(), port.parse().expect("a port"))
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// How maker `index` serves; with onions, a maker past those named (the commitment announcer) does not.
+    fn serve(&self, index: usize) -> Serve {
+        match self {
+            Serving::Not => Serve::None,
+            Serving::Loopback => Serve::Loopback,
+            Serving::Onions(onions) => {
+                onions
+                    .get(index)
+                    .map_or(Serve::None, |(host, port)| Serve::Onion {
+                        host: host.clone(),
+                        port: *port,
+                    })
+            }
+        }
+    }
 }
 
 impl Harness {
@@ -123,7 +175,7 @@ impl Harness {
                 }),
             onion_network: std::env::var("VORTEX_NG_INTEROP_ONION_NETWORK")
                 .unwrap_or_else(|_| "regtest".into()),
-            serve_loopback: std::env::var("VORTEX_NG_INTEROP_SERVE").is_ok_and(|v| v == "loopback"),
+            serve: Serving::from_env(),
             irc: std::env::var("VORTEX_NG_INTEROP_IRC").ok().map(|text| {
                 let mut server = IrcServer::parse(&text).expect("an IRC server host:port");
                 server.expected_network = std::env::var("VORTEX_NG_INTEROP_IRC_NETWORK").ok();
@@ -225,12 +277,13 @@ fn sink() -> vortex_ng_core::bitcoin::Address {
 }
 
 /// Channels for a new participant: on the directory and the IRC server when they are given (both, with
-/// `CHANNEL=both`), else on the relay at `url`. A maker (`serve`) keeps one nick on all of them, anyone else
-/// takes a nick of its own on each (ADR 0007). A maker on the directory serves on loopback when
-/// `VORTEX_NG_INTEROP_SERVE=loopback`, so the other side's taker can connect to it:
-/// joinmarket-clientserver's regtest testing mode only, since JoinMarket-NG's directories refuse a location
-/// that is not a v3 onion.
-async fn meet(harness: &Harness, url: &str, serve: bool) -> ChannelSet {
+/// `CHANNEL=both`), else on the relay at `url`. A maker (`Some(index)`) keeps one nick on all of them, anyone
+/// else takes a nick of its own on each (ADR 0007). A maker on the directory serves as
+/// `VORTEX_NG_INTEROP_SERVE` says ([`Serving`]), so the other side's taker can connect to it: on loopback for
+/// joinmarket-clientserver's regtest testing mode, as an onion for JoinMarket-NG, whose directories refuse a
+/// location that is not a v3 onion.
+async fn meet(harness: &Harness, url: &str, maker_index: Option<usize>) -> ChannelSet {
+    let serve = maker_index.is_some();
     let maker = NickIdentity::generate();
     let identity = || {
         if serve {
@@ -256,11 +309,7 @@ async fn meet(harness: &Harness, url: &str, serve: bool) -> ChannelSet {
                     network: harness.onion_network.clone(),
                     timeout: Duration::from_secs(60),
                     peers,
-                    serve: if serve && harness.serve_loopback {
-                        Serve::Loopback
-                    } else {
-                        Serve::None
-                    },
+                    serve: maker_index.map_or(Serve::None, |index| harness.serve.serve(index)),
                 },
                 &outbound,
             )
@@ -307,7 +356,7 @@ async fn meet(harness: &Harness, url: &str, serve: bool) -> ChannelSet {
 /// five seconds). Our side has a different nick on each channel, which is checked here too.
 async fn wait_for_answering_makers(harness: &Harness, count: usize, limit: Duration) {
     let channels = harness.legacy_channels();
-    let mut observer = meet(harness, "", false).await;
+    let mut observer = meet(harness, "", None).await;
     observer.listen(true, false).await.unwrap();
     let until = Instant::now() + limit;
     let mut seen: HashMap<String, HashSet<usize>> = HashMap::new();
@@ -445,7 +494,7 @@ async fn taker_with_joinmarket_ng_makers() {
         change,
     )
     .unwrap();
-    let mut client = meet(&harness, &url, false).await;
+    let mut client = meet(&harness, &url, None).await;
     println!("taker nick {}", client.nick());
     let tx = run_taker(
         &mut taker,
@@ -519,7 +568,7 @@ struct Prober {
 
 impl Prober {
     async fn new(harness: &Harness, url: &str, announcer: &str) -> Prober {
-        let mut client = meet(harness, url, false).await;
+        let mut client = meet(harness, url, None).await;
         let until = Instant::now() + Duration::from_secs(120);
         loop {
             let book = fetch_orderbook(&mut client, "regtest", Duration::from_secs(12))
@@ -621,7 +670,7 @@ impl Prober {
 /// other side's makers then refuse it. A fresh commitment before and after shows that a maker that stays
 /// silent has refused this one and is not simply gone.
 async fn announced_commitment_is_refused(harness: &Harness, url: &str) {
-    let mut channel = meet(harness, url, true).await;
+    let mut channel = meet(harness, url, Some(harness.makers)).await;
     let announcer = channel.nick().to_string();
     let announcer_wallet = wallet("interop-announcer", harness.pit);
     let offer_type = match harness.pit {
@@ -635,7 +684,7 @@ async fn announced_commitment_is_refused(harness: &Harness, url: &str) {
         let until = Instant::now() + Duration::from_secs(600);
         run_maker(&mut maker, &mut channel, &rpc, "regtest", until).await
     });
-    let mut watcher = meet(harness, url, false).await;
+    let mut watcher = meet(harness, url, None).await;
     watcher.listen(false, true).await.unwrap();
 
     let mut before = Prober::new(harness, url, &announcer).await;
@@ -718,12 +767,14 @@ fn total(wallet: &PitWallet) -> Amount {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn makers_with_joinmarket_ng_taker() {
-    let Some(harness) = Harness::from_env("makers") else {
+    let Some(mut harness) = Harness::from_env("makers") else {
         println!("skipped: tools/jmng-interop/run.sh sets VORTEX_NG_INTEROP_ROLE=makers");
         return;
     };
     let rpc = harness.rpc();
     assert_eq!(rpc.network().unwrap(), Network::Regtest, "regtest only");
+    // The other side's taker reaches the makers' onions through this proxy, as through Tor.
+    harness.start_proxy().await;
 
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -757,7 +808,7 @@ async fn makers_with_joinmarket_ng_taker() {
     };
     for (i, w) in wallets.into_iter().enumerate() {
         let rpc = harness.rpc();
-        let mut client = meet(&harness, &url, true).await;
+        let mut client = meet(&harness, &url, Some(i)).await;
         handles.push(tokio::spawn(async move {
             let offer =
                 Offer::parse(offer_type, &format!("{i} 10000 100000000 {TXFEE} {CJFEE}")).unwrap();
@@ -766,7 +817,11 @@ async fn makers_with_joinmarket_ng_taker() {
             run_maker(&mut maker, &mut client, &rpc, "regtest", until).await
         }));
     }
-    // The makers are connecting: tell the harness where.
+    // The makers are connecting: tell the harness where, and where the proxy is.
+    if let Some(proxy) = &harness.proxy {
+        std::fs::write(harness.dir.join("socks.addr"), proxy.addr().to_string()).unwrap();
+        println!("test proxy at {}", proxy.addr());
+    }
     std::fs::write(harness.dir.join("relay.url"), &url).unwrap();
     println!("{}", harness.place(&url));
 
@@ -787,6 +842,14 @@ async fn makers_with_joinmarket_ng_taker() {
     };
     for handle in handles {
         handle.abort();
+    }
+    for (destination, here) in harness.onions_asked() {
+        let answer = if here {
+            "on this machine"
+        } else {
+            "refused by the proxy"
+        };
+        println!("direct connection asked for {destination}: {answer}");
     }
 
     let tx = rpc

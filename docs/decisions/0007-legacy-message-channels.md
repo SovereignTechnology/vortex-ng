@@ -57,9 +57,12 @@ only as trustworthy as the directory or server that forwarded the line.
    under its own SOCKS credentials, since the in-process Tor client is built without onion support. Whether
    arti's onion support can replace the daemon is investigated separately (issue #49). A taker connects
    directly to the makers it chose that serve an onion, each connection on a circuit of its own, and falls back
-   to directory relay for a maker it cannot reach or whose connection drops (issue #45). The commands' makers
-   still advertise `NOT-SERVING-ONION` and rely on directory relay; their own hidden service (the project's
-   first inbound listener) is a separate step (issue #46).
+   to directory relay for a maker it cannot reach or whose connection drops (issue #45). A maker can serve
+   an onion of its own, the project's first inbound listener (issue #46): published through Tor's control
+   port with `SAFECOOKIE` authentication, or one the operator's Tor already forwards to it. Takers of both
+   reference implementations reach such a maker directly on regtest. The commands' makers still advertise
+   `NOT-SERVING-ONION` and rely on directory relay until a peer on a direct connection can be made to prove
+   its nick (issue #52).
 5. **IRC's signature domain** comes from the server. vortex-ng takes it once per connection, checks its length
    and characters, compares it with the value configured for that server, and freezes it; a channel whose
    domain could be confused with another active channel's does not start. TLS certificates are checked for
