@@ -1,9 +1,9 @@
 //! Helpers for tests, this crate's and (with feature `test-util`) other crates'. Nothing here is needed to
 //! run vortex-ng.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
@@ -22,7 +22,9 @@ use crate::{Channel, ChannelError, Incoming, Next};
 /// came in under different credentials (which Tor would give circuits of their own).
 ///
 /// Any host name ending in `.test` is taken to be this machine: a relay named so can only be reached
-/// through the proxy, which shows that nothing connected to it directly.
+/// through the proxy, which shows that nothing connected to it directly. A `.onion` name is reached only
+/// when the test gave its address ([`AuthSocks::start_with_onions`]); any other is refused, as Tor refuses
+/// an onion it cannot find, and never looked up.
 #[derive(Debug)]
 pub struct AuthSocks {
     addr: SocketAddr,
@@ -33,15 +35,23 @@ pub struct AuthSocks {
 impl AuthSocks {
     /// Listen on `127.0.0.1:<ephemeral>`.
     pub async fn start() -> io::Result<AuthSocks> {
+        AuthSocks::start_with_onions(HashMap::new()).await
+    }
+
+    /// Listen on `127.0.0.1:<ephemeral>`, with `onions` saying where each onion name (`<name>.onion`, any
+    /// port) really is.
+    pub async fn start_with_onions(onions: HashMap<String, IpAddr>) -> io::Result<AuthSocks> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&seen);
+        let onions = Arc::new(onions);
         let task = tokio::spawn(async move {
             while let Ok((conn, _)) = listener.accept().await {
                 let record = Arc::clone(&record);
+                let onions = Arc::clone(&onions);
                 tokio::spawn(async move {
-                    let _ = serve(conn, record).await;
+                    let _ = serve(conn, record, &onions).await;
                 });
             }
         });
@@ -77,7 +87,11 @@ fn bad(why: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why)
 }
 
-async fn serve(mut conn: TcpStream, seen: Arc<Mutex<Vec<(String, String)>>>) -> io::Result<()> {
+async fn serve(
+    mut conn: TcpStream,
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+    onions: &HashMap<String, IpAddr>,
+) -> io::Result<()> {
     // Greeting: only username/password will do.
     let mut head = [0u8; 2];
     conn.read_exact(&mut head).await?;
@@ -132,12 +146,21 @@ async fn serve(mut conn: TcpStream, seen: Arc<Mutex<Vec<(String, String)>>>) -> 
             format!("{host}:{port}"),
         ));
     }
-    let target = if host.ends_with(".test") {
-        "127.0.0.1"
+    let connected = if host.ends_with(".test") {
+        TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await
+    } else if host.ends_with(".onion") {
+        match onions.get(&host) {
+            Some(ip) => TcpStream::connect((*ip, port)).await,
+            None => {
+                // Host unreachable.
+                conn.write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                return Err(bad("an onion nobody serves"));
+            }
+        }
     } else {
-        host.as_str()
+        TcpStream::connect((host.as_str(), port)).await
     };
-    let mut upstream = match TcpStream::connect((target, port)).await {
+    let mut upstream = match connected {
         Ok(upstream) => upstream,
         Err(e) => {
             conn.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await?;

@@ -22,7 +22,9 @@
 # Two rounds:
 #   A. two reference makers (YieldGeneratorBasic, sw0reloffer) and a vortex-ng taker, which does a sw0 round
 #      with them and checks it on the node (crates/vortex-ng-node/tests/jmng_interop.rs, role taker); then a
-#      vortex-ng maker announces a commitment, and both reference makers must refuse it;
+#      vortex-ng maker announces a commitment, and both reference makers must refuse it. With CHANNEL=onion
+#      the taker must reach both makers directly: the directory's log must show it relayed none of the
+#      taker's `!fill`, `!auth`, `!tx`;
 #   B. two vortex-ng makers and the reference's taker, which does a round with them and asks them to broadcast
 #      it (`!push`, tx_broadcast = not-self); vortex-ng then checks the transaction and its makers' wallets.
 # Fidelity bonds are not used yet (BONDS=0 on the vortex-ng side).
@@ -271,6 +273,18 @@ if [ "$rc_a" -ne 0 ]; then
   for n in 1 2; do show "$logs/maker$n.log" 60; done
 else
   echo "txid $(cat "$work/a/taker.txid") at height $(cli getblockcount)"
+  if [ "$CHANNEL" = onion ]; then
+    # The directory logs every line it is handed; the round's lines went over direct connections instead.
+    taker=$(sed -n 's/^taker nick \(J[0-9A-Za-z]*\)$/\1/p' "$logs/vortex-taker.log" | head -1)
+    to=$(grep -c -E "\"line\": \"$taker![0-9A-Za-z]+!(fill|auth|tx) " "$logs/directory.log" || true)
+    from=$(grep -c -E "\"line\": \"J[0-9A-Za-z]+!$taker!(pubkey|ioauth|sig) " "$logs/directory.log" || true)
+    echo "the directory relayed $to of the taker's !fill/!auth/!tx and $from of the makers' !pubkey/!ioauth/!sig"
+    if [ -n "$taker" ] && [ "$to" -eq 0 ]; then
+      echo "Direct connection: both reference makers reached directly"
+    else
+      echo "Direct connection: the taker's round lines went through the directory"; rc_a=28
+    fi
+  fi
 fi
 for p in "${maker_pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
 

@@ -402,6 +402,52 @@ async fn without_a_direct_way_lines_go_by_the_directory() {
     );
 }
 
+#[tokio::test]
+async fn when_a_direct_connection_drops_the_lines_go_by_the_directory() {
+    let directory = TestDirectory::start("regtest", None).await;
+    let maker = NickIdentity::generate();
+    let peer = TestPeer::start("regtest", maker.nick(), true).await;
+    let (taker, route) = taker_with_route(&directory, &maker, Some(peer.location())).await;
+    taker
+        .prepare(&[(maker.nick().to_string(), route.clone())])
+        .await;
+    taker
+        .send_private(&route, maker.nick(), "fill", "0 50000 abc")
+        .await
+        .unwrap();
+    let fill = format!("{}!{}!fill ", taker.nick(), maker.nick());
+    assert!(
+        eventually(|| peer
+            .received()
+            .iter()
+            .any(|(kind, line)| *kind == PRIVMSG && line.starts_with(&fill)))
+        .await
+    );
+
+    // The maker hangs up in the middle of the round: the rest of it goes by the directory.
+    peer.hang_up();
+    assert!(eventually(|| taker.shared.link(maker.nick()).is_none()).await);
+    taker
+        .send_private(&route, maker.nick(), "auth", "abc")
+        .await
+        .unwrap();
+    assert!(
+        eventually(|| directory
+            .received()
+            .iter()
+            .any(|(from, kind, line)| from == taker.nick()
+                && *kind == PRIVMSG
+                && line.contains("!auth ")))
+        .await
+    );
+    assert!(
+        !directory
+            .received()
+            .iter()
+            .any(|(_, _, line)| line.contains("!fill "))
+    );
+}
+
 /// A maker that serves on loopback, connected to `directory`.
 async fn serving_maker(directory: &TestDirectory, identity: NickIdentity) -> OnionChannel {
     let mut cfg = config(&[directory], "regtest");

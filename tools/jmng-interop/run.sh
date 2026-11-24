@@ -25,6 +25,11 @@
 #   B. two vortex-ng makers and joinmarket-ng's taker (jmng_taker.py, through joinmarket-ng's own API),
 #      which does a sw0 round with them and asks them to broadcast it (`!push`, never itself); vortex-ng
 #      then checks the transaction and its makers' wallets.
+# With CHANNEL=onion, round A's makers also serve, as makers do behind Tor: each says an onion name of its own
+# and listens on loopback. The vortex-ng taker reaches the directory through a test SOCKS proxy standing in for
+# Tor, which knows maker 1's onion is on this machine and refuses maker 2's. So the taker must reach maker 1
+# directly and fall back to the directory for maker 2. The directory's log (its privacy-sensitive lines on)
+# must show it relayed none of the taker's `!fill`, `!auth`, `!tx` to maker 1, and relayed maker 2's.
 set -euo pipefail
 
 VORTEX_NG_REPO=https://github.com/SovereignTechnology/vortex-ng.git
@@ -53,6 +58,8 @@ MAKER_MNEMONICS=(
   "minute faint grape plate stock mercy tent world space opera apple rocket"
 )
 TAKER_MNEMONIC="burden notable love elephant orbit couch message galaxy elevator exile drop toilet"
+# With CHANNEL=onion: where round A's makers listen. Their onion names are made up below.
+MAKER_SERVE_PORTS=(15231 15232)
 
 jmng=$(pwd)
 here=$(cd "$(dirname "$0")" && pwd)
@@ -126,20 +133,31 @@ done
 cli generatetoaddress 6 "$funder" >/dev/null
 echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcount); joinmarket-ng wallets funded"
 
-# With CHANNEL=onion: joinmarket-ng's directory server, for both rounds.
+# With CHANNEL=onion: joinmarket-ng's directory server, for both rounds. Its privacy-sensitive lines name
+# who it relays what to, which is what shows a direct connection carried a line instead.
 if [ "$CHANNEL" = onion ]; then
   HOME="$work/directory" NETWORK_CONFIG__NETWORK=regtest DIRECTORY_SERVER__HOST=127.0.0.1 \
     DIRECTORY_SERVER__PORT=$DIRECTORY_PORT DIRECTORY_SERVER__NICK_AUTH_DIRECTORY_ID=$DIRECTORY_ID \
-    LOGGING__LEVEL=DEBUG jm-directory-server >"$logs/directory.log" 2>&1 &
+    LOGGING__LEVEL=DEBUG LOGGING__SENSITIVE=true jm-directory-server >"$logs/directory.log" 2>&1 &
   pids+=($!)
   for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null && break; sleep 1; done
   (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null || { show "$logs/directory.log" 30; exit 26; }
   echo "joinmarket-ng's directory server on 127.0.0.1:$DIRECTORY_PORT ($DIRECTORY_ID)"
 fi
-# What tells vortex-ng's test to meet on the directory.
+# A v3 onion name, well formed (key, checksum, version) though no key behind it is anyone's.
+new_onion() {
+  python3 -I -c 'import base64, hashlib, os
+key = os.urandom(32)
+check = hashlib.sha3_256(b".onion checksum" + key + b"\x03").digest()[:2]
+print(base64.b32encode(key + check + b"\x03").decode().lower() + ".onion")'
+}
+# What tells vortex-ng's test to meet on the directory, and which onion is on this machine.
 onion_env=()
+maker_onions=()
 if [ "$CHANNEL" = onion ]; then
-  onion_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" "VORTEX_NG_INTEROP_DIRECTORY_ID=$DIRECTORY_ID")
+  maker_onions=("$(new_onion)" "$(new_onion)")
+  onion_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" "VORTEX_NG_INTEROP_DIRECTORY_ID=$DIRECTORY_ID"
+    "VORTEX_NG_INTEROP_ONIONS=${maker_onions[0]}")
 fi
 # Where joinmarket-ng's side meets ours: the relay vortex-ng's test runs, or the directory.
 meeting() { if [ "$CHANNEL" = onion ]; then echo "127.0.0.1:$DIRECTORY_PORT"; else echo "nostr:$1"; fi; }
@@ -178,7 +196,12 @@ if [ "$rc_a" -eq 0 ]; then
       bond_env=("MAKER__FIDELITY_BOND_LOCKTIMES=$BOND_LOCKTIME" FIDELITY_BOND_INDEX=0)
     fi
     if [ "$PIT" = tr0 ]; then bond_env+=(WALLET__ADDRESS_TYPE=p2tr); fi  # the pit switch; offers follow it
-    env "${bond_env[@]}" \
+    serve_env=()
+    if [ "$CHANNEL" = onion ]; then  # a static onion: no Tor control port, the listener on loopback
+      serve_env=("MAKER__ONION_HOST=${maker_onions[$((i - 1))]}" MAKER__ONION_SERVING_HOST=127.0.0.1
+        "MAKER__ONION_SERVING_PORT=${MAKER_SERVE_PORTS[$((i - 1))]}")
+    fi
+    env "${bond_env[@]}" "${serve_env[@]}" \
     HOME="$home" JOINMARKET_DATA_DIR="$home/.joinmarket-ng" MNEMONIC="$mnemonic" \
       NETWORK_CONFIG__NETWORK=regtest NETWORK_CONFIG__BITCOIN_NETWORK=regtest \
       NETWORK_CONFIG__ALLOW_CLEARNET_CONNECTIONS=true DIRECTORY_SERVERS="$(meeting "$relay")" \
@@ -217,6 +240,30 @@ else
     echo "maker$n !hp2: $(grep -c 'CoinJoin message sent: command=!hp2' "$logs/maker$n.log") sent," \
       "$(grep -c 'Could not connect to any directory for ephemeral hp2 broadcast' "$logs/maker$n.log") could not connect"
   done
+  if [ "$CHANNEL" = onion ]; then
+    # Which of the taker's round lines the directory relayed to each maker: none to maker 1, reached directly.
+    grep -E '^direct connection asked for' "$logs/vortex-taker.log" | cut -c1-200 || true
+    taker=$(sed -n 's/^taker nick \(J[0-9A-Za-z]*\)$/\1/p' "$logs/vortex-taker.log" | head -1)
+    relayed=()
+    for n in 1 2; do
+      nick=$(grep -o "Handshake accepted: J[0-9A-Za-z]* from [a-z]* at ${maker_onions[$((n - 1))]}:" "$logs/directory.log" \
+        | tail -1 | cut -d' ' -f3 || true)
+      if [ -z "$taker" ] || [ -z "$nick" ]; then
+        echo "maker$n: its nick or the taker's is not in the logs"; rc_a=27; continue
+      fi
+      relayed[n]=$(grep -c -E "PRIVMSG routing: $taker -> $nick \(rest: (fill|auth|tx) " "$logs/directory.log" || true)
+      echo "maker$n $nick at ${maker_onions[$((n - 1))]}: the directory relayed ${relayed[n]} of the taker's" \
+        "!fill/!auth/!tx to it, and $(grep -c -E "PRIVMSG routing: $nick -> $taker " "$logs/directory.log" || true)" \
+        "of its lines to the taker"
+    done
+    if [ "$rc_a" -eq 0 ]; then
+      if [ "${relayed[1]}" -eq 0 ] && [ "${relayed[2]}" -ge 3 ]; then
+        echo "Direct connection: maker 1 reached directly, maker 2 through the directory after its onion was refused"
+      else
+        echo "Direct connection: expected 0 relayed lines for maker 1 and at least 3 for maker 2"; rc_a=28
+      fi
+    fi
+  fi
 fi
 for p in "${maker_pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
 

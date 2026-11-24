@@ -55,9 +55,11 @@ only as trustworthy as the directory or server that forwarded the line.
    end the round. On channels without sender authentication, a received `!error` is logged, not acted on.
 4. **Tor.** The legacy channels reach `.onion` hosts through a Tor daemon's SOCKS port (`--proxy`), each nick
    under its own SOCKS credentials, since the in-process Tor client is built without onion support. Whether
-   arti's onion support can replace the daemon is investigated separately (issue #49). The first version
-   advertises `NOT-SERVING-ONION` and relies on directory relay; the taker's direct connections to maker onions
-   and the maker's own hidden service (the project's first inbound listener) follow as separate steps.
+   arti's onion support can replace the daemon is investigated separately (issue #49). A taker connects
+   directly to the makers it chose that serve an onion, each connection on a circuit of its own, and falls back
+   to directory relay for a maker it cannot reach or whose connection drops (issue #45). The commands' makers
+   still advertise `NOT-SERVING-ONION` and rely on directory relay; their own hidden service (the project's
+   first inbound listener) is a separate step (issue #46).
 5. **IRC's signature domain** comes from the server. vortex-ng takes it once per connection, checks its length
    and characters, compares it with the value configured for that server, and freezes it; a channel whose
    domain could be confused with another active channel's does not start. TLS certificates are checked for
@@ -83,7 +85,7 @@ What each channel shows, and to whom:
 |---|---|---|
 | Nostr (ADR 0002) | the recipient's key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
 | onion directories, relayed (`NOT-SERVING-ONION`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are in clear text | public offers, `!orderbook`, `!hp2`; a nick's presence |
-| onion directories, direct connections | that two nicks are in contact, not what they say | the same |
+| onion directories, a taker connected directly | that two nicks are in contact (the maker's offer to the taker), none of the taker's round lines; a maker that answers through the directories anyway, as some do, also shows them its answers, `!pubkey` in clear text | the same |
 | IRC | everything a directory sees, plus the server's own logs | the same as on onion |
 
 - A maker's single nick, and the nick key's public key that every private line carries, link its presence on

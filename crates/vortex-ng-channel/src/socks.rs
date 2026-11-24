@@ -586,6 +586,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_test_proxy_reaches_only_the_onions_it_was_given() {
+        use crate::testing::AuthSocks;
+
+        let echo = echo_server().await;
+        let (here, elsewhere) = (
+            format!("{}.onion", "a".repeat(56)),
+            format!("{}.onion", "b".repeat(56)),
+        );
+        let onions = [(here.clone(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))].into();
+        let proxy = AuthSocks::start_with_onions(onions).await.unwrap();
+        let connector = UpstreamSocks::isolated(proxy.addr());
+        let mut stream = connector.connect(here.clone(), echo.port()).await.unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut back = [0u8; 4];
+        stream.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"ping");
+        // Any other onion is unreachable, as through Tor, and never looked up.
+        let refused = connector
+            .connect(elsewhere.clone(), echo.port())
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        let asked: Vec<String> = proxy.seen().into_iter().map(|(_, to)| to).collect();
+        assert_eq!(
+            asked,
+            vec![
+                format!("{here}:{}", echo.port()),
+                format!("{elsewhere}:{}", echo.port())
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_proxy_that_cannot_isolate_is_refused() {
         // Our own shim speaks SOCKS5 without authentication: as an upstream it could not keep nicks apart.
         let echo = echo_server().await;

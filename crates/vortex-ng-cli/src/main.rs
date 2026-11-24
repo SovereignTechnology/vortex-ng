@@ -58,7 +58,8 @@ Who sees what:
   a directory node   offers and who is present. For each private line it relays: sender, recipient, size and
                      timing, with `!fill` (order id, amount, commitment) and `!pubkey` in plain text. The
                      encrypted steps stay encrypted. When a taker reaches a maker's onion directly, it sees
-                     only that the two are in contact. vortex-ng makers serve no onion yet.
+                     none of the taker's lines, only the maker's, if the maker answers through it anyway.
+                     vortex-ng makers serve no onion yet.
   an IRC server      the same as a relaying directory node, in its own logs.
 A maker's one nick and its key link its presence on all its channels. More: the README, 'Command line'.
 

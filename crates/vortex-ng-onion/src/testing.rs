@@ -8,7 +8,8 @@
 //! send any line to a peer, or give it a peer list to answer `GETPEERLIST` with.
 //!
 //! [`TestPeer`] is a peer that serves on loopback, as a maker serving an onion would: it takes one direct
-//! connection, records the handshake and the lines it gets, and sends lines back when told.
+//! connection, records the handshake and the lines it gets, sends lines back when told, and hangs up when
+//! told.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -18,7 +19,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use vortex_ng_core::bitcoin::hashes::{Hash, sha256};
 use vortex_ng_core::bitcoin::hex::{DisplayHex, FromHex};
@@ -343,11 +344,13 @@ pub struct TestPeer {
     addr: SocketAddr,
     state: Arc<Mutex<PeerState>>,
     task: JoinHandle<()>,
+    hang_up: watch::Sender<bool>,
 }
 
 impl Drop for TestPeer {
     fn drop(&mut self) {
         self.task.abort();
+        self.hang_up();
     }
 }
 
@@ -364,16 +367,34 @@ impl TestPeer {
         let state = Arc::new(Mutex::new(PeerState::default()));
         let task_state = Arc::clone(&state);
         let (network, nick) = (network.to_string(), nick.to_string());
+        let (hang_up, hung_up) = watch::channel(false);
         let task = tokio::spawn(async move {
             while let Ok((conn, _)) = listener.accept().await {
-                let (state, network, nick) =
-                    (Arc::clone(&task_state), network.clone(), nick.clone());
+                let (state, network, nick, hung_up) = (
+                    Arc::clone(&task_state),
+                    network.clone(),
+                    nick.clone(),
+                    hung_up.clone(),
+                );
                 tokio::spawn(async move {
-                    let _ = serve_peer(conn, state, &network, &nick, answer).await;
+                    let _ = serve_peer(conn, state, &network, &nick, answer, hung_up).await;
                 });
             }
         });
-        TestPeer { addr, state, task }
+        TestPeer {
+            addr,
+            state,
+            task,
+            hang_up,
+        }
+    }
+
+    /// Close every connection it has, and any it takes from now on.
+    pub fn hang_up(&self) {
+        self.hang_up.send_replace(true);
+        if let Ok(mut s) = self.state.lock() {
+            s.writer = None;
+        }
     }
 
     /// Its location, as a directory's peer list names it.
@@ -416,7 +437,11 @@ async fn serve_peer(
     network: &str,
     nick: &str,
     answer: bool,
+    mut hung_up: watch::Receiver<bool>,
 ) -> Result<(), String> {
+    if *hung_up.borrow() {
+        return Ok(());
+    }
     let (read, mut write) = conn.into_split();
     let mut reader = BufReader::new(read);
     let (kind, handshake) = tokio::time::timeout(Duration::from_secs(10), read_line(&mut reader))
@@ -450,9 +475,15 @@ async fn serve_peer(
             }
         }
     });
-    while let Ok((kind, line)) = read_line(&mut reader).await {
-        if let Ok(mut s) = state.lock() {
-            s.received.push((kind, line));
+    loop {
+        tokio::select! {
+            read = read_line(&mut reader) => {
+                let Ok((kind, line)) = read else { break };
+                if let Ok(mut s) = state.lock() {
+                    s.received.push((kind, line));
+                }
+            }
+            _ = hung_up.wait_for(|hung| *hung) => break,
         }
     }
     writer.abort();
