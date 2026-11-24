@@ -69,6 +69,11 @@ only as trustworthy as the directory or server that forwarded the line.
 7. **Live networks.** All of this is built and tested on regtest in throwaway VMs, against
    joinmarket-clientserver v0.9.12, JoinMarket-NG and a local IRC server. The public directory nodes, the public
    IRC servers, signet and mainnet are used only on the owner's explicit go. Mainnet wallets stay refused.
+8. **Choosing channels.** `orderbook`, `maker` and `coinjoin` take `--relays`, `--directories` and `--irc` side
+   by side and need at least one; none is on by default. `--directories` and `--irc` are refused on every
+   network but regtest in this pre-release. Outside regtest they also need `--proxy`, a rule the commands
+   already check, so it stands when the regtest limit is lifted. `orderbook` shows the channel each offer came
+   from. The command help and the README state the table below.
 
 ## Consequences
 

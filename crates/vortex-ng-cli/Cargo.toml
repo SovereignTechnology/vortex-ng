@@ -33,3 +33,5 @@ path = "src/main.rs"
 [dev-dependencies]
 nostr-sdk = { workspace = true, features = ["local-relay"] }
 vortex-ng-nostr = { workspace = true, features = ["test-util"] }
+vortex-ng-onion = { workspace = true, features = ["test-util"] }
+vortex-ng-irc = { workspace = true, features = ["test-util"] }

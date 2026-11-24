@@ -558,7 +558,7 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
         "{:?}",
         proxy.seen()
     );
-    assert!(!show(&logs).contains("connecting to the relays directly"));
+    assert!(!show(&logs).contains("connecting directly"));
     println!(
         "{} nicks came through the proxy, each under its own credentials",
         proxy.usernames().len()

@@ -138,15 +138,19 @@ fn meeting(args: &Args) -> Result<Meeting, Failure> {
 }
 
 impl Meeting {
-    /// The onion directories are for regtest only in this pre-release (ADR 0007): nothing here has been
-    /// tried on a live network.
-    fn allowed_on(&self, network: Network) -> Result<(), Failure> {
-        if (!self.directories.is_empty() || !self.irc.is_empty()) && network != Network::Regtest {
-            return Err(failed(
-                "JoinMarket's onion directories and IRC are enabled on regtest only in this pre-release",
-            ));
+    /// JoinMarket's onion directories and IRC are for regtest only in this pre-release (ADR 0007): nothing
+    /// here has been tried on a live network. Outside regtest they also need a proxy; that is checked first,
+    /// so the rule is already in force on the day the regtest limit goes.
+    fn allowed_on(&self, network: Network, proxied: bool) -> Result<(), Failure> {
+        if (self.directories.is_empty() && self.irc.is_empty()) || network == Network::Regtest {
+            return Ok(());
         }
-        Ok(())
+        Err(failed(if proxied {
+            "JoinMarket's onion directories and IRC are enabled on regtest only in this pre-release"
+        } else {
+            "outside regtest JoinMarket's onion directories and IRC need `--proxy <address>` (a Tor \
+             daemon's SOCKS port), and in this pre-release they are enabled on regtest only"
+        }))
     }
 }
 
@@ -186,7 +190,7 @@ fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
         .map_err(failed)
 }
 
-/// How the command's nicks reach the relays: through `--proxy` when given, each nick under SOCKS
+/// How the command's nicks reach their channels: through `--proxy` when given, each nick under SOCKS
 /// credentials of its own; directly otherwise, which is said aloud.
 fn outbound(args: &Args) -> Result<Outbound, Failure> {
     match args.get("proxy") {
@@ -198,8 +202,8 @@ fn outbound(args: &Args) -> Result<Outbound, Failure> {
         }
         None => {
             eprintln!(
-                "vortex-ng: connecting to the relays directly: they see this machine's address. Give \
-                 `--proxy <address>` (a Tor daemon's SOCKS port) to hide it."
+                "vortex-ng: connecting directly: every relay, directory node and IRC server named sees \
+                 this machine's address. Give `--proxy <address>` (a Tor daemon's SOCKS port) to hide it."
             );
             Ok(Outbound::Direct)
         }
@@ -222,8 +226,8 @@ enum Role {
     Taker,
 }
 
-/// The command's channels, as one set: Nostr relays and onion directory nodes, as given.
-/// The channels a command uses, and a label for each, in the set's order (what `channel_of` indexes).
+/// The channels a command uses, as one set, and a label for each, in the set's order (what `channel_of`
+/// indexes).
 async fn channels(
     network: &str,
     meeting: &Meeting,
@@ -301,7 +305,7 @@ async fn channels(
     Ok((ChannelSet::new(set).map_err(failed)?, labels))
 }
 
-/// `vortex-ng orderbook`: ask the makers on the relays what they offer.
+/// `vortex-ng orderbook`: ask the makers on the chosen channels what they offer.
 pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let mut valued = vec![
         "network",
@@ -316,7 +320,7 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let args = parse(rest, &valued, &[])?;
     let network = wallet::network(&args)?;
     let meeting = meeting(&args)?;
-    meeting.allowed_on(network)?;
+    meeting.allowed_on(network, args.get("proxy").is_some())?;
     let only = match args.get("pit") {
         Some(_) => Some(wallet::pit(&args)?.0),
         None => None,
@@ -491,7 +495,7 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
 
     let file = wallet::open(&args)?;
     let network = file.network();
-    meeting.allowed_on(network)?;
+    meeting.allowed_on(network, args.get("proxy").is_some())?;
     let chain = node(&args, network)?;
     let pit_wallet = PitWallet::new(&file.seed().map_err(failed)?, pit).map_err(failed)?;
     let mut maker = Maker::new(MakerConfig::new(Vec::new()), pit_wallet).map_err(failed)?;
@@ -657,7 +661,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let wallet_path = Path::new(args.required("wallet").map_err(Failure::Usage)?);
     let file = wallet::open(&args)?;
     let network = file.network();
-    meeting.allowed_on(network)?;
+    meeting.allowed_on(network, args.get("proxy").is_some())?;
     let chain = node(&args, network)?;
     let mut pit_wallet = PitWallet::new(&file.seed().map_err(failed)?, pit).map_err(failed)?;
     let height = pit_wallet.sync(&chain, file.birthday()).map_err(failed)?;

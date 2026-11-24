@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the regtest tests (crates/vortex-ng-node/tests/regtest.rs for JoinMarket rounds, regtest_joinstr.rs
 # for joinstr pools, regtest_channels.rs for one maker on three channels at once,
-# crates/vortex-ng-cli/tests/regtest_maker.rs for the command line's maker) against a pinned Bitcoin Core.
+# crates/vortex-ng-cli/tests/regtest_maker.rs for the command line's maker, and its regtest_channels.rs for
+# the commands on each channel) against a pinned Bitcoin Core.
 #
 #   kata-run --net --cwd ~/Projects/vortex-ng -- bash tools/itest/run.sh
 #
@@ -46,6 +47,9 @@ VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cook
 # The command line's maker as a service: real `vortex-ng maker` processes through two rounds.
 VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
   cargo test --locked -p vortex-ng-cli --test regtest_maker -- --nocapture
+# The commands themselves on each channel, chosen with --relays, --directories and --irc, through a proxy.
+VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
+  cargo test --locked -p vortex-ng-cli --test regtest_channels -- --nocapture
 # One maker on a Nostr relay, an onion directory and an IRC server at once, with a taker on each.
 VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
   cargo test --locked -p vortex-ng-node --test regtest_channels -- --nocapture

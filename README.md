@@ -9,9 +9,9 @@ around JoinMarket's maker/taker market instead of a central coordinator:
 - **JoinMarket semantics, Nostr transport.** The protocol layer (commands, NaCl sessions, PoDLE, fidelity
   bonds, per-pit transaction rules, maker and taker checks) follows JMP-0001 and the JMP extensions exactly.
   The message channel is Nostr relays. No coordinator.
-- **Beside JoinMarket's own channels (in progress, ADR 0007).** The onion directory nodes and IRC that
-  joinmarket-clientserver and JoinMarket-NG use, at the same time as Nostr, so vortex-ng shares their market;
-  then a bridge for clients without Tor. Tracked in issue #33.
+- **Beside JoinMarket's own channels (regtest only so far, ADR 0007).** The onion directory nodes that
+  joinmarket-clientserver and JoinMarket-NG use, and joinmarket-clientserver's IRC, at the same time as Nostr,
+  so vortex-ng can share their market; then a bridge for clients without Tor. Tracked in issue #33.
 - **Three pits.** `sw0` (P2WPKH, JMP-0001), `tr0` (taproot, JMP-0010), and `wsh0` (P2WSH 2-of-2, shaped
   exactly like a Lightning funding output; draft in this repo).
 - **Lightning channel opens inside the coinjoin.** A taker's equal-amount output can be the funding output of
@@ -38,8 +38,10 @@ unaudited: mainnet wallets are refused. Do not use it with real funds.**
 | crate | role |
 |---|---|
 | `vortex-ng-core` | Protocol logic with no I/O: codec, nicks, offers, PoDLE, bonds, per-pit rules |
-| `vortex-ng-channel` | The message-channel trait the drivers run over (Nostr today; onion directories and IRC next) |
+| `vortex-ng-channel` | The message-channel trait the drivers run over (Nostr, onion directories, IRC), and several at once |
 | `vortex-ng-nostr` | The Nostr message channel |
+| `vortex-ng-onion` | JoinMarket's onion directory channel |
+| `vortex-ng-irc` | JoinMarket's IRC channel |
 | `vortex-ng-wallet` | JoinMarket-compatible wallet (mixdepths per pit, fidelity bonds) |
 | `vortex-ng-chain` | Chain backend over Core-compatible JSON-RPC (Bitcoin Core or rbitcoin) |
 | `vortex-ng-ln` | Lightning channel funding (LND, Core Lightning, LDK) |
@@ -74,24 +76,31 @@ vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
 vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
 ```
 
-`where` is any of `--relays <url[,url...]>` (Nostr relays), `--directories <host:port[,...]>` (JoinMarket's
-onion directory nodes) and `--irc <host:port[,...]>` (JoinMarket's IRC pit, as joinmarket-clientserver uses it);
-the last two are regtest only in this pre-release (ADR 0007). IRC uses TLS with certificate checks unless the
-host is an onion (Tor encrypts it) or loopback; `irc://host:port` asks for plain text and works on regtest only. On several channels at once a maker uses one nick on
-all of them and a taker a different nick on each; a peer stays on the channel it first spoke on. An IRC server
-whose signature domain (its `NETWORK` name) could be mistaken for another channel's is refused.
+`where` is at least one of these, and none is on by default:
+
+- `--relays <url[,url...]>`: Nostr relays.
+- `--directories <host:port[,...]>`: JoinMarket's onion directory nodes.
+- `--irc <host:port[,...]>`: JoinMarket's IRC pit, as joinmarket-clientserver uses it. IRC uses TLS with
+  certificate checks unless the host is an onion (Tor encrypts it) or loopback. `irc://host:port` asks for plain
+  text and works on regtest only.
+
+`--directories` and `--irc` work on regtest only in this pre-release and are refused on any other network
+(ADR 0007). Outside regtest they also need `--proxy`, a Tor daemon's SOCKS port. On several channels at once a
+maker uses one nick on all of them and a taker a different nick on each, and a round stays on the channel its
+`!fill` came on. An IRC server whose signature domain (its `NETWORK` name) could be mistaken for another
+channel's is refused.
 
 What each channel shows, and to whom (ADR 0007 has the reasons):
 
 | channel | its operator sees | others on it see |
 |---|---|---|
 | Nostr relays | the recipient key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
-| onion directory nodes (vortex-ng never serves an onion yet, so they relay its private messages) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
-| an IRC server | everything a directory node sees, in its own logs | the same as on the directories |
+| onion directory nodes, relaying (every vortex-ng maker, as none serves an onion yet) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
+| onion directory nodes, when a taker reaches a maker's onion directly | that the two nicks are in contact, not what they say | the same |
+| an IRC server | everything a relaying directory node sees, in its own logs | the same as on the directories |
 
 A maker's single nick, and the nick key its private lines carry, link its presence on all its channels, as in
-JoinMarket. A taker's nicks differ per channel. Outside regtest the onion directories and IRC will need a Tor
-daemon's SOCKS port (`--proxy`).
+JoinMarket. A taker's nicks differ per channel.
 
 `node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
 `--rpc-password-file <file>`): a Bitcoin Core compatible node on the wallet's network.
@@ -121,11 +130,11 @@ daemon's SOCKS port (`--proxy`).
 - `orderbook` lists what the makers answer, with the channel each answered on, and verifies their fidelity
   bonds when given a node.
 - `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
-  username and password, such as a Tor daemon's SOCKS port (`127.0.0.1:9050`). Every nick then reaches the
-  relays under credentials of its own, so Tor gives it circuits of its own: a maker and the throwaway nick it
-  sends `!hp2` from share nothing. Relay names are resolved by the proxy, never on this machine. A proxy that
-  takes no credentials could not keep nicks apart and is refused. **Without `--proxy` the relays see this
-  machine's address**, and the command says so when it starts. In-process Tor (arti, feature `tor` of
+  username and password, such as a Tor daemon's SOCKS port (`127.0.0.1:9050`). Every nick then reaches its
+  channels under credentials of its own, so Tor gives it circuits of its own: a maker and the throwaway nick it
+  sends `!hp2` from share nothing. Host names are resolved by the proxy, never on this machine. A proxy that
+  takes no credentials could not keep nicks apart and is refused. **Without `--proxy` every relay, directory
+  node and IRC server named sees this machine's address**, and the command says so when it starts. In-process Tor (arti, feature `tor` of
   `vortex-ng-nostr`) is not wired into the commands yet.
 
 ## Building
