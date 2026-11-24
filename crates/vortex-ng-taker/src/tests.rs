@@ -118,9 +118,16 @@ fn is_refusal(out: &Outgoing) -> bool {
     matches!(out, Outgoing::Private { command, .. } if command == "error")
 }
 
+/// Whether a reply to a repeated `!fill` from `taker` is the `!pubkey` the maker already gave it.
+fn is_same_pubkey(out: &Outgoing, taker: &str, earlier: Option<&String>) -> bool {
+    matches!(out, Outgoing::Private { to, command, body }
+        if command == "pubkey" && to == taker && Some(body) == earlier)
+}
+
 /// A round between the taker and two makers. With `noisy`, the channel misbehaves as a directory or IRC
 /// server may: every line arrives twice, every line seen so far is delivered again after each step, and every
-/// line the taker sent also reaches the other maker. None of that may change the round.
+/// line the taker sent also reaches the other maker. None of that may change the round. A maker may answer a
+/// repeated `!fill` with the `!pubkey` it already sent (the taker may have moved to another connection).
 fn coinjoin_with(pit: Pit, noisy: bool) -> (Transaction, PitWallet) {
     coinjoin_after(pit, noisy, 0)
 }
@@ -198,6 +205,8 @@ fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkeys: usize) -> (Transaction, 
     }
     let mut progress = Progress::Waiting;
     let mut seen: Vec<(String, String, String, String)> = Vec::new();
+    // Each maker's `!pubkey` of this round, as it first sent it.
+    let mut pubkeys: BTreeMap<String, String> = BTreeMap::new();
     while let Some((from, message)) = queue.pop_front() {
         let Outgoing::Private { to, command, body } = message else {
             continue;
@@ -205,6 +214,11 @@ fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkeys: usize) -> (Transaction, 
         let cmd = to_command(&command, &body);
         if let Some(maker) = makers.get_mut(&to) {
             for out in maker.handle(&from, cmd, &chain, NOW) {
+                if let Outgoing::Private { command, body, .. } = &out
+                    && command == "pubkey"
+                {
+                    pubkeys.entry(to.clone()).or_insert_with(|| body.clone());
+                }
                 queue.push_back((to.clone(), out));
             }
         } else {
@@ -226,10 +240,13 @@ fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkeys: usize) -> (Transaction, 
                 let cmd = to_command(command, body);
                 if let Some(maker) = makers.get_mut(&target) {
                     // Nothing but a refusal of a fill that was never this maker's; the refusal goes nowhere
-                    // the taker would act on (a driver drops a lone `!error` on such a channel).
+                    // the taker would act on (a driver drops a lone `!error` on such a channel). Its own fill,
+                    // repeated, gets the same `!pubkey` again and nothing new.
                     let outs = maker.handle(from, cmd, &chain, NOW);
+                    let repeat = command == "fill" && *to == target;
                     assert!(
-                        outs.iter().all(is_refusal),
+                        outs.iter().all(|out| is_refusal(out)
+                            || (repeat && is_same_pubkey(out, from, pubkeys.get(&target)))),
                         "{pit:?}: {target} answered a stray !{command}: {outs:?}"
                     );
                 } else {
