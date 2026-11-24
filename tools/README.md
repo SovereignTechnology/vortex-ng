@@ -78,3 +78,17 @@
   `tr0`, P2WPKH in `sw0`): `tr0` on the PR #643 checkout and `sw0` on joinmarket-ng main's, bonds on, pass in
   both directions. Still not covered: `wsh0` (joinmarket-ng has no such pit), Tor, more than one relay, channel
   rings.
+- `mixed-interop/run.sh`: one JoinMarket round with makers of three implementations (issue #51):
+  joinmarket-clientserver (v0.9.12), JoinMarket-NG (0.43.0) and vortex-ng, one maker each, on regtest. They
+  meet on joinmarket-clientserver's directory node in its testing mode (plain TCP on loopback, no Tor), where
+  everyone says `testnet` in the handshake; each maker serves on loopback. Each implementation's taker then does
+  a round with all three makers, and vortex-ng's taker also checks that a commitment one of its makers announces
+  is refused by every maker. Each transaction must confirm with four equal outputs, which with only these three
+  makers on the directory means one of each, and vortex-ng's maker checks its own wallet after every round. Run
+  from a vortex-ng checkout: `kata-run --net --cwd ~/Projects/vortex-ng -- bash tools/mixed-interop/run.sh`.
+  Not covered: JoinMarket-NG's directory server (it refuses the loopback locations joinmarket-clientserver's
+  makers use in testing mode), nick authentication (JMP-0005), fidelity bonds, Tor, IRC.
+  **Run 2026-11-24** (Kata, agentrun; the commit that adds this harness, Bitcoin Core v32.1.0): all three rounds
+  confirmed on the first attempt, each with 4 inputs and 4 outputs of 1,000,000 sat. In the third,
+  joinmarket-clientserver's maker, JoinMarket-NG's maker and a vortex-ng maker all refused the announced
+  commitment and still accepted a fresh one.

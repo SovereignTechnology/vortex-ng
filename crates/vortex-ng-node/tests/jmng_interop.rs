@@ -30,6 +30,10 @@
 //! the relay until the harness, having run joinmarket-ng's taker against them and mined a block, writes the
 //! round's txid to `<dir>/jmng.txid`. The transaction must be on the node with both makers in it, and each
 //! maker's wallet, restored from its seed, must hold what it had plus its fee, less its mining-fee share.
+//!
+//! `VORTEX_NG_INTEROP_MAKERS` is how many makers this side runs (two by default) and, for the taker, how many
+//! it chooses. `VORTEX_NG_INTEROP_ROUND_MAKERS` is how many makers the round has in all, when other
+//! implementations' makers are in it too (`tools/mixed-interop/run.sh`).
 
 // A test harness: a failed step should panic with its error.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -78,6 +82,8 @@ struct Harness {
     url: String,
     cookie: PathBuf,
     makers: usize,
+    /// `VORTEX_NG_INTEROP_ROUND_MAKERS`: the makers in the round, ours and others' (`makers` by default).
+    round_makers: usize,
     /// `VORTEX_NG_INTEROP_BONDS=1`: every maker holds a fidelity bond, and takers accept a maker that
     /// charges a fee only if its bond verifies.
     bonds: bool,
@@ -152,14 +158,19 @@ impl Harness {
         if std::env::var("VORTEX_NG_INTEROP_ROLE").ok()? != role {
             return None;
         }
+        let makers = std::env::var("VORTEX_NG_INTEROP_MAKERS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(2);
         Some(Harness {
             dir: std::env::var("VORTEX_NG_INTEROP_DIR").ok()?.into(),
             url: std::env::var("VORTEX_NG_REGTEST_RPC").ok()?,
             cookie: std::env::var("VORTEX_NG_REGTEST_COOKIE").ok()?.into(),
-            makers: std::env::var("VORTEX_NG_INTEROP_MAKERS")
+            makers,
+            round_makers: std::env::var("VORTEX_NG_INTEROP_ROUND_MAKERS")
                 .ok()
                 .and_then(|n| n.parse().ok())
-                .unwrap_or(2),
+                .unwrap_or(makers),
             bonds: std::env::var("VORTEX_NG_INTEROP_BONDS").is_ok_and(|v| v == "1"),
             pit: match std::env::var("VORTEX_NG_INTEROP_PIT").as_deref() {
                 Ok("sw0") | Err(_) => Pit::Sw0,
@@ -857,7 +868,7 @@ async fn makers_with_joinmarket_ng_taker() {
         .unwrap()
         .expect("the round's transaction on the node");
     assert!(
-        tx.input.len() > harness.makers,
+        tx.input.len() > harness.round_makers,
         "every maker and the taker contribute"
     );
     assert_eq!(
@@ -865,7 +876,7 @@ async fn makers_with_joinmarket_ng_taker() {
             .iter()
             .filter(|o| o.value.to_sat() == AMOUNT)
             .count(),
-        harness.makers + 1
+        harness.round_makers + 1
     );
     assert_pit_outputs(&tx, harness.pit);
     for (name, had) in names.iter().zip(before) {
@@ -878,8 +889,9 @@ async fn makers_with_joinmarket_ng_taker() {
         );
     }
     println!(
-        "CoinJoin {txid} by the other implementation's taker with {} vortex-ng makers confirmed: {} inputs, {} outputs",
+        "CoinJoin {txid} by the other implementation's taker with {} vortex-ng makers of {} confirmed: {} inputs, {} outputs",
         harness.makers,
+        harness.round_makers,
         tx.input.len(),
         tx.output.len()
     );
