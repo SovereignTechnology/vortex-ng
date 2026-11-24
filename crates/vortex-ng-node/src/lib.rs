@@ -671,19 +671,30 @@ pub async fn fetch_orderbook_for<C: Channel>(
     client.listen(true, false).await?;
     client.ask_orderbook().await?;
     let mut asked = Instant::now();
+    // When to ask again, for a maker we heard of that has not answered.
+    let mut ask_again: Option<Instant> = None;
     // Kept per channel until the end: what one channel delivers first cannot take a maker off another.
     let mut channels: HashMap<usize, ChannelAnswers<C::Route>> = HashMap::new();
     let mut arrived = 0u64;
     let gather_until = Instant::now() + gather;
-    while let Some(left) = gather_until.checked_duration_since(Instant::now()) {
-        match client.receive(left).await {
+    while Instant::now() < gather_until {
+        if ask_again.is_some_and(|at| Instant::now() >= at) {
+            ask_again = None;
+            client.ask_orderbook().await?;
+            asked = Instant::now();
+        }
+        let wake = ask_again.map_or(gather_until, |at| at.min(gather_until));
+        match client
+            .receive(wake.saturating_duration_since(Instant::now()))
+            .await
+        {
             Next::Message(Incoming::Offers { nick, .. }) => {
                 // Public offers are a discovery cache (the draft): a maker that has not answered may have
-                // started listening after our request, so ask again.
+                // started listening after our request, which relays do not keep. Ask again, as soon as the
+                // interval since the last request allows: its offers may be the last we hear of it.
                 let answered = channels.values().any(|c| c.answers.contains_key(&nick));
-                if !answered && asked.elapsed() >= REASK_INTERVAL {
-                    client.ask_orderbook().await?;
-                    asked = Instant::now();
+                if !answered && ask_again.is_none() {
+                    ask_again = Some(asked + REASK_INTERVAL);
                 }
             }
             Next::Message(Incoming::Private { msg, route }) => {
@@ -738,7 +749,9 @@ pub async fn fetch_orderbook_for<C: Channel>(
                 }
             }
             Next::Message(Incoming::Public { .. }) => {}
-            Next::Timeout | Next::Closed => break,
+            // The time to ask again, or the end of the gathering: the loop sees which.
+            Next::Timeout => {}
+            Next::Closed => break,
         }
     }
     Ok(settle(channels))

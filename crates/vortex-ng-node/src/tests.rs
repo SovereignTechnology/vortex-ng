@@ -1388,6 +1388,35 @@ async fn a_line_relabelled_on_one_channel_does_not_take_the_maker_off_another() 
 }
 
 #[tokio::test]
+async fn a_maker_heard_just_after_the_request_is_asked_again() {
+    use vortex_ng_channel::testing::{MockRoute, Sent, mock_channel};
+
+    let (mut channel, handle) = mock_channel("J5taker", true);
+    // Relays do not store `!orderbook`: a maker that began listening just after it went out missed it, and
+    // the offers it then announces, well within the re-ask interval, may be all the taker hears of it.
+    for _ in 0..5 {
+        handle.deliver(Incoming::Offers {
+            nick: "J5maker".into(),
+            offers: Vec::new(),
+            route: MockRoute("a".into()),
+        });
+    }
+    let gather = REASK_INTERVAL + Duration::from_millis(400);
+    fetch_orderbook_for(&mut channel, "regtest", gather, |_| Some(0))
+        .await
+        .unwrap();
+    let asks = handle
+        .sent()
+        .iter()
+        .filter(|sent| matches!(sent, Sent::AskOrderbook))
+        .count();
+    assert_eq!(
+        asks, 2,
+        "once more after the interval, however many offers came"
+    );
+}
+
+#[tokio::test]
 async fn offers_a_taker_cannot_use_do_not_take_the_place_of_one_it_can() {
     use vortex_ng_channel::testing::mock_channel;
     use vortex_ng_core::nick::NickIdentity;
