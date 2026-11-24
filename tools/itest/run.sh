@@ -2,7 +2,8 @@
 # Run the regtest tests (crates/vortex-ng-node/tests/regtest.rs for JoinMarket rounds, regtest_joinstr.rs
 # for joinstr pools, regtest_channels.rs for one maker on three channels at once,
 # crates/vortex-ng-cli/tests/regtest_maker.rs for the command line's maker, and its regtest_channels.rs for
-# the commands on each channel) against a pinned Bitcoin Core.
+# the commands on each channel, and regtest_pools.rs for a maker and a joinstr pool on one wallet) against a
+# pinned Bitcoin Core. ITEST_ONLY=<test name> runs one of them alone.
 #
 #   kata-run --net --cwd ~/Projects/vortex-ng -- bash tools/itest/run.sh
 #
@@ -42,14 +43,35 @@ for _ in $(seq 1 60); do [ -s "$cookie" ] && break; sleep 1; done
 [ -s "$cookie" ] || { echo "bitcoind did not start" >&2; exit 97; }
 
 cd "$repo"
-VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
-  cargo test --locked -p vortex-ng-node --test regtest --test regtest_joinstr -- --nocapture
+# ITEST_ONLY=<test> runs that one test alone (regtest, regtest_joinstr, regtest_pools, regtest_maker,
+# regtest_channels): iterate on it, then run them all once.
+only=${ITEST_ONLY:-}
+ran=0
+itest() {  # crate, test names
+  local crate=$1 names=()
+  shift
+  if [ -n "$only" ]; then
+    local hit=0 name
+    for name in "$@"; do [ "$name" != "$only" ] || hit=1; done
+    [ "$hit" = 1 ] || return 0
+    names=("$only")
+  else
+    names=("$@")
+  fi
+  local args=()
+  for name in "${names[@]}"; do args+=(--test "$name"); done
+  VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
+    cargo test --locked -p "$crate" "${args[@]}" -- --nocapture
+  ran=$((ran + 1))
+}
+# A JoinMarket maker and a joinstr pool on one wallet at once (issue #51). First: its coinbases must still be
+# worth something, and regtest halves the subsidy every 150 blocks.
+itest vortex-ng-cli regtest_pools
+itest vortex-ng-node regtest regtest_joinstr
 # The command line's maker as a service: real `vortex-ng maker` processes through two rounds.
-VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
-  cargo test --locked -p vortex-ng-cli --test regtest_maker -- --nocapture
+itest vortex-ng-cli regtest_maker
 # The commands themselves on each channel, chosen with --relays, --directories and --irc, through a proxy.
-VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
-  cargo test --locked -p vortex-ng-cli --test regtest_channels -- --nocapture
+itest vortex-ng-cli regtest_channels
 # One maker on a Nostr relay, an onion directory and an IRC server at once, with a taker on each.
-VORTEX_NG_REGTEST_RPC="http://127.0.0.1:${PORT}" VORTEX_NG_REGTEST_COOKIE="$cookie" \
-  cargo test --locked -p vortex-ng-node --test regtest_channels -- --nocapture
+itest vortex-ng-node regtest_channels
+[ "$ran" -gt 0 ] || { echo "ITEST_ONLY=$only: no such test" >&2; exit 97; }

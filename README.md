@@ -56,7 +56,8 @@ rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Ecl
 
 ## Command line
 
-`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin` and `balance`.
+`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin`, `balance`, and `pools`, `pool join` and
+`pool create` for joinstr pools.
 
 ```
 vortex-ng wallet new          --wallet <file> --network <network> [--words 12|24] [--birthday <height>]
@@ -140,6 +141,18 @@ one round the makers can link them, since every one of them sees the round's com
   from what the maker remembers when it grows, so a flood of announcements cannot fill the disk.
 - `orderbook` lists what the makers answer, with the channel each answered on, and verifies their fidelity
   bonds when given a node.
+- `pools` lists the open joinstr pools on the relays named (ADR 0006): reached over Tor, without an aut-ct
+  requirement. `pool join --pool <id>` joins one with a confirmed coin of the wallet's `--mixdepth` (0 by
+  default) worth the pool's denomination plus 500 to 5000 sat; `pool create --denomination <sats> --peers <n>`
+  announces a pool on the first relay named, hosts it and joins it the same way. The output, the denomination
+  less a share of the mining fee, goes to the next mixdepth; nobody is paid, and there is no change, so the coin
+  must be the right size first (`coinjoin --amount <sats>` leaves one in the next mixdepth). Relays see who
+  writes to a pool's key and when; every peer holds the pool's key and can read every pool message; a pool
+  without aut-ct has no defence against one party taking many places.
+- The commands that spend coins share `<wallet>.claims` beside the wallet file: every coin a maker's round, a
+  `coinjoin` or a pool holds, until when, and every address handed out, read and written under a file lock.
+  A coin one of them holds is never put into another's transaction and no address is handed out twice, so a
+  `maker` and `pool` commands can run on one wallet at the same time (issue #51).
 - `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
   username and password, such as a Tor daemon's SOCKS port (`127.0.0.1:9050`). Every nick then reaches its
   channels under credentials of its own, so Tor gives it circuits of its own: a maker and the throwaway nick it

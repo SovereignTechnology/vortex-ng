@@ -5759,6 +5759,7 @@ dependencies = [
  "vortex-ng-channel",
  "vortex-ng-core",
  "vortex-ng-irc",
+ "vortex-ng-joinstr",
  "vortex-ng-maker",
  "vortex-ng-node",
  "vortex-ng-nostr",

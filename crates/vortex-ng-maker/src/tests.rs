@@ -1229,3 +1229,114 @@ fn the_keeper_is_rewritten_from_what_is_remembered_when_it_asks() {
     assert_eq!(keeper.0.lock().unwrap().rewrites, 1);
     assert_eq!(keeper.kept().len(), 3);
 }
+
+/// Claims in memory, shared with the test: coins held by another user of the wallet, those held for the
+/// maker, and the addresses taken.
+#[derive(Clone, Default)]
+struct MemoryClaims(std::sync::Arc<std::sync::Mutex<ClaimsState>>);
+
+#[derive(Default)]
+struct ClaimsState {
+    elsewhere: HashSet<OutPoint>,
+    ours: Vec<OutPoint>,
+    taken: HashSet<String>,
+}
+
+impl WalletClaims for MemoryClaims {
+    fn held_elsewhere(&self) -> Result<HashSet<OutPoint>, String> {
+        Ok(self.0.lock().unwrap().elsewhere.clone())
+    }
+
+    fn hold(&self, coins: &[OutPoint], _seconds: u64) -> Result<bool, String> {
+        let mut state = self.0.lock().unwrap();
+        if coins.iter().any(|c| state.elsewhere.contains(c)) {
+            return Ok(false);
+        }
+        state.ours.extend_from_slice(coins);
+        Ok(true)
+    }
+
+    fn take_address(&self, address: &vortex_ng_core::bitcoin::Address) -> Result<bool, String> {
+        Ok(self.0.lock().unwrap().taken.insert(address.to_string()))
+    }
+}
+
+#[test]
+fn a_coin_held_by_another_user_of_the_wallet_is_never_offered_or_spent() {
+    let (taker, chain) = new_taker();
+    let coins: Vec<OutPoint> = maker_coins().into_iter().map(|(coin, _)| coin).collect();
+    let big = coins
+        .iter()
+        .copied()
+        .find(|c| {
+            maker_coins()
+                .iter()
+                .any(|(o, u)| o == c && u.value.to_sat() == 500_000)
+        })
+        .unwrap();
+    let claims = MemoryClaims::default();
+    let mut maker = funded_maker();
+    assert_eq!(maker.liquidity().unwrap(), 800_000);
+    maker.share_wallet(Box::new(claims.clone()));
+    // A joinstr round in another process holds the 500,000 coin.
+    claims.0.lock().unwrap().elsewhere.insert(big);
+    assert_eq!(
+        maker.liquidity().unwrap(),
+        300_000,
+        "only what nobody else holds"
+    );
+    // A round the other coin covers goes ahead without it; the coins shown are now held for the maker.
+    let ioauth = auth_round(&mut maker, &taker, &chain, 200_000).expect("an !ioauth");
+    assert!(!ioauth.utxos.contains(&big));
+    assert_eq!(claims.0.lock().unwrap().ours, ioauth.utxos);
+}
+
+#[test]
+fn a_round_is_refused_when_its_coins_are_taken_meanwhile_and_addresses_are_handed_out_once() {
+    let (taker, chain) = new_taker();
+    let claims = MemoryClaims::default();
+    let mut maker = funded_maker();
+    maker.share_wallet(Box::new(claims.clone()));
+    // Another user of the wallet already took the first addresses this maker would hand out.
+    let mut probe = maker_wallet();
+    let first_cj = probe.next_receive_address(1).unwrap();
+    let first_change = probe.next_change_address(0).unwrap();
+    {
+        let mut state = claims.0.lock().unwrap();
+        state.taken.insert(first_cj.to_string());
+        state.taken.insert(first_change.to_string());
+    }
+    let ioauth = auth_round(&mut maker, &taker, &chain, 200_000).expect("an !ioauth");
+    assert_ne!(ioauth.cj_address, first_cj.to_string());
+    assert_ne!(ioauth.change_address, first_change.to_string());
+    let state = claims.0.lock().unwrap();
+    assert!(
+        state.taken.contains(&ioauth.cj_address) && state.taken.contains(&ioauth.change_address)
+    );
+    drop(state);
+
+    // Its coins held elsewhere between the choice and the hold: the round is refused, nothing shown.
+    let mut maker = funded_maker();
+    let racing = MemoryClaims::default();
+    maker.share_wallet(Box::new(RaceClaims(racing.clone())));
+    assert!(auth_round(&mut maker, &taker, &chain, 200_000).is_none());
+    assert!(racing.0.lock().unwrap().ours.is_empty());
+}
+
+/// Claims that let the maker choose any coin and then refuse to hold it, as when another process holds it
+/// between the two.
+struct RaceClaims(MemoryClaims);
+
+impl WalletClaims for RaceClaims {
+    fn held_elsewhere(&self) -> Result<HashSet<OutPoint>, String> {
+        Ok(HashSet::new())
+    }
+
+    fn hold(&self, _coins: &[OutPoint], _seconds: u64) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn take_address(&self, address: &vortex_ng_core::bitcoin::Address) -> Result<bool, String> {
+        self.0.take_address(address)
+    }
+}
