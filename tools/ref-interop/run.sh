@@ -172,6 +172,8 @@ ServerUID = 65534
 ServerGID = 65534
 [Limits]
 MaxNickLength = 30
+# Every client of this run is on loopback, and the commitment check alone adds several (default 5).
+MaxConnectionsIP = 0
 [Options]
 PAM = no
 Ident = no
