@@ -985,6 +985,76 @@ async fn one_maker_on_three_channels_serves_a_taker_on_each() {
 /// the taker's private lines goes through the directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_whole_coinjoin_over_direct_connections() {
+    coinjoin_over_direct_connections(false).await;
+}
+
+/// The same with a taker that connects as joinmarket-clientserver's does: it sends `!fill` through the
+/// directory and connects to the maker as it does. The makers answer that `!fill` there, then follow the
+/// taker onto the connection with its `!auth`: nothing else of the round goes through the directory (#46).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taker_that_connects_after_its_fill_has_the_rest_of_the_round_direct() {
+    coinjoin_over_direct_connections(true).await;
+}
+
+/// An onion channel that opens a direct connection to a maker only once it has sent the maker its `!fill`,
+/// through the directory: joinmarket-clientserver's taker (`onionmc.py`, `_privmsg`).
+struct ConnectsAfterFill(vortex_ng_onion::OnionChannel);
+
+impl Channel for ConnectsAfterFill {
+    type Route = vortex_ng_onion::OnionRoute;
+
+    fn nick(&self) -> &str {
+        self.0.nick()
+    }
+
+    fn authenticates(&self, route: &Self::Route) -> bool {
+        self.0.authenticates(route)
+    }
+
+    async fn listen(&self, offers: bool, public: bool) -> Result<(), ChannelError> {
+        self.0.listen(offers, public).await
+    }
+
+    async fn send_private(
+        &self,
+        route: &Self::Route,
+        to: &str,
+        command: &str,
+        body: &str,
+    ) -> Result<(), ChannelError> {
+        self.0.send_private(route, to, command, body).await?;
+        if command == "fill" {
+            self.0.prepare(&[(to.to_string(), route.clone())]).await;
+        }
+        Ok(())
+    }
+
+    async fn ask_orderbook(&self) -> Result<(), ChannelError> {
+        self.0.ask_orderbook().await
+    }
+
+    async fn announce_offers(&self, pit: Pit, offers: &[Offer]) -> Result<(), ChannelError> {
+        self.0.announce_offers(pit, offers).await
+    }
+
+    async fn withdraw_offers(&self, pit: Pit) -> Result<(), ChannelError> {
+        self.0.withdraw_offers(pit).await
+    }
+
+    async fn publish_unlinked(&self, line: &str) -> Result<(), ChannelError> {
+        self.0.publish_unlinked(line).await
+    }
+
+    async fn receive(&mut self, wait: Duration) -> Next<Self::Route> {
+        self.0.receive(wait).await
+    }
+
+    async fn shutdown(&self) {
+        self.0.shutdown().await
+    }
+}
+
+async fn coinjoin_over_direct_connections(late: bool) {
     use vortex_ng_channel::set::{ChannelSet, DynChannel};
     use vortex_ng_channel::socks::Outbound;
     use vortex_ng_core::nick::NickIdentity;
@@ -1020,6 +1090,7 @@ async fn a_whole_coinjoin_over_direct_connections() {
 
     let mut handles = Vec::new();
     let mut entries = Vec::new();
+    let mut maker_nicks = Vec::new();
     for (i, wallet) in maker_wallets.into_iter().enumerate() {
         let mut channel = OnionChannel::connect(
             NickIdentity::generate(),
@@ -1028,6 +1099,7 @@ async fn a_whole_coinjoin_over_direct_connections() {
         )
         .await
         .unwrap();
+        maker_nicks.push(channel.nick().to_string());
         entries.push(format!(
             "{};{}",
             channel.nick(),
@@ -1087,7 +1159,11 @@ async fn a_whole_coinjoin_over_direct_connections() {
     .await
     .unwrap();
     let taker_nick = onion.nick().to_string();
-    let channels: Vec<Box<dyn DynChannel>> = vec![Box::new(onion)];
+    let channels: Vec<Box<dyn DynChannel>> = if late {
+        vec![Box::new(ConnectsAfterFill(onion))]
+    } else {
+        vec![Box::new(onion)]
+    };
     let mut client = ChannelSet::new(channels).unwrap();
     let tx = run_taker(
         &mut taker,
@@ -1102,21 +1178,225 @@ async fn a_whole_coinjoin_over_direct_connections() {
     .unwrap();
     assert_eq!(tx.input.len(), 3);
     assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
-    // The directory carried the taker's `!orderbook` and nothing private from it.
-    let from_taker: Vec<u64> = directory
-        .received()
-        .iter()
-        .filter(|(from, _, _)| *from == taker_nick)
-        .map(|(_, kind, _)| *kind)
-        .collect();
-    assert!(from_taker.contains(&vortex_ng_onion::wire::PUBMSG));
+    let received = directory.received();
+    let private_from = |nick: &str| -> Vec<String> {
+        received
+            .iter()
+            .filter(|(from, kind, _)| from == nick && *kind == vortex_ng_onion::wire::PRIVMSG)
+            .map(|(_, _, line)| line.clone())
+            .collect()
+    };
+    // The directory carried the taker's `!orderbook`; of its private lines, at most the `!fill`s.
     assert!(
-        !from_taker.contains(&vortex_ng_onion::wire::PRIVMSG),
-        "{from_taker:?}"
+        received
+            .iter()
+            .any(|(from, kind, _)| *from == taker_nick && *kind == vortex_ng_onion::wire::PUBMSG)
     );
+    let taker_lines = private_from(&taker_nick);
+    if late {
+        assert_eq!(taker_lines.len(), 2, "{taker_lines:?}");
+        assert!(taker_lines.iter().all(|line| line.contains("!fill ")));
+    } else {
+        assert!(taker_lines.is_empty(), "{taker_lines:?}");
+    }
+    // Of each maker's round lines, only the `!pubkey` answering a `!fill` that came that way.
+    for nick in &maker_nicks {
+        let round: Vec<String> = private_from(nick)
+            .into_iter()
+            .filter(|line| {
+                ["!pubkey ", "!ioauth ", "!sig "]
+                    .iter()
+                    .any(|c| line.contains(c))
+            })
+            .collect();
+        if late {
+            assert_eq!(round.len(), 1, "{round:?}");
+            assert!(round[0].contains("!pubkey "), "{round:?}");
+        } else {
+            assert!(round.is_empty(), "{round:?}");
+        }
+    }
     for handle in handles {
         handle.abort();
     }
+}
+
+/// A third maker announces an offer and then never answers its `!fill`: a taker allowed to go on with two does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_round_goes_on_without_a_maker_that_never_answers() {
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let pit = Pit::Sw0;
+    let mut utxos = HashMap::new();
+    let maker_wallets: Vec<PitWallet> = (0..2u8)
+        .map(|i| funded(pit, &format!("left{i}"), 500_000, None, 100 + i, &mut utxos))
+        .collect();
+    let mut taker_wallet = funded(pit, "left-taker", 600_000, None, 110, &mut utxos);
+    let chain = SharedChain(Arc::new(utxos));
+    let until = Instant::now() + Duration::from_secs(24);
+    let mut handles = Vec::new();
+    for (i, wallet) in maker_wallets.into_iter().enumerate() {
+        let (chain, url) = (chain.clone(), url.clone());
+        handles.push(tokio::spawn(async move {
+            let offer =
+                Offer::parse("sw0absoffer", &format!("{i} 10000 10000000 100 500")).unwrap();
+            let mut maker = Maker::new(MakerConfig::new(vec![offer]), wallet).unwrap();
+            let keys = NickKeys::generate();
+            let mut client = NickClient::connect(keys, "regtest", &[url], None, CONNECT_TIMEOUT)
+                .await
+                .unwrap();
+            run_maker(&mut maker, &mut client, &chain, "regtest", until).await
+        }));
+    }
+    // Answers `!orderbook` like any maker, and nothing else.
+    let mut silent = NickClient::connect(
+        NickKeys::generate(),
+        "regtest",
+        std::slice::from_ref(&url),
+        None,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    silent.listen(false, true).await.unwrap();
+    let quiet = tokio::spawn(async move {
+        while Instant::now() < until {
+            let next = silent.receive(Duration::from_millis(200)).await;
+            if let Next::Message(Incoming::Public {
+                nick,
+                commands,
+                route,
+            }) = next
+                && commands.iter().any(|c| matches!(c, Command::Orderbook))
+            {
+                let body = "2 10000 10000000 100 500";
+                let _ = silent
+                    .send_private(&route, &nick, "sw0absoffer", body)
+                    .await;
+            }
+        }
+    });
+
+    let utxo = taker_wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+    let cfg = TakerConfig {
+        pit,
+        makers: 3,
+        bondless_require_zero_fee: false,
+        ..pit_config()
+    };
+    let cj = taker_wallet
+        .next_receive_address(1)
+        .unwrap()
+        .script_pubkey();
+    let change = taker_wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(
+        cfg.clone(),
+        0,
+        vec![(utxo.outpoint, utxo.txout.clone())],
+        podle,
+        cj,
+        change,
+    )
+    .unwrap()
+    .allow_fewer_makers(2)
+    .unwrap();
+    let mut client = NickClient::connect(
+        NickKeys::generate(),
+        "regtest",
+        std::slice::from_ref(&url),
+        None,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let tx = run_taker(
+        &mut taker,
+        &taker_wallet,
+        &mut client,
+        &chain,
+        &cfg,
+        Duration::from_secs(3),
+        until,
+    )
+    .await
+    .unwrap();
+    assert_eq!(taker.makers_in_round(), 2);
+    assert_eq!(tx.input.len(), 3);
+    assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+    quiet.abort();
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_round_ends_when_its_channels_close() {
+    use vortex_ng_channel::testing::{Sent, mock_channel};
+    use vortex_ng_core::nick::NickIdentity;
+
+    let pit = Pit::Sw0;
+    let mut utxos = HashMap::new();
+    let mut taker_wallet = funded(pit, "closing-taker", 600_000, None, 120, &mut utxos);
+    let chain = SharedChain(Arc::new(utxos));
+    let utxo = taker_wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+    let cfg = TakerConfig {
+        pit,
+        makers: 1,
+        bondless_require_zero_fee: false,
+        ..pit_config()
+    };
+    let cj = taker_wallet
+        .next_receive_address(1)
+        .unwrap()
+        .script_pubkey();
+    let change = taker_wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(
+        cfg.clone(),
+        0,
+        vec![(utxo.outpoint, utxo.txout.clone())],
+        podle,
+        cj,
+        change,
+    )
+    .unwrap();
+    let (mut channel, handle) = mock_channel("J5taker", true);
+    let maker = NickIdentity::generate();
+    handle.deliver_private(
+        &maker,
+        "J5taker",
+        "sw0absoffer",
+        "0 10000 10000000 100 500",
+        "a",
+    );
+    let closer = handle.clone();
+    tokio::spawn(async move {
+        loop {
+            let filled = closer
+                .sent()
+                .iter()
+                .any(|s| matches!(s, Sent::Private { command, .. } if command == "fill"));
+            if filled {
+                closer.close();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let started = Instant::now();
+    let round = run_taker(
+        &mut taker,
+        &taker_wallet,
+        &mut channel,
+        &chain,
+        &cfg,
+        Duration::from_millis(200),
+        started + Duration::from_secs(30),
+    )
+    .await;
+    assert!(matches!(round, Err(NodeError::Channel(_))), "{round:?}");
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 #[test]
@@ -1164,22 +1444,77 @@ fn a_line_of_thousands_of_commands_is_not_read() {
 #[test]
 fn past_the_cap_a_channel_keeps_a_sample_of_who_answered() {
     let mut book: ChannelAnswers<u8> = ChannelAnswers::new();
+    let mut no_bonds = |_: &str, _: &str| false;
     for i in 0..MAX_ANSWERING_NICKS {
         assert!(
-            book.place(&format!("J5first{i}"), &0, i as u64, 0)
+            book.place(&format!("J5first{i}"), &0, i as u64, 0, None, &mut no_bonds)
                 .is_some()
         );
     }
     // A later nick gets a place when its draw lands inside the table, and pushes one out.
     let heard = MAX_ANSWERING_NICKS as u64 + 1;
-    assert!(book.place("J5late", &0, heard, 3).is_some());
+    assert!(
+        book.place("J5late", &0, heard, 3, None, &mut no_bonds)
+            .is_some()
+    );
     assert_eq!(book.answers.len(), MAX_ANSWERING_NICKS);
     assert!(book.answers.contains_key("J5late"));
     // When it lands past the table it does not, and nothing moves.
     let past = MAX_ANSWERING_NICKS as u64 + 1;
-    assert!(book.place("J5unlucky", &0, heard + 1, past).is_none());
+    assert!(
+        book.place("J5unlucky", &0, heard + 1, past, None, &mut no_bonds)
+            .is_none()
+    );
     assert!(!book.answers.contains_key("J5unlucky"));
     assert_eq!(book.answers.len(), MAX_ANSWERING_NICKS);
+}
+
+#[test]
+fn past_the_cap_a_real_bond_keeps_its_place_and_gets_one() {
+    let mut book: ChannelAnswers<u8> = ChannelAnswers::new();
+    let asked = std::cell::Cell::new(0usize);
+    let mut real = |maker: &str, _: &str| {
+        asked.set(asked.get() + 1);
+        maker.starts_with("J5bond")
+    };
+    // Every nick shows a proof; only the bonds' stand up.
+    for i in 0..MAX_ANSWERING_NICKS {
+        let nick = if i == 0 {
+            "J5bond0".to_string()
+        } else {
+            format!("J5first{i}")
+        };
+        let answer = book.place(&nick, &0, i as u64, 0, None, &mut real).unwrap();
+        answer.proof = Some("a proof".into());
+    }
+    // Nothing is asked of the chain while there are places left.
+    assert_eq!(asked.get(), 0);
+    // Later nicks land inside the table and push others out, but never the bond.
+    for i in 0..5 * MAX_ANSWERING_NICKS as u64 {
+        book.place(
+            &format!("J5later{i}"),
+            &0,
+            0,
+            i * 7_919,
+            Some("a proof"),
+            &mut real,
+        );
+    }
+    assert!(book.answers.contains_key("J5bond0"));
+    assert_eq!(book.answers.len(), MAX_ANSWERING_NICKS);
+    // A draw past the table turns a newcomer away, unless its bond is real.
+    let past = MAX_ANSWERING_NICKS as u64;
+    assert!(
+        book.place("J5plain", &0, 0, past, Some("a proof"), &mut real)
+            .is_none()
+    );
+    assert!(
+        book.place("J5bond1", &0, 0, past, Some("a proof"), &mut real)
+            .is_some()
+    );
+    assert!(book.answers.contains_key("J5bond0") && book.answers.contains_key("J5bond1"));
+    // The proofs held when the places ran out, then one per newcomer.
+    assert!(asked.get() > MAX_ANSWERING_NICKS);
 }
 
 #[tokio::test]
@@ -1200,13 +1535,42 @@ async fn a_line_relabelled_on_one_channel_does_not_take_the_maker_off_another() 
         tokio::time::sleep(Duration::from_millis(100)).await;
         later.deliver_private(&late_maker, "J5takerOnB", "sw0absoffer", body, "b");
     });
-    let usable = |offer: &Offer| offer.offer_type.pit == Pit::Sw0;
+    let usable = |offer: &Offer| (offer.offer_type.pit == Pit::Sw0).then_some(0);
     let book = fetch_orderbook_for(&mut set, "regtest", Duration::from_millis(400), usable)
         .await
         .unwrap();
     assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
     assert_eq!(book.offers[0].1.offer_type.pit, Pit::Sw0);
     assert_eq!(set.channel_of(book.route(maker.nick()).unwrap()), 1);
+}
+
+#[tokio::test]
+async fn a_maker_heard_just_after_the_request_is_asked_again() {
+    use vortex_ng_channel::testing::{MockRoute, Sent, mock_channel};
+
+    let (mut channel, handle) = mock_channel("J5taker", true);
+    // Relays do not store `!orderbook`: a maker that began listening just after it went out missed it, and
+    // the offers it then announces, well within the re-ask interval, may be all the taker hears of it.
+    for _ in 0..5 {
+        handle.deliver(Incoming::Offers {
+            nick: "J5maker".into(),
+            offers: Vec::new(),
+            route: MockRoute("a".into()),
+        });
+    }
+    let gather = REASK_INTERVAL + Duration::from_millis(400);
+    fetch_orderbook_for(&mut channel, "regtest", gather, |_| Some(0))
+        .await
+        .unwrap();
+    let asks = handle
+        .sent()
+        .iter()
+        .filter(|sent| matches!(sent, Sent::AskOrderbook))
+        .count();
+    assert_eq!(
+        asks, 2,
+        "once more after the interval, however many offers came"
+    );
 }
 
 #[tokio::test]
@@ -1226,13 +1590,35 @@ async fn offers_a_taker_cannot_use_do_not_take_the_place_of_one_it_can() {
         let real = "99 10000 100000000 0 500";
         handle.deliver_private(&maker, "J5taker", "sw0absoffer", real, "a");
     }
-    let usable = |offer: &Offer| offer.offer_type.pit == Pit::Sw0;
+    let usable = |offer: &Offer| (offer.offer_type.pit == Pit::Sw0).then_some(0);
     let book = fetch_orderbook_for(&mut channel, "regtest", Duration::from_millis(300), usable)
         .await
         .unwrap();
     assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
     assert_eq!(book.offers[0].1.oid, 99);
     assert!(book.route(maker.nick()).is_some());
+}
+
+#[tokio::test]
+async fn an_older_dearer_offer_delivered_first_does_not_replace_the_real_one() {
+    use vortex_ng_channel::testing::mock_channel;
+    use vortex_ng_core::nick::NickIdentity;
+    use vortex_ng_core::offer::CjFee;
+
+    let (dear, cheap) = ("0 10000 100000000 0 900", "0 10000 100000000 0 500");
+    for order in [[dear, cheap], [cheap, dear]] {
+        let (mut channel, handle) = mock_channel("J5taker", false);
+        let maker = NickIdentity::generate();
+        for body in order {
+            handle.deliver_private(&maker, "J5taker", "sw0absoffer", body, "a");
+        }
+        let cost = |offer: &Offer| offer.fee_for(100_000);
+        let book = fetch_orderbook_for(&mut channel, "regtest", Duration::from_millis(200), cost)
+            .await
+            .unwrap();
+        assert_eq!(book.offers.len(), 1, "{:?}", book.offers);
+        assert_eq!(book.offers[0].1.cjfee, CjFee::Absolute(500));
+    }
 }
 
 #[tokio::test]
@@ -1284,5 +1670,89 @@ async fn a_replayed_offer_does_not_cost_a_maker_its_bond_or_its_route() {
         kept.verify_signatures(&secp, "J5takerOnB", maker.nick())
             .is_ok(),
         "the proof made out to us"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flood_of_nicks_does_not_push_out_a_real_bond() {
+    use vortex_ng_channel::testing::mock_channel;
+    use vortex_ng_core::bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use vortex_ng_core::bond::BondTemplate;
+    use vortex_ng_core::nick::NickIdentity;
+
+    let secp = Secp256k1::new();
+    let bond = |byte: u8| {
+        let key = SecretKey::from_slice(&[byte; 32]).unwrap();
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([byte; 32]),
+            vout: 0,
+        };
+        BondTemplate::new(&secp, &key, outpoint, 1_893_456_000, 300)
+    };
+    let line = |maker: &NickIdentity, template: &BondTemplate| {
+        let proof = template.proof(&secp, "J5taker", maker.nick());
+        format!(
+            "0 10000 100000000 0 500!tbond {}",
+            proof.to_base64().unwrap()
+        )
+    };
+    let (mut channel, handle) = mock_channel("J5taker", false);
+    // A maker with a real bond answers first, and another one once the flood has filled the places. Every nick
+    // of the flood shows a proof of its own: signed, made out to us, and backed by nothing.
+    let (early, late) = (NickIdentity::generate(), NickIdentity::generate());
+    let (early_bond, late_bond, nothing) = (bond(1), bond(2), bond(3));
+    handle.deliver_private(
+        &early,
+        "J5taker",
+        "sw0absoffer",
+        &line(&early, &early_bond),
+        "a",
+    );
+    // Enough nicks after the places run out to use up the lookups allowed.
+    for i in 0..2 * MAX_ANSWERING_NICKS + 100 {
+        if i == MAX_ANSWERING_NICKS + 500 {
+            handle.deliver_private(
+                &late,
+                "J5taker",
+                "sw0absoffer",
+                &line(&late, &late_bond),
+                "a",
+            );
+        }
+        let sybil = NickIdentity::generate();
+        handle.deliver_private(
+            &sybil,
+            "J5taker",
+            "sw0absoffer",
+            &line(&sybil, &nothing),
+            "a",
+        );
+    }
+    let bonded = [early.nick().to_string(), late.nick().to_string()];
+    let mut asked = 0usize;
+    let book = fetch_orderbook_with_bonds(
+        &mut channel,
+        "regtest",
+        // Room to check every line's signatures in an unoptimised build.
+        Duration::from_secs(15),
+        |_| Some(0),
+        |maker, _proof, us| {
+            asked += 1;
+            assert_eq!(us, "J5taker");
+            bonded.iter().any(|nick| nick == maker)
+        },
+    )
+    .await
+    .unwrap();
+    for nick in &bonded {
+        assert!(book.proofs.contains_key(nick), "{nick} kept its place");
+    }
+    let makers: std::collections::HashSet<&String> =
+        book.offers.iter().map(|(nick, _)| nick).collect();
+    assert_eq!(makers.len(), MAX_ANSWERING_NICKS);
+    // The chain was asked only after the places ran out, and no more than allowed.
+    assert!(
+        asked > MAX_ANSWERING_NICKS && asked <= MAX_BOND_LOOKUPS,
+        "{asked}"
     );
 }

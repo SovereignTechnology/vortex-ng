@@ -9,10 +9,14 @@ use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::crypto::ring;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 
 use crate::channel::IrcServer;
 use crate::codec::parse;
@@ -24,9 +28,59 @@ struct State {
     received: Vec<(String, String)>,
 }
 
+/// The certificate authority that issued [`TestIrc::start_tls`]'s certificate (for `irc.test` and 127.0.0.1).
+/// A fixture: its key was thrown away, and the server's key below protects nothing.
+const TEST_CA: &[u8] = include_bytes!("testdata/ca.der");
+/// An authority that issued nothing here.
+const OTHER_CA: &[u8] = include_bytes!("testdata/other-ca.der");
+const SERVER_CERT: &[u8] = include_bytes!("testdata/server.der");
+const SERVER_KEY: &[u8] = include_bytes!("testdata/server.key.der");
+
+fn roots_of(ca: &'static [u8]) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_slice(ca))
+        .unwrap_or_else(|e| panic!("test CA: {e}"));
+    roots
+}
+
+/// Roots that trust [`TestIrc::start_tls`]'s certificate.
+pub fn test_roots() -> RootCertStore {
+    roots_of(TEST_CA)
+}
+
+/// Roots of one certificate authority, from its DER certificate.
+pub fn roots_from_der(der: &[u8]) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_slice(der).into_owned())
+        .unwrap_or_else(|e| panic!("CA certificate: {e}"));
+    roots
+}
+
+/// Roots that do not.
+pub fn other_roots() -> RootCertStore {
+    roots_of(OTHER_CA)
+}
+
+fn acceptor() -> TlsAcceptor {
+    let key = PrivateKeyDer::try_from(SERVER_KEY.to_vec()).unwrap_or_else(|e| panic!("key: {e}"));
+    let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .and_then(|builder| {
+            builder.with_no_client_auth().with_single_cert(
+                vec![CertificateDer::from_slice(SERVER_CERT).into_owned()],
+                key,
+            )
+        })
+        .unwrap_or_else(|e| panic!("TLS: {e}"));
+    TlsAcceptor::from(Arc::new(config))
+}
+
 /// An IRC server on `127.0.0.1:<ephemeral>`.
 pub struct TestIrc {
     addr: SocketAddr,
+    tls: bool,
     state: Arc<Mutex<State>>,
     task: JoinHandle<()>,
 }
@@ -40,6 +94,15 @@ impl Drop for TestIrc {
 impl TestIrc {
     /// A server that announces `network` in its `005` line, or none.
     pub async fn start(network: Option<&str>) -> TestIrc {
+        TestIrc::listen(network, None).await
+    }
+
+    /// The same server behind TLS, with a certificate from [`test_roots`].
+    pub async fn start_tls(network: Option<&str>) -> TestIrc {
+        TestIrc::listen(network, Some(acceptor())).await
+    }
+
+    async fn listen(network: Option<&str>, tls: Option<TlsAcceptor>) -> TestIrc {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap_or_else(|e| panic!("bind: {e}"));
@@ -48,16 +111,29 @@ impl TestIrc {
             .unwrap_or_else(|e| panic!("address: {e}"));
         let state = Arc::new(Mutex::new(State::default()));
         let network = network.map(str::to_string);
+        let tls_on = tls.is_some();
         let task_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
             while let Ok((conn, _)) = listener.accept().await {
                 let (state, network) = (Arc::clone(&task_state), network.clone());
+                let tls = tls.clone();
                 tokio::spawn(async move {
-                    let _ = serve(conn, state, network).await;
+                    let _ = match tls {
+                        Some(tls) => match tls.accept(conn).await {
+                            Ok(conn) => serve(conn, state, network).await,
+                            Err(e) => Err(e.to_string()),
+                        },
+                        None => serve(conn, state, network).await,
+                    };
                 });
             }
         });
-        TestIrc { addr, state, task }
+        TestIrc {
+            addr,
+            tls: tls_on,
+            state,
+            task,
+        }
     }
 
     /// How to reach it.
@@ -66,6 +142,7 @@ impl TestIrc {
             host: self.addr.ip().to_string(),
             port: self.addr.port(),
             expected_network: None,
+            tls: self.tls,
         }
     }
 
@@ -99,12 +176,12 @@ impl TestIrc {
     }
 }
 
-async fn serve(
-    conn: TcpStream,
+async fn serve<S: AsyncRead + AsyncWrite + Send + 'static>(
+    conn: S,
     state: Arc<Mutex<State>>,
     network: Option<String>,
 ) -> Result<(), String> {
-    let (read, mut write) = conn.into_split();
+    let (read, mut write) = tokio::io::split(conn);
     let mut reader = BufReader::new(read);
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let writer = tokio::spawn(async move {

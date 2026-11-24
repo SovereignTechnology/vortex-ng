@@ -14,6 +14,7 @@ mod lightning;
 mod market;
 mod podle_log;
 mod secret;
+mod seen_log;
 mod wallet;
 
 use std::process::ExitCode;
@@ -40,9 +41,9 @@ Usage:
                       [node]
   vortex-ng maker     --wallet <file> where node (--fee-rel <fraction> | --fee-abs <sats>)
                       [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
-                      [--upkeep <seconds>]
+                      [--upkeep <seconds>] [--serve-onion <name>.onion:<port>]
   vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
-                      [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
+                      [--min-makers <n>] [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                       [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
                       [--allow-bondless-fees] [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
   vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
@@ -51,10 +52,29 @@ Usage:
   vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
   vortex-ng --version
 
-where: any of --relays <url[,url...]> (Nostr relays), --directories <host:port[,...]> (JoinMarket's onion
-directory nodes) and --irc <host:port[,...]> (JoinMarket's IRC pit; onion IRC hosts reach the server through
-the proxy); the last two on regtest only in this pre-release. A maker uses one nick on all of them, a taker a
-different nick on each. Who sees what on each channel: the README, section 'Command line'.
+where: at least one of these. None is on by default.
+  --relays <url[,url...]>          Nostr relays.
+  --directories <host:port[,...]>  JoinMarket's onion directory nodes.
+  --irc <host:port[,...]>          JoinMarket's IRC pit. TLS unless the host is an onion or loopback;
+                                   `irc://host:port` is plain text, for regtest.
+--directories and --irc work on regtest only in this pre-release, and are refused elsewhere; outside regtest
+they also need --proxy. A maker uses one nick on all its channels, a taker a different nick on each. A round
+stays on the channel its `!fill` came on. `orderbook` shows the channel each offer came from.
+
+--serve-onion <name>.onion:<port> (maker, with --directories): a v3 onion service your Tor daemon already
+forwards to 127.0.0.1:<port> (torrc: HiddenServicePort <port> 127.0.0.1:<port>). The maker listens there and
+names it to the directory nodes, so takers can connect to it directly.
+
+Who sees what:
+  a Nostr relay      the recipient key and timing of private messages; public messages.
+  a directory node   offers and who is present. For each private line it relays: sender, recipient, size and
+                     timing, with `!fill` (order id, amount, commitment) and `!pubkey` in plain text. The
+                     encrypted steps stay encrypted. When a taker connects to a maker's onion directly, the
+                     rest of their round leaves the directory, except a `!fill` some takers still send
+                     through it first (and its `!pubkey`) and the answers of a maker that replies through
+                     it anyway.
+  an IRC server      the same as a relaying directory node, in its own logs.
+A maker's one nick and its key link its presence on all its channels. More: the README, 'Command line'.
 
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
@@ -80,8 +100,8 @@ never committed to before). The makers see that coin and can link it to the roun
 
 `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
 username and password, such as a Tor daemon's SOCKS port (127.0.0.1:9050). Every nick, a maker's throwaway
-`!hp2` nick included, then reaches the relays under credentials of its own. Without it the relays see this
-machine's address, and the command says so.
+`!hp2` nick included, then reaches its channels under credentials of its own. Without it every relay,
+directory node and IRC server named sees this machine's address, and the command says so.
 
 Networks: regtest, signet, testnet4, testnet. Mainnet wallets are disabled in this pre-release.
 

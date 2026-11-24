@@ -265,9 +265,27 @@ async fn taker_with_route(
     maker: &NickIdentity,
     location: Option<String>,
 ) -> (OnionChannel, OnionRoute) {
+    taker_through(
+        directory,
+        maker,
+        location,
+        PeerPolicy::Local,
+        &Outbound::Direct,
+    )
+    .await
+}
+
+/// [`taker_with_route`], with its own peer policy and way out.
+async fn taker_through(
+    directory: &TestDirectory,
+    maker: &NickIdentity,
+    location: Option<String>,
+    peers: PeerPolicy,
+    outbound: &Outbound,
+) -> (OnionChannel, OnionRoute) {
     let mut cfg = config(&[directory], "regtest");
-    cfg.peers = PeerPolicy::Local;
-    let mut taker = OnionChannel::connect(NickIdentity::generate(), cfg, &Outbound::Direct)
+    cfg.peers = peers;
+    let mut taker = OnionChannel::connect(NickIdentity::generate(), cfg, outbound)
         .await
         .unwrap();
     taker.listen(true, false).await.unwrap();
@@ -402,6 +420,52 @@ async fn without_a_direct_way_lines_go_by_the_directory() {
     );
 }
 
+#[tokio::test]
+async fn when_a_direct_connection_drops_the_lines_go_by_the_directory() {
+    let directory = TestDirectory::start("regtest", None).await;
+    let maker = NickIdentity::generate();
+    let peer = TestPeer::start("regtest", maker.nick(), true).await;
+    let (taker, route) = taker_with_route(&directory, &maker, Some(peer.location())).await;
+    taker
+        .prepare(&[(maker.nick().to_string(), route.clone())])
+        .await;
+    taker
+        .send_private(&route, maker.nick(), "fill", "0 50000 abc")
+        .await
+        .unwrap();
+    let fill = format!("{}!{}!fill ", taker.nick(), maker.nick());
+    assert!(
+        eventually(|| peer
+            .received()
+            .iter()
+            .any(|(kind, line)| *kind == PRIVMSG && line.starts_with(&fill)))
+        .await
+    );
+
+    // The maker hangs up in the middle of the round: the rest of it goes by the directory.
+    peer.hang_up();
+    assert!(eventually(|| taker.shared.link(maker.nick()).is_none()).await);
+    taker
+        .send_private(&route, maker.nick(), "auth", "abc")
+        .await
+        .unwrap();
+    assert!(
+        eventually(|| directory
+            .received()
+            .iter()
+            .any(|(from, kind, line)| from == taker.nick()
+                && *kind == PRIVMSG
+                && line.contains("!auth ")))
+        .await
+    );
+    assert!(
+        !directory
+            .received()
+            .iter()
+            .any(|(_, _, line)| line.contains("!fill "))
+    );
+}
+
 /// A maker that serves on loopback, connected to `directory`.
 async fn serving_maker(directory: &TestDirectory, identity: NickIdentity) -> OnionChannel {
     let mut cfg = config(&[directory], "regtest");
@@ -450,6 +514,91 @@ async fn a_serving_maker_is_reached_directly_both_ways() {
         (identity.nick(), "pubkey")
     );
     // The directory saw neither.
+    assert!(
+        !directory
+            .received()
+            .iter()
+            .any(|(_, _, line)| line.contains("!fill ") || line.contains("!pubkey "))
+    );
+}
+
+#[tokio::test]
+async fn a_maker_serving_a_configured_onion_is_reached_through_the_proxy() {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use vortex_ng_channel::testing::AuthSocks;
+
+    let directory = TestDirectory::start("regtest", None).await;
+    let identity = NickIdentity::generate();
+    let host = format!("{}.onion", "c".repeat(56));
+    let free = || {
+        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    // Only a v3 onion name and a real port will do.
+    for (name, port) in [("example.com".to_string(), free()), (host.clone(), 0)] {
+        let mut cfg = config(&[&directory], "regtest");
+        cfg.serve = Serve::Onion { host: name, port };
+        assert!(matches!(
+            OnionChannel::connect(identity.clone(), cfg, &Outbound::Direct).await,
+            Err(ChannelError::Invalid(_))
+        ));
+    }
+    let port = free();
+    let mut cfg = config(&[&directory], "regtest");
+    cfg.serve = Serve::Onion {
+        host: host.clone(),
+        port,
+    };
+    let mut maker = OnionChannel::connect(identity.clone(), cfg, &Outbound::Direct)
+        .await
+        .unwrap();
+    maker.listen(false, true).await.unwrap();
+    let location = format!("{host}:{port}");
+    assert_eq!(maker.location(), Some(location.as_str()));
+
+    // The taker reaches the maker by its onion name, through the proxy, as through Tor.
+    let proxy =
+        AuthSocks::start_with_onions(HashMap::from([(host.clone(), Ipv4Addr::LOCALHOST.into())]))
+            .await
+            .unwrap();
+    let (mut taker, route) = taker_through(
+        &directory,
+        &identity,
+        Some(location.clone()),
+        PeerPolicy::Onion,
+        &Outbound::IsolatingProxy(proxy.addr()),
+    )
+    .await;
+    settled(&[&directory], 2).await;
+    taker
+        .prepare(&[(identity.nick().to_string(), route.clone())])
+        .await;
+    assert!(eventually(|| maker.direct() == 1 && taker.direct() == 1).await);
+    assert!(proxy.seen().iter().any(|(_, to)| *to == location));
+
+    taker
+        .send_private(&route, identity.nick(), "fill", "0 50000 abc")
+        .await
+        .unwrap();
+    let Next::Message(Incoming::Private { msg, route: back }) = maker.receive(WAIT).await else {
+        panic!("the fill")
+    };
+    assert_eq!(
+        (msg.from.as_str(), msg.command.as_str()),
+        (taker.nick(), "fill")
+    );
+    maker
+        .send_private(&back, taker.nick(), "pubkey", &"ab".repeat(32))
+        .await
+        .unwrap();
+    let Next::Message(Incoming::Private { msg, .. }) = taker.receive(WAIT).await else {
+        panic!("the answer")
+    };
+    assert_eq!(
+        (msg.from.as_str(), msg.command.as_str()),
+        (identity.nick(), "pubkey")
+    );
     assert!(
         !directory
             .received()

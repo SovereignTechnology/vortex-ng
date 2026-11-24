@@ -47,7 +47,9 @@ only as trustworthy as the directory or server that forwarded the line.
    - A maker keeps one nick on every channel, as JoinMarket does. A session belongs to the channel its
      `!fill` arrived on; that nick's lines on other channels are ignored while the session lives.
    - A taker uses a different nick on each channel, so a maker never has to choose which channel to answer on,
-     and the taker's channels cannot be linked through its nick.
+     and the taker's channels cannot be linked through its nick. Within one round they can be linked anyway:
+     every maker in it gets the same commitment and encryption key, and in the end the same transaction
+     (issue #52). Keeping a separate key per maker would not change that, as the transaction is the same.
    - A line is verified against the `hostid` of the channel it arrived on. Routes are learned only from
      verified private lines, never from unsigned public ones. The strict nick check is used everywhere.
 3. **No legacy channel is switched on before the maker and taker tolerate stray lines.** A line that verifies
@@ -55,9 +57,19 @@ only as trustworthy as the directory or server that forwarded the line.
    end the round. On channels without sender authentication, a received `!error` is logged, not acted on.
 4. **Tor.** The legacy channels reach `.onion` hosts through a Tor daemon's SOCKS port (`--proxy`), each nick
    under its own SOCKS credentials, since the in-process Tor client is built without onion support. Whether
-   arti's onion support can replace the daemon is investigated separately (issue #49). The first version
-   advertises `NOT-SERVING-ONION` and relies on directory relay; the taker's direct connections to maker onions
-   and the maker's own hidden service (the project's first inbound listener) follow as separate steps.
+   arti's onion support can replace the daemon was investigated in issue #49: not yet (addendum below). A
+   taker connects directly to the makers it chose that serve an onion, each connection on a circuit of its
+   own, and falls back
+   to directory relay for a maker it cannot reach or whose connection drops (issue #45). A maker can serve
+   an onion of its own, the project's first inbound listener (issue #46): published through Tor's control
+   port with `SAFECOOKIE` authentication, or one the operator's Tor already forwards to it. Takers of both
+   reference implementations reach such a maker directly on regtest. While a maker's session waits for
+   `!auth`, its answers follow the taker's latest line, and a repeated `!fill` is answered again with the same
+   `!pubkey` (a few times at most), so a copy handed over by someone who saw it does not keep the taker from
+   its answer. From `!auth` on, the session moves to another route only with a step encrypted for it, which
+   only the taker can write. `vortex-ng maker --serve-onion` serves an onion the
+   operator's Tor forwards; publishing one through the control port is not offered by the commands until it
+   has been tried against a real Tor daemon (issue #52).
 5. **IRC's signature domain** comes from the server. vortex-ng takes it once per connection, checks its length
    and characters, compares it with the value configured for that server, and freezes it; a channel whose
    domain could be confused with another active channel's does not start. TLS certificates are checked for
@@ -69,6 +81,11 @@ only as trustworthy as the directory or server that forwarded the line.
 7. **Live networks.** All of this is built and tested on regtest in throwaway VMs, against
    joinmarket-clientserver v0.9.12, JoinMarket-NG and a local IRC server. The public directory nodes, the public
    IRC servers, signet and mainnet are used only on the owner's explicit go. Mainnet wallets stay refused.
+8. **Choosing channels.** `orderbook`, `maker` and `coinjoin` take `--relays`, `--directories` and `--irc` side
+   by side and need at least one; none is on by default. `--directories` and `--irc` are refused on every
+   network but regtest in this pre-release. Outside regtest they also need `--proxy`, a rule the commands
+   already check, so it stands when the regtest limit is lifted. `orderbook` shows the channel each offer came
+   from. The command help and the README state the table below.
 
 ## Consequences
 
@@ -78,7 +95,7 @@ What each channel shows, and to whom:
 |---|---|---|
 | Nostr (ADR 0002) | the recipient's key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
 | onion directories, relayed (`NOT-SERVING-ONION`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are in clear text | public offers, `!orderbook`, `!hp2`; a nick's presence |
-| onion directories, direct connections | that two nicks are in contact, not what they say | the same |
+| onion directories, a taker connected directly | that two nicks are in contact (the maker's offer to the taker), none of the rest of their round, except a `!fill` the taker sends through the directories before it connects, as some do, with the maker's `!pubkey`, and the answers of a maker that replies through the directories anyway, as some do, `!pubkey` in clear text | the same |
 | IRC | everything a directory sees, plus the server's own logs | the same as on onion |
 
 - A maker's single nick, and the nick key's public key that every private line carries, link its presence on
@@ -89,3 +106,27 @@ What each channel shows, and to whom:
 - The Nostr channel draft's rule that a nick key is used nowhere else now reads: nowhere outside JoinMarket's
   message channels; a maker may use its nick on other JoinMarket channels, a taker should use a different
   nick on each.
+
+## Addendum: in-process Tor for onions (issue #49, 2026-11-24)
+
+Investigated on arti 0.47, our pin, by building the workspace in a throwaway VM with arti-client's
+`onion-service-client`, `onion-service-service` and `vanguards` features added to the opt-in `tor` feature, and
+running `cargo deny` on the result.
+
+- **Connecting to onions** (`onion-service-client`, a stable feature) builds and adds one crate, `tor-hsclient`
+  (MIT or Apache-2.0). `cargo deny` finds nothing new, and arti accepts onion addresses by default.
+- **Hosting an onion** (`onion-service-service`, also stable) builds and adds five more: `tor-hsservice`,
+  `growable-bloom-filter`, `k12`, `serde_bytes` and `xxhash-rust`. The last is under the Boost licence
+  (BSL-1.0), which `deny.toml` does not allow yet. Two of its properties matter for a maker. The proof-of-work
+  defence against floods of introduction requests (`hs-pow-full`) is behind arti's `experimental` flag and links
+  LGPL code. And a service's keys go to arti's keystore on disk unless the experimental ephemeral keystore is
+  used. C Tor has had that defence since 0.4.8, and `ADD_ONION` gives a service whose keys are never written.
+- **Long-lived connections.** A failed circuit ends the streams on it; the onion channel already treats that
+  as a dropped connection and reconnects to each directory with back-off (5 seconds, doubling to 10 minutes).
+  What has not been tried is arti reaching an onion directory at all: that needs a Tor network, either the live
+  one (decision 7: the owner's call) or a private test network in a VM, which needs C Tor's relays.
+
+Decision: keep the Tor daemon, for both directions, for now. Connecting through arti is the next step when it is
+wanted: `onion-service-client` in the `tor` feature, so the legacy channels can reach `.onion` hosts without a
+daemon, once there is a Tor network to test it on. A maker's onion stays with the operator's Tor
+(`--serve-onion`, or later the control port) until arti's proof-of-work defence leaves `experimental`.

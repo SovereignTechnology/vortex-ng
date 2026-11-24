@@ -25,6 +25,7 @@ use vortex_ng_node::{
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_nostr::socks::Outbound;
+use vortex_ng_onion::wire::is_v3_onion;
 use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy, Serve};
 use vortex_ng_taker::{
     Coin, DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, TakerError, choose_coins, podle_for,
@@ -35,6 +36,7 @@ use vortex_ng_wallet::{MIXDEPTHS, PitWallet};
 use crate::args::Args;
 use crate::issued::IssuedLog;
 use crate::podle_log::PodleLog;
+use crate::seen_log::SeenLog;
 use crate::wallet::{failed, network_name, parse};
 use crate::{Failure, lightning, secret, wallet};
 
@@ -123,7 +125,7 @@ fn meeting(args: &Args) -> Result<Meeting, Failure> {
                 Some(list) if !list.is_empty() && list.len() <= MAX_IRC => list,
                 _ => {
                     return Err(usage(
-                        "`--irc` is one to four host:port, separated by commas",
+                        "`--irc` is one to four host:port (or irc://, ircs://), separated by commas",
                     ));
                 }
             }
@@ -142,15 +144,19 @@ fn meeting(args: &Args) -> Result<Meeting, Failure> {
 }
 
 impl Meeting {
-    /// The onion directories are for regtest only in this pre-release (ADR 0007): nothing here has been
-    /// tried on a live network.
-    fn allowed_on(&self, network: Network) -> Result<(), Failure> {
-        if (!self.directories.is_empty() || !self.irc.is_empty()) && network != Network::Regtest {
-            return Err(failed(
-                "JoinMarket's onion directories and IRC are enabled on regtest only in this pre-release",
-            ));
+    /// JoinMarket's onion directories and IRC are for regtest only in this pre-release (ADR 0007): nothing
+    /// here has been tried on a live network. Outside regtest they also need a proxy; that is checked first,
+    /// so the rule is already in force on the day the regtest limit goes.
+    fn allowed_on(&self, network: Network, proxied: bool) -> Result<(), Failure> {
+        if (self.directories.is_empty() && self.irc.is_empty()) || network == Network::Regtest {
+            return Ok(());
         }
-        Ok(())
+        Err(failed(if proxied {
+            "JoinMarket's onion directories and IRC are enabled on regtest only in this pre-release"
+        } else {
+            "outside regtest JoinMarket's onion directories and IRC need `--proxy <address>` (a Tor \
+             daemon's SOCKS port), and in this pre-release they are enabled on regtest only"
+        }))
     }
 }
 
@@ -204,7 +210,7 @@ fn open_pit_wallet(
     Ok((pit_wallet, issued))
 }
 
-/// How the command's nicks reach the relays: through `--proxy` when given, each nick under SOCKS
+/// How the command's nicks reach their channels: through `--proxy` when given, each nick under SOCKS
 /// credentials of its own; directly otherwise, which is said aloud.
 fn outbound(args: &Args) -> Result<Outbound, Failure> {
     match args.get("proxy") {
@@ -216,8 +222,8 @@ fn outbound(args: &Args) -> Result<Outbound, Failure> {
         }
         None => {
             eprintln!(
-                "vortex-ng: connecting to the relays directly: they see this machine's address. Give \
-                 `--proxy <address>` (a Tor daemon's SOCKS port) to hide it."
+                "vortex-ng: connecting directly: every relay, directory node and IRC server named sees \
+                 this machine's address. Give `--proxy <address>` (a Tor daemon's SOCKS port) to hide it."
             );
             Ok(Outbound::Direct)
         }
@@ -231,6 +237,34 @@ fn fee_text(offer: &Offer) -> String {
     }
 }
 
+/// `--serve-onion <name>.onion:<port>`: an onion service the operator's Tor already forwards to
+/// `127.0.0.1:<port>`. Only a maker serves, and only with directories, which tell takers where it is.
+fn serve(args: &Args, meeting: &Meeting) -> Result<Serve, Failure> {
+    let Some(given) = args.get("serve-onion") else {
+        return Ok(Serve::None);
+    };
+    let wrong = || {
+        usage(
+            "`--serve-onion` is <name>.onion:<port>, a v3 onion service your Tor daemon forwards to \
+             127.0.0.1:<port>",
+        )
+    };
+    let (host, port) = given.rsplit_once(':').ok_or_else(wrong)?;
+    let port: u16 = port.parse().map_err(|_| wrong())?;
+    if !is_v3_onion(host) || port == 0 {
+        return Err(wrong());
+    }
+    if meeting.directories.is_empty() {
+        return Err(usage(
+            "`--serve-onion` needs `--directories`: takers learn a maker's onion from the directory nodes",
+        ));
+    }
+    Ok(Serve::Onion {
+        host: host.to_string(),
+        port,
+    })
+}
+
 /// Who the channels speak for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -240,13 +274,14 @@ enum Role {
     Taker,
 }
 
-/// The command's channels, as one set: Nostr relays and onion directory nodes, as given.
-/// The channels a command uses, and a label for each, in the set's order (what `channel_of` indexes).
+/// The channels a command uses, as one set, and a label for each, in the set's order (what `channel_of`
+/// indexes). `serve` is what the onion channel serves; a taker's is `Serve::None`.
 async fn channels(
     network: &str,
     meeting: &Meeting,
     outbound: &Outbound,
     role: Role,
+    serve: Serve,
 ) -> Result<(ChannelSet, Vec<String>), Failure> {
     let maker = NickIdentity::generate();
     let identity = || match role {
@@ -276,10 +311,11 @@ async fn channels(
             } else {
                 PeerPolicy::Onion
             },
-            // Not yet: serving needs an onion published through Tor's control port, which the commands do not
-            // take yet. A loopback location is only for joinmarket-clientserver's regtest testing mode:
-            // JoinMarket-NG's directories refuse a location that is not a v3 onion.
-            serve: Serve::None,
+            // A maker serves the onion `--serve-onion` names, which the operator's Tor forwards to a loopback
+            // port. Publishing one through Tor's control port is not offered yet. A loopback location is only
+            // for joinmarket-clientserver's regtest testing mode: JoinMarket-NG's directories refuse a
+            // location that is not a v3 onion.
+            serve,
         };
         let onion = OnionChannel::connect(identity(), config, outbound)
             .await
@@ -319,7 +355,7 @@ async fn channels(
     Ok((ChannelSet::new(set).map_err(failed)?, labels))
 }
 
-/// `vortex-ng orderbook`: ask the makers on the relays what they offer.
+/// `vortex-ng orderbook`: ask the makers on the chosen channels what they offer.
 pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let mut valued = vec![
         "network",
@@ -334,7 +370,7 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let args = parse(rest, &valued, &[])?;
     let network = wallet::network(&args)?;
     let meeting = meeting(&args)?;
-    meeting.allowed_on(network)?;
+    meeting.allowed_on(network, args.get("proxy").is_some())?;
     let only = match args.get("pit") {
         Some(_) => Some(wallet::pit(&args)?.0),
         None => None,
@@ -348,8 +384,12 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let (us, seen_on, book) = runtime()?.block_on(async {
-        let (mut client, labels) = channels(channel, &meeting, &outbound, Role::Taker).await?;
-        let usable = |offer: &Offer| only.is_none_or(|pit| offer.offer_type.pit == pit);
+        let (mut client, labels) =
+            channels(channel, &meeting, &outbound, Role::Taker, Serve::None).await?;
+        let usable = |offer: &Offer| {
+            only.is_none_or(|pit| offer.offer_type.pit == pit)
+                .then_some(0)
+        };
         let gather = Duration::from_secs(wait.into());
         let book = fetch_orderbook_for(&mut client, channel, gather, usable)
             .await
@@ -461,10 +501,12 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         "max-size",
         "upkeep",
         "proxy",
+        "serve-onion",
     ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
     let meeting = meeting(&args)?;
+    let serve = serve(&args, &meeting)?;
     let (pit, pit_name) = wallet::pit(&args)?;
     let fee = match (
         args.get("fee-rel"),
@@ -506,10 +548,15 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
 
     let file = wallet::open(&args)?;
     let network = file.network();
-    meeting.allowed_on(network)?;
+    meeting.allowed_on(network, args.get("proxy").is_some())?;
     let chain = node(&args, network)?;
     let (pit_wallet, _) = open_pit_wallet(&args, &file, pit, pit_name)?;
     let mut maker = Maker::new(MakerConfig::new(Vec::new()), pit_wallet).map_err(failed)?;
+    // The commitments seen used in earlier runs are still refused (`<wallet>.commitments`).
+    let wallet_path = Path::new(args.required("wallet").map_err(Failure::Usage)?);
+    let (log, remembered) = SeenLog::open(wallet_path).map_err(failed)?;
+    maker.keep_commitments(remembered, Box::new(log));
+    let (verified, announced) = maker.remembered_commitments();
     let service = MakerService {
         policy,
         birthday: file.birthday(),
@@ -518,13 +565,27 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     runtime()?.block_on(async {
-        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Maker).await?;
+        let serving = match &serve {
+            Serve::Onion { host, port } => Some(format!(
+                "serving {host}:{port} on 127.0.0.1:{port}, for takers to connect to directly"
+            )),
+            _ => None,
+        };
+        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Maker, serve).await?;
         println!(
             "maker {} in the {pit_name} pit on {}, {}",
             client.nick(),
             network_name(network),
             meeting.describe()
         );
+        if let Some(serving) = serving {
+            println!("{serving}");
+        }
+        if verified + announced > 0 {
+            println!(
+                "remembering {verified} commitment(s) it verified and {announced} announced, from earlier runs"
+            );
+        }
         let mut report = |report: MakerReport| match report {
             MakerReport::Offering {
                 height,
@@ -759,6 +820,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         "pit",
         "amount",
         "makers",
+        "min-makers",
         "mixdepth",
         "destination",
         "fee-rate",
@@ -808,6 +870,10 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         _ => return Err(usage("`--amount <sats>` is required")),
     };
     let makers = args.number("makers", 3, 1..=20).map_err(Failure::Usage)? as usize;
+    // Off by default: going on with fewer makers than asked for is a smaller anonymity set.
+    let min_makers = args
+        .number("min-makers", makers as u32, 1..=makers as u32)
+        .map_err(Failure::Usage)? as usize;
     let mixdepth = args
         .number("mixdepth", 0, 0..=MIXDEPTHS - 1)
         .map_err(Failure::Usage)?;
@@ -831,7 +897,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let wallet_path = Path::new(args.required("wallet").map_err(Failure::Usage)?);
     let file = wallet::open(&args)?;
     let network = file.network();
-    meeting.allowed_on(network)?;
+    meeting.allowed_on(network, args.get("proxy").is_some())?;
     let chain = node(&args, network)?;
     let (mut pit_wallet, mut issued) = open_pit_wallet(&args, &file, pit, pit_name)?;
     let height = pit_wallet.sync(&chain, file.birthday()).map_err(failed)?;
@@ -948,6 +1014,11 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
             "may charge a fee"
         }
     );
+    if min_makers < makers {
+        println!(
+            "If makers fail, the round goes on with as few as {min_makers}: a smaller anonymity set."
+        );
+    }
     if !args.flag("yes") && !secret::confirm("Proceed?").map_err(failed)? {
         return Err(failed("not confirmed: nothing was sent"));
     }
@@ -980,11 +1051,13 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         cj_script,
         change.clone(),
     )
+    .and_then(|taker| taker.allow_fewer_makers(min_makers))
     .map_err(taker_failed)?;
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let tx = runtime()?.block_on(async {
-        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Taker).await?;
+        let (mut client, _) =
+            channels(channel, &meeting, &outbound, Role::Taker, Serve::None).await?;
         let gather = Duration::from_secs(wait.into());
         let round = run_taker(
             &mut taker,
@@ -1026,6 +1099,12 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         .map(|out| out.value.to_sat())
         .sum();
     println!("Broadcast {txid}");
+    if taker.makers_in_round() < makers {
+        println!(
+            "{} of the {makers} makers asked for took part.",
+            taker.makers_in_round()
+        );
+    }
     println!(
         "{amount} sat to {to}; {} sat in maker and mining fees; {kept} sat change.",
         total.saturating_sub(amount).saturating_sub(kept)

@@ -77,6 +77,9 @@ aes-gcm-siv = { version = "=0.11.1", default-features = false, features = ["aes"
 # Tor in-process (feature `tor` of vortex-ng-nostr). 0.47.0 (2026-10-01): newest release at least 7 days old.
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
 tor-rtcompat = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
+# TLS to IRC servers: the versions nostr-sdk's websockets already bring in, on ring, so no new crate.
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "=1.0.11"
 # Descriptor wallets (rust-bitcoin 0.32) with BIP39 seeds; synced from our own chain backend.
 bdk_wallet = { version = "3.2.0", default-features = false, features = ["std", "keys-bip39"] }
 

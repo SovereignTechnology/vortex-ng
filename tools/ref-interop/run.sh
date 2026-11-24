@@ -14,13 +14,21 @@
 # directory node is one of its bots that never offers anything; vortex-ng meets it there, with `testnet` in the
 # handshake. With CHANNEL=irc everyone meets in #joinmarket-pit-test on a local IRC server: IRCD=miniircd (the
 # default; the reference's own test server, which announces no NETWORK, so the signature domain is host and
-# port) or IRCD=ngircd (Debian's, announcing NETWORK=VortexRefTest).
+# port) or IRCD=ngircd (Debian's, announcing NETWORK=VortexRefTest). With IRCD=ngircd TLS=1, vortex-ng connects
+# to the server's TLS port, checking a certificate from a throwaway authority, and the reference stays on the
+# plain port of the same server. With CHANNEL=both every maker and taker is on the directory and the IRC server
+# at once: a maker with one nick on both, and vortex-ng's taker with a nick of its own on each.
 #
 # Two rounds:
 #   A. two reference makers (YieldGeneratorBasic, sw0reloffer) and a vortex-ng taker, which does a sw0 round
-#      with them and checks it on the node (crates/vortex-ng-node/tests/jmng_interop.rs, role taker);
+#      with them and checks it on the node (crates/vortex-ng-node/tests/jmng_interop.rs, role taker); then a
+#      vortex-ng maker announces a commitment, and both reference makers must refuse it. With CHANNEL=onion
+#      the taker must reach both makers directly: the directory's log must show it relayed none of the
+#      taker's `!fill`, `!auth`, `!tx`;
 #   B. two vortex-ng makers and the reference's taker, which does a round with them and asks them to broadcast
 #      it (`!push`, tx_broadcast = not-self); vortex-ng then checks the transaction and its makers' wallets.
+#      Our makers serve on loopback; with CHANNEL=onion the directory may carry only the taker's first line to
+#      each (`!fill`, which is when the reference connects) and the `!pubkey` answering it, none of the rest.
 # Fidelity bonds are not used yet (BONDS=0 on the vortex-ng side).
 set -euo pipefail
 
@@ -38,12 +46,19 @@ CHANNEL=${CHANNEL:-onion}
 IRCD=${IRCD:-miniircd}
 DIRECTORY_PORT=18081
 IRC_PORT=16667
+IRC_TLS_PORT=16697
+TLS=${TLS:-0}
 IRC_NETWORK=VortexRefTest
 AMOUNT=1000000  # crates/vortex-ng-node/tests/jmng_interop.rs AMOUNT
-case "$CHANNEL" in onion|irc) ;; *) echo "CHANNEL=$CHANNEL: onion or irc" >&2; exit 97 ;; esac
+case "$CHANNEL" in onion|irc|both) ;; *) echo "CHANNEL=$CHANNEL: onion, irc or both" >&2; exit 97 ;; esac
 case "$IRCD" in miniircd|ngircd) ;; *) echo "IRCD=$IRCD: miniircd or ngircd" >&2; exit 97 ;; esac
 label=$CHANNEL
 [ "$CHANNEL" = irc ] && label="irc, $IRCD"
+[ "$CHANNEL" = both ] && label="onion + irc, $IRCD"
+if [ "$TLS" = 1 ]; then
+  { [ "$CHANNEL" = irc ] && [ "$IRCD" = ngircd ]; } || { echo "TLS=1 needs CHANNEL=irc IRCD=ngircd" >&2; exit 97; }
+  label="$label, TLS"
+fi
 
 here=$(cd "$(dirname "$0")" && pwd)
 tree=$(cd "$here/../.." && pwd)
@@ -69,7 +84,8 @@ fetch() {  # url, sha256, destination
 export DEBIAN_FRONTEND=noninteractive
 packages=(python3 python3-venv python3-dev build-essential autoconf automake libtool pkg-config libffi-dev
   libssl-dev libsodium23 git curl ca-certificates)
-[ "$CHANNEL" = irc ] && [ "$IRCD" = ngircd ] && packages+=(ngircd)
+[ "$CHANNEL" != onion ] && [ "$IRCD" = ngircd ] && packages+=(ngircd)
+[ "$TLS" = 1 ] && packages+=(openssl)
 apt-get update -qq >/dev/null
 apt-get install -y -qq --no-install-recommends "${packages[@]}" >/dev/null 2>&1
 
@@ -118,9 +134,10 @@ echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcou
 bot_pid=
 start_bot() {
   local role=$1 name=$2 index=$3; shift 3
-  local seed
+  local seed channel=$CHANNEL
+  [ "$role" = directory ] && channel=onion  # a directory node is on the onion channel only
   seed=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  env "$@" REF_RPC_PORT="$PORT" REF_COOKIE="$cookie" REF_WALLET="jm-$name" REF_MINE_TO="$funder" REF_SEED="$seed" REF_CHANNEL="$CHANNEL" \
+  env "$@" REF_RPC_PORT="$PORT" REF_COOKIE="$cookie" REF_WALLET="jm-$name" REF_MINE_TO="$funder" REF_SEED="$seed" REF_CHANNEL="$channel" \
     REF_DIRECTORY="127.0.0.1:$DIRECTORY_PORT" REF_SERVE_PORT=$((DIRECTORY_PORT + index)) REF_INDEX="$index" \
     REF_IRC="127.0.0.1:$IRC_PORT" \
     python3 "$here/ref_bot.py" "$role" "$name" "$work/bots/$name" "$work/bots" >"$logs/$name.log" 2>&1 &
@@ -141,7 +158,7 @@ fund_bot() {
 
 # Where everyone meets.
 meet_env=()
-if [ "$CHANNEL" = onion ]; then
+if [ "$CHANNEL" != irc ]; then
   start_bot directory directory 0
   for _ in $(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null && break; sleep 1; done
   (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null || { show "$logs/directory.log" 40; exit 26; }
@@ -149,7 +166,8 @@ if [ "$CHANNEL" = onion ]; then
   # Our makers serve on loopback, as the reference's do in its testing mode, so its taker connects directly.
   meet_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" VORTEX_NG_INTEROP_ONION_NETWORK=testnet
     VORTEX_NG_INTEROP_SERVE=loopback)
-else
+fi
+if [ "$CHANNEL" != onion ]; then
   if [ "$IRCD" = ngircd ]; then
     cat >"$work/ngircd.conf" <<EOF
 [Global]
@@ -162,24 +180,54 @@ ServerUID = 65534
 ServerGID = 65534
 [Limits]
 MaxNickLength = 30
+# Every client of this run is on loopback, and the commitment check alone adds several (default 5).
+MaxConnectionsIP = 0
 [Options]
 PAM = no
 Ident = no
 DNS = no
 EOF
+    meet_env+=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT" "VORTEX_NG_INTEROP_IRC_NETWORK=$IRC_NETWORK")
+    if [ "$TLS" = 1 ]; then
+      # A throwaway authority and a certificate for 127.0.0.1, which only this run trusts.
+      mkdir -p "$work/tls"
+      openssl ecparam -genkey -name prime256v1 -noout -out "$work/tls/ca.key" 2>/dev/null
+      openssl req -x509 -new -key "$work/tls/ca.key" -days 2 -subj "/CN=vortex-ng interop CA" \
+        -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" -out "$work/tls/ca.pem"
+      openssl x509 -in "$work/tls/ca.pem" -outform DER -out "$work/tls/ca.der"
+      openssl ecparam -genkey -name prime256v1 -noout -out "$work/tls/server.ec" 2>/dev/null
+      openssl pkcs8 -topk8 -nocrypt -in "$work/tls/server.ec" -out "$work/tls/server.key"
+      openssl req -new -key "$work/tls/server.key" -subj "/CN=127.0.0.1" -out "$work/tls/server.csr"
+      printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n' >"$work/tls/ext"
+      openssl x509 -req -in "$work/tls/server.csr" -CA "$work/tls/ca.pem" -CAkey "$work/tls/ca.key" -CAcreateserial \
+        -days 2 -extfile "$work/tls/ext" -out "$work/tls/server.pem" 2>/dev/null
+      rm -f "$work/tls/ca.key"
+      chmod 755 "$work/tls" && chmod 644 "$work/tls/server.key" "$work/tls/server.pem"
+      cat >>"$work/ngircd.conf" <<EOF
+[SSL]
+CertFile = $work/tls/server.pem
+KeyFile = $work/tls/server.key
+Ports = $IRC_TLS_PORT
+EOF
+      meet_env=("VORTEX_NG_INTEROP_IRC=ircs://127.0.0.1:$IRC_TLS_PORT" "VORTEX_NG_INTEROP_IRC_NETWORK=$IRC_NETWORK"
+        "VORTEX_NG_INTEROP_IRC_CA=$work/tls/ca.der")
+    fi
     ngircd -n -f "$work/ngircd.conf" >"$logs/ircd.log" 2>&1 &
-    meet_env=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT" "VORTEX_NG_INTEROP_IRC_NETWORK=$IRC_NETWORK")
   else
     fetch https://github.com/JoinMarket-Org/miniircd/archive/master.tar.gz "$MINIIRCD_SHA256" "$work/miniircd.tar.gz"
     mkdir -p "$work/miniircd"
     tar -xzf "$work/miniircd.tar.gz" -C "$work/miniircd" --strip-components=1
     # It refuses to run as root without dropping to another account after binding.
     python3 "$work/miniircd/miniircd" --listen=127.0.0.1 --ports="$IRC_PORT" --setuid=nobody >"$logs/ircd.log" 2>&1 &
-    meet_env=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT")
+    meet_env+=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT")
   fi
   pids+=($!)
   for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/$IRC_PORT) 2>/dev/null && break; sleep 1; done
   (exec 3<>/dev/tcp/127.0.0.1/$IRC_PORT) 2>/dev/null || { show "$logs/ircd.log" 30; exit 26; }
+  if [ "$TLS" = 1 ]; then
+    for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/$IRC_TLS_PORT) 2>/dev/null && break; sleep 1; done
+    (exec 3<>/dev/tcp/127.0.0.1/$IRC_TLS_PORT) 2>/dev/null || { show "$logs/ircd.log" 30; exit 26; }
+  fi
   echo "$IRCD on 127.0.0.1:$IRC_PORT"
 fi
 
@@ -195,7 +243,7 @@ start_vortex() {  # $1 = role, $2 = its directory
   for _ in $(seq 1 600); do [ -s "$2/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
   [ -s "$2/relay.url" ] || { echo "vortex-ng ($1) did not get ready"; show "$logs/vortex-$1.log" 40; return 1; }
 }
-report() { grep -E 'IRC server at|directory at|IRC signature domain|answered on the|maker .* nick|taker nick|CoinJoin .* confirmed|panicked|failed|test result' "$1" | cut -c1-400 || true; }
+report() { grep -E 'IRC server at|directory at|IRC signature domain|answered on the|maker .* nick|taker nick|CoinJoin .* confirmed|Commitment announced|answered !error|panicked|failed|test result' "$1" | cut -c1-400 || true; }
 bot_report() {  # what a reference bot said that matters
   grep -E -i 'offerlist=|txid|hp2|rejected|refus|invalid|Traceback|Error|giving up|Signature|Handshake|connect-in' "$logs/$1.log" \
     | grep -v -E 'DEBUG.*(tick|sync)' | tail -n "$2" | cut -c1-300 || true
@@ -227,6 +275,18 @@ if [ "$rc_a" -ne 0 ]; then
   for n in 1 2; do show "$logs/maker$n.log" 60; done
 else
   echo "txid $(cat "$work/a/taker.txid") at height $(cli getblockcount)"
+  if [ "$CHANNEL" = onion ]; then
+    # The directory logs every line it is handed; the round's lines went over direct connections instead.
+    taker=$(sed -n 's/^taker nick \(J[0-9A-Za-z]*\)$/\1/p' "$logs/vortex-taker.log" | head -1)
+    to=$(grep -c -E "\"line\": \"$taker![0-9A-Za-z]+!(fill|auth|tx) " "$logs/directory.log" || true)
+    from=$(grep -c -E "\"line\": \"J[0-9A-Za-z]+!$taker!(pubkey|ioauth|sig) " "$logs/directory.log" || true)
+    echo "the directory relayed $to of the taker's !fill/!auth/!tx and $from of the makers' !pubkey/!ioauth/!sig"
+    if [ -n "$taker" ] && [ "$to" -eq 0 ]; then
+      echo "Direct connection: both reference makers reached directly"
+    else
+      echo "Direct connection: the taker's round lines went through the directory"; rc_a=28
+    fi
+  fi
 fi
 for p in "${maker_pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
 
@@ -265,12 +325,33 @@ if [ "$rc_b" -ne 0 ]; then
   show "$logs/vortex-makers.log" 30
 else
   echo "txid $txid at height $(cli getblockcount)"
+  if [ "$CHANNEL" = onion ]; then
+    # The reference's taker sends its first line to a maker (`!fill`) by the directory and opens a connection
+    # to the maker as it does; the rest of the round must go over that connection, both ways.
+    makers=$(sed -n 's/^maker [0-9]* nick \(J[0-9A-Za-z]*\)$/\1/p' "$logs/vortex-makers.log" | paste -sd'|' -)
+    if [ -z "$makers" ]; then
+      echo "our makers' nicks are not in the log"; rc_b=27
+    else
+      fills=$(grep -c -E "\"line\": \"J[0-9A-Za-z]+!($makers)!fill " "$logs/directory.log" || true)
+      to=$(grep -c -E "\"line\": \"J[0-9A-Za-z]+!($makers)!(auth|tx) " "$logs/directory.log" || true)
+      pubkeys=$(grep -c -E "\"line\": \"($makers)!J[0-9A-Za-z]+!pubkey " "$logs/directory.log" || true)
+      from=$(grep -c -E "\"line\": \"($makers)!J[0-9A-Za-z]+!(ioauth|sig) " "$logs/directory.log" || true)
+      echo "the directory relayed the taker's $fills !fill and $to !auth/!tx to our makers," \
+        "and their $pubkeys !pubkey and $from !ioauth/!sig to it"
+      if [ "$to" -eq 0 ] && [ "$from" -eq 0 ]; then
+        echo "Direct connection: the reference taker reached both our makers directly after its !fill"
+      else
+        echo "Direct connection: the round's later lines went through the directory"; rc_b=28
+      fi
+    fi
+  fi
 fi
 
-if [ "$CHANNEL" = onion ]; then
+if [ "$CHANNEL" != irc ]; then
   echo "-- directory"; bot_report directory 10
   [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] || show "$logs/directory.log" 40
-else
+fi
+if [ "$CHANNEL" != onion ]; then
   [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] || show "$logs/ircd.log" 20
 fi
 [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] && { echo "== both directions passed"; exit 0; }

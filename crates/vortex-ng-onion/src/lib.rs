@@ -1,11 +1,11 @@
 //! JoinMarket's onion message channel: directory nodes, as joinmarket-clientserver (`jmdaemon/onionmc.py`)
 //! and JoinMarket-NG (`jmcore/directory_client.py`) speak it (ADR 0007).
 //!
-//! An [`OnionChannel`] is one nick connected to every configured directory node at once. It serves no onion
-//! of its own (`NOT-SERVING-ONION`), so a private line is relayed by a directory unless a direct connection
-//! carries it: the directory sees who talks to whom, when, and how much, and the plain-text steps of a round
-//! (`!fill`, `!pubkey`); the encrypted steps stay encrypted. Private lines are JMP-0001 lines signed with
-//! `hostid` `onion-network`; public lines are unsigned.
+//! An [`OnionChannel`] is one nick connected to every configured directory node at once. Unless it serves an
+//! onion of its own (below), it says `NOT-SERVING-ONION`, and a private line is relayed by a directory unless
+//! a direct connection carries it: the directory sees who talks to whom, when, and how much, and the
+//! plain-text steps of a round (`!fill`, `!pubkey`); the encrypted steps stay encrypted. Private lines are
+//! JMP-0001 lines signed with `hostid` `onion-network`; public lines are unsigned.
 //!
 //! Direct connections (a taker's, issue #45): directories tell where peers that serve an onion are (peer
 //! lists, which joinmarket-clientserver's directories send when they relay a line and JoinMarket-NG's on
@@ -18,19 +18,23 @@
 //!
 //! Serving (a maker's, issue #46, [`Serve`]): the channel listens on `127.0.0.1` and says where in its
 //! handshakes, so directories name it in peer lists and takers can connect to it. On regtest the loopback
-//! address itself is the location (as joinmarket-clientserver's testing mode does); otherwise it is published
-//! as an ephemeral onion through Tor's control port ([`control`]). An inbound peer gets 10 s to say a valid
+//! address itself can be the location (as joinmarket-clientserver's testing mode does); otherwise it is an
+//! onion: an ephemeral one published through Tor's control port ([`control`], `SAFECOOKIE`), or one the
+//! operator's Tor already forwards to a loopback port ([`Serve::Onion`], as JoinMarket-NG's
+//! `MAKER__ONION_HOST` does). An inbound peer gets 10 s to say a valid
 //! handshake and gets ours back (joinmarket-clientserver counts a peer as handshaked only once it has had
 //! the peer's handshake, whichever side connected), then may send private lines in its own nick only, at a
 //! bounded rate, and is dropped after 5 minutes of silence; at most 32 connections are open and 16 handshakes
 //! pending at once. The nick in a handshake proves nothing, so a connection is never chosen for a nick: an
 //! answer goes back on it only when the line being answered, signed by that nick, came in on it.
 //!
-//! That is not yet enough to serve in public, and the commands do not: a line's signature does not cover its
-//! recipient, so a maker chosen for a round can hand the taker's signed `!fill` to another maker over a
-//! connection of its own and take that session's place. Serving outside regtest needs a challenge the nick
-//! key answers, which JoinMarket's peers do not speak today. This is the project's only inbound listener
-//! (ADR 0007).
+//! A line's signature does not cover its recipient, so a maker chosen for a round can hand the taker's signed
+//! `!fill` to another maker over a connection of its own. The maker driver keeps that from taking the
+//! session away (`vortex-ng-node`, `maker_step`): the real taker's `!fill` is answered too, with the same
+//! `!pubkey`, and from `!auth` on the round follows only lines encrypted for the session, which only the
+//! taker can write. `vortex-ng maker --serve-onion` serves an onion the operator's Tor forwards; publishing
+//! one through the control port is not offered by the commands yet (issue #52). This is the project's only
+//! inbound listener (ADR 0007).
 //!
 //! Each directory has a task that connects (through the nick's own [`NickConnector`], so a Tor daemon gives
 //! this nick circuits of its own), does the handshake (and JoinMarket-NG's nick authentication, JMP-0005,
@@ -184,6 +188,14 @@ pub enum Serve {
     Loopback,
     /// On a loopback port published as an ephemeral onion through Tor's control port.
     Tor(control::TorControl),
+    /// As the onion `host` (`<56 characters>.onion`) that the operator's Tor already forwards to
+    /// `127.0.0.1:port` (`HiddenServicePort <port> 127.0.0.1:<port>`): listen there and say `host:port`.
+    Onion {
+        /// The onion name.
+        host: String,
+        /// The onion's port, and the loopback port it leads to.
+        port: u16,
+    },
 }
 
 /// Where a line came from.
@@ -617,6 +629,17 @@ impl OnionChannel {
         // Serving: a loopback listener, and where takers find it.
         let (listener, location, service) = match &config.serve {
             Serve::None => (None, None, None),
+            Serve::Onion { host, port } => {
+                if !wire::is_v3_onion(host) || *port == 0 {
+                    return Err(ChannelError::Invalid(
+                        "an onion to serve: a v3 name and a port",
+                    ));
+                }
+                let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *port))
+                    .await
+                    .map_err(transport)?;
+                (Some(listener), Some(format!("{host}:{port}")), None)
+            }
             serve => {
                 let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                     .await

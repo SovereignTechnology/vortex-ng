@@ -16,6 +16,7 @@
 # rounds, each on a relay run by vortex-ng's test crates/vortex-ng-node/tests/jmng_interop.rs:
 #   A. joinmarket-ng's two test makers (`jm-maker start`, Core's wallet backend, the relay as their only
 #      message channel) and a vortex-ng taker, which does a sw0 round with them and checks it on the node;
+#      then a vortex-ng maker announces a commitment, and both joinmarket-ng makers must refuse it;
 # PIT=sw0 (the default) or PIT=tr0 picks the pit both sides trade in; tr0 needs a joinmarket-ng checkout that
 # has the Taproot pit (its PR #643) under the Nostr channel.
 # With BONDS=1 (the default) every maker holds a fidelity bond and each taker runs joinmarket-ng's default
@@ -24,6 +25,15 @@
 #   B. two vortex-ng makers and joinmarket-ng's taker (jmng_taker.py, through joinmarket-ng's own API),
 #      which does a sw0 round with them and asks them to broadcast it (`!push`, never itself); vortex-ng
 #      then checks the transaction and its makers' wallets.
+# With CHANNEL=onion, round A's makers also serve, as makers do behind Tor: each says an onion name of its own
+# and listens on loopback. The vortex-ng taker reaches the directory through a test SOCKS proxy standing in for
+# Tor, which knows maker 1's onion is on this machine and refuses maker 2's. So the taker must reach maker 1
+# directly and fall back to the directory for maker 2. The directory's log (its privacy-sensitive lines on)
+# must show it relayed none of the taker's `!fill`, `!auth`, `!tx` to maker 1, and relayed maker 2's.
+# Round B's vortex-ng makers serve the same way (onion names of their own, loopback ports), and joinmarket-ng's
+# taker reaches them through the same kind of proxy, run by vortex-ng's test, which knows maker 1's onion and
+# refuses maker 2's. The directory must have relayed none of the taker's round lines to maker 1 and none of
+# maker 1's answers, and relayed maker 2's both ways.
 set -euo pipefail
 
 VORTEX_NG_REPO=https://github.com/SovereignTechnology/vortex-ng.git
@@ -58,6 +68,9 @@ MAKER_MNEMONICS=(
   "minute faint grape plate stock mercy tent world space opera apple rocket"
 )
 TAKER_MNEMONIC="burden notable love elephant orbit couch message galaxy elevator exile drop toilet"
+# With CHANNEL=onion: where round A's makers listen, and round B's (ours). Their onion names are made up below.
+MAKER_SERVE_PORTS=(15231 15232)
+OUR_SERVE_PORTS=(15241 15242)
 
 jmng=$(pwd)
 here=$(cd "$(dirname "$0")" && pwd)
@@ -135,39 +148,54 @@ done
 cli generatetoaddress 6 "$funder" >/dev/null
 echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcount); joinmarket-ng wallets funded"
 
-# With CHANNEL=onion: joinmarket-ng's directory server, for both rounds.
+# With CHANNEL=onion: joinmarket-ng's directory server, for both rounds. Its privacy-sensitive lines name
+# who it relays what to, which is what shows a direct connection carried a line instead.
 if [ "$CHANNEL" = onion ]; then
   HOME="$work/directory" NETWORK_CONFIG__NETWORK=regtest DIRECTORY_SERVER__HOST=127.0.0.1 \
     DIRECTORY_SERVER__PORT=$DIRECTORY_PORT DIRECTORY_SERVER__NICK_AUTH_DIRECTORY_ID=$DIRECTORY_ID \
-    LOGGING__LEVEL=DEBUG jm-directory-server >"$logs/directory.log" 2>&1 &
+    LOGGING__LEVEL=DEBUG LOGGING__SENSITIVE=true jm-directory-server >"$logs/directory.log" 2>&1 &
   pids+=($!)
   for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null && break; sleep 1; done
   (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null || { show "$logs/directory.log" 30; exit 26; }
   echo "joinmarket-ng's directory server on 127.0.0.1:$DIRECTORY_PORT ($DIRECTORY_ID)"
 fi
-# What tells vortex-ng's test to meet on the directory.
+# A v3 onion name, well formed (key, checksum, version) though no key behind it is anyone's.
+new_onion() {
+  python3 -I -c 'import base64, hashlib, os
+key = os.urandom(32)
+check = hashlib.sha3_256(b".onion checksum" + key + b"\x03").digest()[:2]
+print(base64.b32encode(key + check + b"\x03").decode().lower() + ".onion")'
+}
+# What tells vortex-ng's test to meet on the directory, and which onion is on this machine.
 onion_env=()
+maker_onions=()
+our_onions=()
 if [ "$CHANNEL" = onion ]; then
-  onion_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" "VORTEX_NG_INTEROP_DIRECTORY_ID=$DIRECTORY_ID")
+  maker_onions=("$(new_onion)" "$(new_onion)")
+  our_onions=("$(new_onion)" "$(new_onion)")
+  onion_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" "VORTEX_NG_INTEROP_DIRECTORY_ID=$DIRECTORY_ID"
+    "VORTEX_NG_INTEROP_ONIONS=${maker_onions[0]}")
 fi
 # Where joinmarket-ng's side meets ours: the relay vortex-ng's test runs, or the directory.
 meeting() { if [ "$CHANNEL" = onion ]; then echo "127.0.0.1:$DIRECTORY_PORT"; else echo "nostr:$1"; fi; }
 
 # The vortex-ng side of a round: the relay plus the taker or the makers. Prints the relay URL once it is up.
 vortex_pid=
-start_vortex() {  # $1 = role, $2 = its directory
-  (cd "$work/vortex-ng" && env "${onion_env[@]}" VORTEX_NG_INTEROP_ROLE="$1" VORTEX_NG_INTEROP_DIR="$2" VORTEX_NG_INTEROP_BONDS="$BONDS" \
+start_vortex() {  # $1 = role, $2 = its directory, then settings of its own (NAME=value) over onion_env's
+  local role=$1 dir=$2
+  shift 2
+  (cd "$work/vortex-ng" && env "${onion_env[@]}" "$@" VORTEX_NG_INTEROP_ROLE="$role" VORTEX_NG_INTEROP_DIR="$dir" VORTEX_NG_INTEROP_BONDS="$BONDS" \
     VORTEX_NG_INTEROP_PIT="$PIT" \
     VORTEX_NG_INTEROP_BOND_MNEMONICS="${MAKER_MNEMONICS[0]}|${MAKER_MNEMONICS[1]}" \
     VORTEX_NG_INTEROP_MAKERS=${#MAKER_MNEMONICS[@]} VORTEX_NG_REGTEST_RPC="http://127.0.0.1:$PORT" \
     VORTEX_NG_REGTEST_COOKIE="$cookie" \
-    cargo test --locked -p vortex-ng-node --test jmng_interop -- --nocapture >"$logs/vortex-$1.log" 2>&1) &
+    cargo test --locked -p vortex-ng-node --test jmng_interop -- --nocapture >"$logs/vortex-$role.log" 2>&1) &
   vortex_pid=$!
   pids+=("$vortex_pid")
-  for _ in $(seq 1 600); do [ -s "$2/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
-  [ -s "$2/relay.url" ] || { echo "vortex-ng ($1) did not start its relay"; show "$logs/vortex-$1.log" 40; return 1; }
+  for _ in $(seq 1 600); do [ -s "$dir/relay.url" ] && break; kill -0 "$vortex_pid" 2>/dev/null || break; sleep 1; done
+  [ -s "$dir/relay.url" ] || { echo "vortex-ng ($role) did not start its relay"; show "$logs/vortex-$role.log" 40; return 1; }
 }
-report() { grep -E 'relay at|directory at|answered on the directory|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
+report() { grep -E 'relay at|directory at|answered on the directory|maker .* (announced|nick)|taker nick|CoinJoin .* confirmed|Commitment announced|answered !error|panicked|failed|test result|refuses' "$1" | cut -c1-400 || true; }
 
 # ---- A: joinmarket-ng makers, vortex-ng taker ------------------------------------------------------------
 rc_a=0
@@ -187,7 +215,12 @@ if [ "$rc_a" -eq 0 ]; then
       bond_env=("MAKER__FIDELITY_BOND_LOCKTIMES=$BOND_LOCKTIME" FIDELITY_BOND_INDEX=0)
     fi
     if [ "$PIT" = tr0 ]; then bond_env+=(WALLET__ADDRESS_TYPE=p2tr); fi  # the pit switch; offers follow it
-    env "${bond_env[@]}" \
+    serve_env=()
+    if [ "$CHANNEL" = onion ]; then  # a static onion: no Tor control port, the listener on loopback
+      serve_env=("MAKER__ONION_HOST=${maker_onions[$((i - 1))]}" MAKER__ONION_SERVING_HOST=127.0.0.1
+        "MAKER__ONION_SERVING_PORT=${MAKER_SERVE_PORTS[$((i - 1))]}")
+    fi
+    env "${bond_env[@]}" "${serve_env[@]}" \
     HOME="$home" JOINMARKET_DATA_DIR="$home/.joinmarket-ng" MNEMONIC="$mnemonic" \
       NETWORK_CONFIG__NETWORK=regtest NETWORK_CONFIG__BITCOIN_NETWORK=regtest \
       NETWORK_CONFIG__ALLOW_CLEARNET_CONNECTIONS=true DIRECTORY_SERVERS="$(meeting "$relay")" \
@@ -226,16 +259,49 @@ else
     echo "maker$n !hp2: $(grep -c 'CoinJoin message sent: command=!hp2' "$logs/maker$n.log") sent," \
       "$(grep -c 'Could not connect to any directory for ephemeral hp2 broadcast' "$logs/maker$n.log") could not connect"
   done
+  if [ "$CHANNEL" = onion ]; then
+    # Which of the taker's round lines the directory relayed to each maker: none to maker 1, reached directly.
+    grep -E '^direct connection asked for' "$logs/vortex-taker.log" | cut -c1-200 || true
+    taker=$(sed -n 's/^taker nick \(J[0-9A-Za-z]*\)$/\1/p' "$logs/vortex-taker.log" | head -1)
+    relayed=()
+    for n in 1 2; do
+      nick=$(grep -o "Handshake accepted: J[0-9A-Za-z]* from [a-z]* at ${maker_onions[$((n - 1))]}:" "$logs/directory.log" \
+        | tail -1 | cut -d' ' -f3 || true)
+      if [ -z "$taker" ] || [ -z "$nick" ]; then
+        echo "maker$n: its nick or the taker's is not in the logs"; rc_a=27; continue
+      fi
+      relayed[n]=$(grep -c -E "PRIVMSG routing: $taker -> $nick \(rest: (fill|auth|tx) " "$logs/directory.log" || true)
+      echo "maker$n $nick at ${maker_onions[$((n - 1))]}: the directory relayed ${relayed[n]} of the taker's" \
+        "!fill/!auth/!tx to it, and $(grep -c -E "PRIVMSG routing: $nick -> $taker " "$logs/directory.log" || true)" \
+        "of its lines to the taker"
+    done
+    if [ "$rc_a" -eq 0 ]; then
+      if [ "${relayed[1]}" -eq 0 ] && [ "${relayed[2]}" -ge 3 ]; then
+        echo "Direct connection: maker 1 reached directly, maker 2 through the directory after its onion was refused"
+      else
+        echo "Direct connection: expected 0 relayed lines for maker 1 and at least 3 for maker 2"; rc_a=28
+      fi
+    fi
+  fi
 fi
 for p in "${maker_pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
 
 # ---- B: vortex-ng makers, joinmarket-ng taker ------------------------------------------------------------
 rc_b=0
-start_vortex makers "$work/b" || rc_b=22
+# With CHANNEL=onion our makers serve as onions of their own; the test's proxy, which joinmarket-ng's taker
+# then uses as its Tor, knows maker 1's and refuses maker 2's.
+serve_b=()
+if [ "$CHANNEL" = onion ]; then
+  serve_b=("VORTEX_NG_INTEROP_SERVE=${our_onions[0]}:${OUR_SERVE_PORTS[0]},${our_onions[1]}:${OUR_SERVE_PORTS[1]}"
+    "VORTEX_NG_INTEROP_ONIONS=${our_onions[0]}")
+fi
+start_vortex makers "$work/b" "${serve_b[@]}" || rc_b=22
 if [ "$rc_b" -eq 0 ]; then
   relay=$(cat "$work/b/relay.url")
+  socks_b=()
+  [ ! -s "$work/b/socks.addr" ] || socks_b=("JMNG_SOCKS=$(cat "$work/b/socks.addr")")
   sleep 5  # the makers publish their offers right after the relay URL is written
-  HOME="$work/taker" JMNG_TAKER_MNEMONIC="$TAKER_MNEMONIC" python3 "$here/jmng_taker.py" "$(meeting "$relay")" "http://127.0.0.1:$PORT" "$cookie" \
+  env "${socks_b[@]}" HOME="$work/taker" JMNG_TAKER_MNEMONIC="$TAKER_MNEMONIC" python3 "$here/jmng_taker.py" "$(meeting "$relay")" "http://127.0.0.1:$PORT" "$cookie" \
     "$work/taker/.joinmarket-ng" "$BONDS" "$PIT" >"$logs/jmng-taker.log" 2>&1 || rc_b=$?
   txid=$(sed -n 's/^JMNG_TXID=//p' "$logs/jmng-taker.log" | tail -1)
   if [ "$rc_b" -eq 0 ] && [ -n "$txid" ] && [ "$txid" != None ]; then
@@ -258,6 +324,32 @@ if [ "$rc_b" -ne 0 ]; then
 else
   echo "txid $txid at height $(cli getblockcount)"
   grep -E -i 'bond' "$logs/jmng-taker.log" | grep -v -E 'utxo_metadata|registry' | tail -6 | cut -c1-260 || true
+  if [ "$CHANNEL" = onion ]; then
+    # Which of the round's lines the directory relayed between joinmarket-ng's taker and each of our makers.
+    grep -E '^direct connection asked for' "$logs/vortex-makers.log" | cut -c1-200 || true
+    taker=$(sed -n 's/^JMNG_TAKER_NICK=\(J[0-9A-Za-z]*\)$/\1/p' "$logs/jmng-taker.log" | head -1)
+    to=()
+    from=()
+    for n in 1 2; do
+      nick=$(sed -n "s/^maker $((n - 1)) nick \(J[0-9A-Za-z]*\)\$/\1/p" "$logs/vortex-makers.log" | head -1)
+      if [ -z "$taker" ] || [ -z "$nick" ]; then
+        echo "maker$n: its nick or the taker's is not in the logs"; rc_b=27; continue
+      fi
+      to[n]=$(grep -c -E "PRIVMSG routing: $taker -> $nick \(rest: (fill|auth|tx) " "$logs/directory.log" || true)
+      from[n]=$(grep -c -E "PRIVMSG routing: $nick -> $taker \(rest: (pubkey|ioauth|sig) " "$logs/directory.log" || true)
+      echo "maker$n $nick at ${our_onions[$((n - 1))]}: the directory relayed ${to[n]} of the taker's" \
+        "!fill/!auth/!tx to it and ${from[n]} of its !pubkey/!ioauth/!sig to the taker"
+    done
+    if [ "$rc_b" -eq 0 ]; then
+      if [ "${to[1]}" -eq 0 ] && [ "${from[1]}" -eq 0 ] && [ "${to[2]}" -ge 3 ] && [ "${from[2]}" -ge 3 ]; then
+        echo "Direct connection: joinmarket-ng's taker reached maker 1 directly both ways, maker 2 through the" \
+          "directory after its onion was refused"
+      else
+        echo "Direct connection: expected nothing relayed with maker 1 and at least 3 lines each way with maker 2"
+        rc_b=28
+      fi
+    fi
+  fi
 fi
 
 if [ "$CHANNEL" = onion ]; then

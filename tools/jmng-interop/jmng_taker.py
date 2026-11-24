@@ -12,7 +12,11 @@ relay as the only message channel. With bonds (1) it keeps joinmarket-ng's defau
 charges a fee is chosen only if its fidelity bond verifies, so the makers' `!tbond` proofs must pass
 joinmarket-ng's own checks. Without (0), like joinmarket-ng's own end-to-end tests, it lets makers without a
 bond charge a fee. It never broadcasts the transaction itself (`not-self`): it sends `!push` to
-the makers, so the round reaches the node only if one of them broadcasts it. Prints `JMNG_TXID=<txid>`.
+the makers, so the round reaches the node only if one of them broadcasts it. Prints `JMNG_TAKER_NICK=<nick>`
+once started and `JMNG_TXID=<txid>` at the end.
+
+With `JMNG_SOCKS=<host>:<port>` its way to the makers' onions is that SOCKS proxy (the harness's stand-in for
+Tor) instead of a Tor daemon; it still reaches a directory on loopback directly.
 """
 
 import asyncio
@@ -62,6 +66,10 @@ async def main() -> int:
         **wallet_pit,
     )
     await wallet.sync_all()
+    socks = {}
+    if os.environ.get("JMNG_SOCKS"):
+        host, port = os.environ["JMNG_SOCKS"].rsplit(":", 1)
+        socks = {"socks_host": host, "socks_port": int(port)}
     config = TakerConfig(
         mnemonic=TAKER_MNEMONIC,
         network=NetworkType.REGTEST,
@@ -79,9 +87,11 @@ async def main() -> int:
         tx_broadcast=BroadcastPolicy.NOT_SELF,
         data_dir=data_dir,
         **config_pit,
+        **socks,
     )
     taker = Taker(wallet, backend, config)
     await taker.start()
+    print(f"JMNG_TAKER_NICK={taker.nick}", flush=True)
     try:
         destination = wallet.get_receive_address(1, 0)
         txid = await asyncio.wait_for(
