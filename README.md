@@ -90,13 +90,19 @@ maker uses one nick on all of them and a taker a different nick on each, and a r
 `!fill` came on. An IRC server whose signature domain (its `NETWORK` name) could be mistaken for another
 channel's is refused.
 
+`maker --serve-onion <name>.onion:<port>` (with `--directories`) serves a v3 onion service that your Tor daemon
+already forwards to `127.0.0.1:<port>` (in torrc, `HiddenServiceDir` and `HiddenServicePort <port>
+127.0.0.1:<port>`). The maker listens there and names it to the directory nodes, so a taker can connect to it
+directly and keep the rest of the round off the directories. Publishing an onion through Tor's control port is
+not offered by the commands yet.
+
 What each channel shows, and to whom (ADR 0007 has the reasons):
 
 | channel | its operator sees | others on it see |
 |---|---|---|
 | Nostr relays | the recipient key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
-| onion directory nodes, relaying (every vortex-ng maker, as none serves an onion yet) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
-| onion directory nodes, when a taker reaches a maker's onion directly | that the two nicks are in contact (the maker's offer to the taker), none of the taker's round lines; a maker that answers through the directories anyway, as some do, also shows them its answers, `!pubkey` in plain text | the same |
+| onion directory nodes, relaying (a maker that serves no onion: a vortex-ng maker without `--serve-onion`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
+| onion directory nodes, when a taker connects to a maker's onion directly | that the two nicks are in contact (the maker's offer to the taker), none of the rest of their round, with two exceptions: a taker that sends its `!fill` through the directories before it connects, as some do, shows them that `!fill` and the maker's `!pubkey`; a maker that answers through the directories anyway, as some do, shows them its answers, `!pubkey` in plain text | the same |
 | an IRC server | everything a relaying directory node sees, in its own logs | the same as on the directories |
 
 A maker's single nick, and the nick key its private lines carry, link its presence on all its channels, as in

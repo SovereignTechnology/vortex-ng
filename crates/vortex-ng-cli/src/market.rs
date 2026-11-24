@@ -22,6 +22,7 @@ use vortex_ng_node::{
 use vortex_ng_nostr::client::{NickClient, unix_now};
 use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_nostr::socks::Outbound;
+use vortex_ng_onion::wire::is_v3_onion;
 use vortex_ng_onion::{Directory, OnionChannel, OnionConfig, PeerPolicy, Serve};
 use vortex_ng_taker::{
     Coin, DEFAULT_BONDLESS_ALLOWANCE, Taker, TakerConfig, TakerError, choose_coins, podle_for,
@@ -217,6 +218,34 @@ fn fee_text(offer: &Offer) -> String {
     }
 }
 
+/// `--serve-onion <name>.onion:<port>`: an onion service the operator's Tor already forwards to
+/// `127.0.0.1:<port>`. Only a maker serves, and only with directories, which tell takers where it is.
+fn serve(args: &Args, meeting: &Meeting) -> Result<Serve, Failure> {
+    let Some(given) = args.get("serve-onion") else {
+        return Ok(Serve::None);
+    };
+    let wrong = || {
+        usage(
+            "`--serve-onion` is <name>.onion:<port>, a v3 onion service your Tor daemon forwards to \
+             127.0.0.1:<port>",
+        )
+    };
+    let (host, port) = given.rsplit_once(':').ok_or_else(wrong)?;
+    let port: u16 = port.parse().map_err(|_| wrong())?;
+    if !is_v3_onion(host) || port == 0 {
+        return Err(wrong());
+    }
+    if meeting.directories.is_empty() {
+        return Err(usage(
+            "`--serve-onion` needs `--directories`: takers learn a maker's onion from the directory nodes",
+        ));
+    }
+    Ok(Serve::Onion {
+        host: host.to_string(),
+        port,
+    })
+}
+
 /// Who the channels speak for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -227,12 +256,13 @@ enum Role {
 }
 
 /// The channels a command uses, as one set, and a label for each, in the set's order (what `channel_of`
-/// indexes).
+/// indexes). `serve` is what the onion channel serves; a taker's is `Serve::None`.
 async fn channels(
     network: &str,
     meeting: &Meeting,
     outbound: &Outbound,
     role: Role,
+    serve: Serve,
 ) -> Result<(ChannelSet, Vec<String>), Failure> {
     let maker = NickIdentity::generate();
     let identity = || match role {
@@ -262,10 +292,11 @@ async fn channels(
             } else {
                 PeerPolicy::Onion
             },
-            // Not yet: serving needs an onion published through Tor's control port, which the commands do not
-            // take yet. A loopback location is only for joinmarket-clientserver's regtest testing mode:
-            // JoinMarket-NG's directories refuse a location that is not a v3 onion.
-            serve: Serve::None,
+            // A maker serves the onion `--serve-onion` names, which the operator's Tor forwards to a loopback
+            // port. Publishing one through Tor's control port is not offered yet. A loopback location is only
+            // for joinmarket-clientserver's regtest testing mode: JoinMarket-NG's directories refuse a
+            // location that is not a v3 onion.
+            serve,
         };
         let onion = OnionChannel::connect(identity(), config, outbound)
             .await
@@ -334,7 +365,8 @@ pub(crate) fn orderbook(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let (us, seen_on, book) = runtime()?.block_on(async {
-        let (mut client, labels) = channels(channel, &meeting, &outbound, Role::Taker).await?;
+        let (mut client, labels) =
+            channels(channel, &meeting, &outbound, Role::Taker, Serve::None).await?;
         let usable = |offer: &Offer| {
             only.is_none_or(|pit| offer.offer_type.pit == pit)
                 .then_some(0)
@@ -450,10 +482,12 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
         "max-size",
         "upkeep",
         "proxy",
+        "serve-onion",
     ];
     valued.extend(RPC_OPTIONS);
     let args = parse(rest, &valued, &[])?;
     let meeting = meeting(&args)?;
+    let serve = serve(&args, &meeting)?;
     let (pit, pit_name) = wallet::pit(&args)?;
     let fee = match (
         args.get("fee-rel"),
@@ -507,13 +541,22 @@ pub(crate) fn maker(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     runtime()?.block_on(async {
-        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Maker).await?;
+        let serving = match &serve {
+            Serve::Onion { host, port } => Some(format!(
+                "serving {host}:{port} on 127.0.0.1:{port}, for takers to connect to directly"
+            )),
+            _ => None,
+        };
+        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Maker, serve).await?;
         println!(
             "maker {} in the {pit_name} pit on {}, {}",
             client.nick(),
             network_name(network),
             meeting.describe()
         );
+        if let Some(serving) = serving {
+            println!("{serving}");
+        }
         let mut report = |report: MakerReport| match report {
             MakerReport::Offering {
                 height,
@@ -779,7 +822,8 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let tx = runtime()?.block_on(async {
-        let (mut client, _) = channels(channel, &meeting, &outbound, Role::Taker).await?;
+        let (mut client, _) =
+            channels(channel, &meeting, &outbound, Role::Taker, Serve::None).await?;
         let gather = Duration::from_secs(wait.into());
         let round = run_taker(
             &mut taker,

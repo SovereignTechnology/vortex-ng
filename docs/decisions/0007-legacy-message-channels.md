@@ -64,8 +64,9 @@ only as trustworthy as the directory or server that forwarded the line.
    `!auth`, its answers follow the taker's latest line, and a repeated `!fill` is answered again with the same
    `!pubkey` (a few times at most), so a copy handed over by someone who saw it does not keep the taker from
    its answer. From `!auth` on, the session moves to another route only with a step encrypted for it, which
-   only the taker can write. The commands' makers still advertise
-   `NOT-SERVING-ONION` and rely on directory relay for now (issue #52).
+   only the taker can write. `vortex-ng maker --serve-onion` serves an onion the
+   operator's Tor forwards; publishing one through the control port is not offered by the commands until it
+   has been tried against a real Tor daemon (issue #52).
 5. **IRC's signature domain** comes from the server. vortex-ng takes it once per connection, checks its length
    and characters, compares it with the value configured for that server, and freezes it; a channel whose
    domain could be confused with another active channel's does not start. TLS certificates are checked for
@@ -91,7 +92,7 @@ What each channel shows, and to whom:
 |---|---|---|
 | Nostr (ADR 0002) | the recipient's key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
 | onion directories, relayed (`NOT-SERVING-ONION`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are in clear text | public offers, `!orderbook`, `!hp2`; a nick's presence |
-| onion directories, a taker connected directly | that two nicks are in contact (the maker's offer to the taker), none of the taker's round lines; a maker that answers through the directories anyway, as some do, also shows them its answers, `!pubkey` in clear text | the same |
+| onion directories, a taker connected directly | that two nicks are in contact (the maker's offer to the taker), none of the rest of their round, except a `!fill` the taker sends through the directories before it connects, as some do, with the maker's `!pubkey`, and the answers of a maker that replies through the directories anyway, as some do, `!pubkey` in clear text | the same |
 | IRC | everything a directory sees, plus the server's own logs | the same as on onion |
 
 - A maker's single nick, and the nick key's public key that every private line carries, link its presence on

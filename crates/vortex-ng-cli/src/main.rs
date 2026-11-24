@@ -36,7 +36,7 @@ Usage:
                       [node]
   vortex-ng maker     --wallet <file> where node (--fee-rel <fraction> | --fee-abs <sats>)
                       [--pit sw0|tr0|wsh0] [--txfee <sats>] [--min-size <sats>] [--max-size <sats>]
-                      [--upkeep <seconds>]
+                      [--upkeep <seconds>] [--serve-onion <name>.onion:<port>]
   vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
                       [--min-makers <n>] [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                       [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
@@ -53,13 +53,18 @@ where: at least one of these. None is on by default.
 they also need --proxy. A maker uses one nick on all its channels, a taker a different nick on each. A round
 stays on the channel its `!fill` came on. `orderbook` shows the channel each offer came from.
 
+--serve-onion <name>.onion:<port> (maker, with --directories): a v3 onion service your Tor daemon already
+forwards to 127.0.0.1:<port> (torrc: HiddenServicePort <port> 127.0.0.1:<port>). The maker listens there and
+names it to the directory nodes, so takers can connect to it directly.
+
 Who sees what:
   a Nostr relay      the recipient key and timing of private messages; public messages.
   a directory node   offers and who is present. For each private line it relays: sender, recipient, size and
                      timing, with `!fill` (order id, amount, commitment) and `!pubkey` in plain text. The
-                     encrypted steps stay encrypted. When a taker reaches a maker's onion directly, it sees
-                     none of the taker's lines, only the maker's, if the maker answers through it anyway.
-                     vortex-ng makers serve no onion yet.
+                     encrypted steps stay encrypted. When a taker connects to a maker's onion directly, the
+                     rest of their round leaves the directory, except a `!fill` some takers still send
+                     through it first (and its `!pubkey`) and the answers of a maker that replies through
+                     it anyway.
   an IRC server      the same as a relaying directory node, in its own logs.
 A maker's one nick and its key link its presence on all its channels. More: the README, 'Command line'.
 

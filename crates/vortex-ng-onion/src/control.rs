@@ -54,7 +54,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct TorControl {
     /// The control port, normally `127.0.0.1:9051`.
     pub addr: SocketAddr,
-    /// The authentication cookie file, needed for method `COOKIE`.
+    /// The authentication cookie file, needed for method `SAFECOOKIE`.
     pub cookie: Option<PathBuf>,
 }
 

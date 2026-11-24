@@ -1,11 +1,11 @@
 //! JoinMarket's onion message channel: directory nodes, as joinmarket-clientserver (`jmdaemon/onionmc.py`)
 //! and JoinMarket-NG (`jmcore/directory_client.py`) speak it (ADR 0007).
 //!
-//! An [`OnionChannel`] is one nick connected to every configured directory node at once. It serves no onion
-//! of its own (`NOT-SERVING-ONION`), so a private line is relayed by a directory unless a direct connection
-//! carries it: the directory sees who talks to whom, when, and how much, and the plain-text steps of a round
-//! (`!fill`, `!pubkey`); the encrypted steps stay encrypted. Private lines are JMP-0001 lines signed with
-//! `hostid` `onion-network`; public lines are unsigned.
+//! An [`OnionChannel`] is one nick connected to every configured directory node at once. Unless it serves an
+//! onion of its own (below), it says `NOT-SERVING-ONION`, and a private line is relayed by a directory unless
+//! a direct connection carries it: the directory sees who talks to whom, when, and how much, and the
+//! plain-text steps of a round (`!fill`, `!pubkey`); the encrypted steps stay encrypted. Private lines are
+//! JMP-0001 lines signed with `hostid` `onion-network`; public lines are unsigned.
 //!
 //! Direct connections (a taker's, issue #45): directories tell where peers that serve an onion are (peer
 //! lists, which joinmarket-clientserver's directories send when they relay a line and JoinMarket-NG's on
@@ -32,8 +32,9 @@
 //! `!fill` to another maker over a connection of its own. The maker driver keeps that from taking the
 //! session away (`vortex-ng-node`, `maker_step`): the real taker's `!fill` is answered too, with the same
 //! `!pubkey`, and from `!auth` on the round follows only lines encrypted for the session, which only the
-//! taker can write. The commands do not serve yet (issue #52). This is the project's only inbound listener
-//! (ADR 0007).
+//! taker can write. `vortex-ng maker --serve-onion` serves an onion the operator's Tor forwards; publishing
+//! one through the control port is not offered by the commands yet (issue #52). This is the project's only
+//! inbound listener (ADR 0007).
 //!
 //! Each directory has a task that connects (through the nick's own [`NickConnector`], so a Tor daemon gives
 //! this nick circuits of its own), does the handshake (and JoinMarket-NG's nick authentication, JMP-0005,

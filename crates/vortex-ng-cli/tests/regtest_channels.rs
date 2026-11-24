@@ -2,9 +2,11 @@
 //!
 //! Two `vortex-ng maker` processes serve a Nostr relay, an onion directory node and an IRC server at once.
 //! `vortex-ng orderbook` finds them on each channel and says which, and `vortex-ng coinjoin` takes one round
-//! on each channel and one on all three.
+//! on each channel and one on all three. The first maker serves an onion (`--serve-onion`): the taker
+//! connects to it directly, and the directory relays none of their round.
 //!
-//! Nobody reaches a server directly: each is known by a name only the test's SOCKS proxy resolves.
+//! Nobody reaches a server directly: each is known by a name only the test's SOCKS proxy resolves, and so is
+//! the first maker's onion.
 //!
 //! The round test is skipped unless `VORTEX_NG_REGTEST_RPC` and `VORTEX_NG_REGTEST_COOKIE` are set
 //! (`tools/itest/run.sh` sets them). The refusals outside regtest need no node.
@@ -12,7 +14,8 @@
 // A test: a failed step should panic with its error.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -148,6 +151,42 @@ async fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) {
     }
 }
 
+/// The nick a maker's log names on its first line.
+fn nick_in(log: &Path) -> String {
+    let text = std::fs::read_to_string(log).unwrap();
+    let first = text.lines().next().unwrap_or_default();
+    first
+        .strip_prefix("maker ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("a nick in {first:?}"))
+        .to_string()
+}
+
+/// The round lines the directory relayed between a maker and anyone: what was sent to it, what it sent.
+fn relayed(directory: &TestDirectory, maker: &str) -> (usize, usize) {
+    let lines = directory.received();
+    let to = format!("!{maker}!");
+    let from = format!("{maker}!");
+    let count = |sender: bool, commands: &[&str]| {
+        lines
+            .iter()
+            .filter(|(_, _, line)| {
+                (if sender {
+                    line.starts_with(&from)
+                } else {
+                    line.contains(&to)
+                }) && commands
+                    .iter()
+                    .any(|command| line.contains(&format!("!{command} ")))
+            })
+            .count()
+    };
+    (
+        count(false, &["fill", "auth", "tx"]),
+        count(true, &["pubkey", "ioauth", "sig"]),
+    )
+}
+
 fn show(logs: &[PathBuf]) -> String {
     logs.iter()
         .map(|log| {
@@ -215,6 +254,59 @@ async fn the_legacy_channels_are_refused_outside_regtest() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--serve-onion` takes a v3 onion and a port, needs `--directories`, and is checked before anything starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_onion_to_serve_is_refused_before_anything_starts() {
+    let proxy = AuthSocks::start().await.unwrap();
+    let proxy_addr = proxy.addr().to_string();
+    let onion = format!("{}.onion", "c".repeat(56));
+    let maker = |serving: &str, channel: [&str; 2]| {
+        run(&[
+            "maker",
+            "--wallet",
+            "/nonexistent/wallet.json",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--rpc-cookie-file",
+            "/nonexistent",
+            "--fee-abs",
+            "500",
+            "--proxy",
+            &proxy_addr,
+            channel[0],
+            channel[1],
+            "--serve-onion",
+            serving,
+        ])
+    };
+    let on_onion = ["--directories", "directory.test:5222"];
+    for wrong in [
+        onion.clone(),
+        format!("{onion}:0"),
+        format!("{onion}:65536"),
+        format!("{onion}:port"),
+        "directory.test:5222".to_string(),
+        "abcdefghijklmnop.onion:5222".to_string(),
+        format!("{}.onion:5222", "c".repeat(55)),
+    ] {
+        let refused = maker(&wrong, on_onion);
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(2), "{wrong}: {said}");
+        assert!(
+            said.contains("`--serve-onion` is <name>.onion:<port>"),
+            "{wrong}: {said}"
+        );
+    }
+    let refused = maker(&format!("{onion}:5222"), ["--relays", "ws://relay.test:1"]);
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{said}");
+    assert!(
+        said.contains("`--serve-onion` needs `--directories`"),
+        "{said}"
+    );
+    assert!(proxy.seen().is_empty(), "{:?}", proxy.seen());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_commands_work_on_each_channel_through_the_proxy() {
     let (Ok(url), Ok(cookie)) = (
@@ -245,7 +337,17 @@ async fn the_commands_work_on_each_channel_through_the_proxy() {
         .to_string();
     let directory = TestDirectory::start("regtest", None).await;
     let irc = TestIrc::start(Some("TestNet")).await;
-    let proxy = AuthSocks::start().await.unwrap();
+    // The first maker's onion, which the operator's Tor would forward to the port: here the proxy does.
+    let onion = format!("{}.onion", "c".repeat(56));
+    let onion_port = {
+        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let onion_at = format!("{onion}:{onion_port}");
+    let proxy =
+        AuthSocks::start_with_onions(HashMap::from([(onion.clone(), Ipv4Addr::LOCALHOST.into())]))
+            .await
+            .unwrap();
     let proxy_addr = proxy.addr().to_string();
     let relay_at = format!("relay.test:{relay_port}");
     let directory_at = format!("directory.test:{}", directory.directory().port);
@@ -292,7 +394,12 @@ async fn the_commands_work_on_each_channel_through_the_proxy() {
         .map(|i| dir.join(format!("maker{i}.log")))
         .collect();
     let mut makers = Makers(Vec::new());
-    for (wallet, log) in wallets.iter().zip(&logs) {
+    for (i, (wallet, log)) in wallets.iter().zip(&logs).enumerate() {
+        let serving: Vec<&str> = if i == 0 {
+            vec!["--serve-onion", &onion_at]
+        } else {
+            Vec::new()
+        };
         let out = std::fs::File::create(log).unwrap();
         let err = std::fs::File::create(log.with_extension("err")).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_vortex-ng"))
@@ -316,6 +423,7 @@ async fn the_commands_work_on_each_channel_through_the_proxy() {
                 &proxy_addr,
             ])
             .args(&on_all)
+            .args(&serving)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
@@ -329,6 +437,16 @@ async fn the_commands_work_on_each_channel_through_the_proxy() {
         || logs.iter().all(|log| offering_at(log).is_some()),
     )
     .await;
+    let nicks: Vec<String> = logs.iter().map(|log| nick_in(log)).collect();
+    assert!(
+        std::fs::read_to_string(&logs[0])
+            .unwrap()
+            .contains(&format!("serving {onion_at} on 127.0.0.1:{onion_port}")),
+        "{}",
+        show(&logs)
+    );
+    // The directory names the serving maker when asked (JoinMarket-NG's way).
+    directory.set_peerlist(&[format!("{};{onion_at}", nicks[0])]);
 
     // `orderbook` finds both makers on each channel, and says which channel.
     for (name, channel, label) in &each {
@@ -468,13 +586,22 @@ async fn the_commands_work_on_each_channel_through_the_proxy() {
         "{balance}"
     );
 
-    // Everything went through the proxy, to the three servers by name, and no maker connected directly.
+    // Everything went through the proxy, to the three servers and the serving maker's onion by name, and no
+    // maker connected directly.
     let reached: BTreeSet<String> = proxy.seen().into_iter().map(|(_, to)| to).collect();
-    let expected: BTreeSet<String> = [relay_at, directory_at.clone(), irc_at.clone()]
+    let expected: BTreeSet<String> = [relay_at, directory_at.clone(), irc_at.clone(), onion_at]
         .into_iter()
         .collect();
     assert_eq!(reached, expected);
     assert!(!show(&logs).contains("connecting directly"));
+
+    // The directory relayed nothing of the serving maker's rounds either way; the other maker's went through it.
+    assert_eq!(relayed(&directory, &nicks[0]), (0, 0), "{}", show(&logs));
+    let (to, from) = relayed(&directory, &nicks[1]);
+    assert!(to >= 3 && from >= 3, "{to} {from}");
+    println!(
+        "the directory relayed 0 round lines to or from the maker serving an onion, {to} and {from} for the other"
+    );
 
     for child in &mut makers.0 {
         assert!(
