@@ -8,7 +8,7 @@ Everything else comes from the environment run.sh sets:
     REF_WALLET                  the Core watch-only wallet this bot imports its addresses into (created by run.sh)
     REF_MINE_TO                 where the reference's regtest interface would mine to (see the shim below)
     REF_SEED                    the bot's wallet entropy (32 hex characters); not used by the directory
-    REF_CHANNEL                 onion or irc
+    REF_CHANNEL                 onion, irc, or both at once
     REF_DIRECTORY               onion: the directory node, 127.0.0.1:<port>
     REF_SERVE_PORT              onion, maker and directory: the port this bot serves on
     REF_IRC                     irc: the server, <host>:<port>
@@ -53,7 +53,7 @@ def config_text() -> str:
         f"rpc_cookie_file = {os.environ['REF_COOKIE']}",
         f"rpc_wallet_file = {os.environ['REF_WALLET']}",
     ]
-    if CHANNEL == "onion":
+    if CHANNEL in ("onion", "both"):
         serve = os.environ.get("REF_SERVE_PORT", "0")
         lines += [
             "[MESSAGING:onion]",
@@ -68,7 +68,7 @@ def config_text() -> str:
             f"directory_nodes = {os.environ['REF_DIRECTORY']}",
             "regtest_count = 1,5",
         ]
-    else:
+    if CHANNEL in ("irc", "both"):
         host, port = os.environ["REF_IRC"].rsplit(":", 1)
         lines += [
             "[MESSAGING:server1]",

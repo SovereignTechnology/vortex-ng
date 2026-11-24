@@ -16,7 +16,8 @@
 # default; the reference's own test server, which announces no NETWORK, so the signature domain is host and
 # port) or IRCD=ngircd (Debian's, announcing NETWORK=VortexRefTest). With IRCD=ngircd TLS=1, vortex-ng connects
 # to the server's TLS port, checking a certificate from a throwaway authority, and the reference stays on the
-# plain port of the same server.
+# plain port of the same server. With CHANNEL=both every maker and taker is on the directory and the IRC server
+# at once: a maker with one nick on both, and vortex-ng's taker with a nick of its own on each.
 #
 # Two rounds:
 #   A. two reference makers (YieldGeneratorBasic, sw0reloffer) and a vortex-ng taker, which does a sw0 round
@@ -45,10 +46,11 @@ IRC_TLS_PORT=16697
 TLS=${TLS:-0}
 IRC_NETWORK=VortexRefTest
 AMOUNT=1000000  # crates/vortex-ng-node/tests/jmng_interop.rs AMOUNT
-case "$CHANNEL" in onion|irc) ;; *) echo "CHANNEL=$CHANNEL: onion or irc" >&2; exit 97 ;; esac
+case "$CHANNEL" in onion|irc|both) ;; *) echo "CHANNEL=$CHANNEL: onion, irc or both" >&2; exit 97 ;; esac
 case "$IRCD" in miniircd|ngircd) ;; *) echo "IRCD=$IRCD: miniircd or ngircd" >&2; exit 97 ;; esac
 label=$CHANNEL
 [ "$CHANNEL" = irc ] && label="irc, $IRCD"
+[ "$CHANNEL" = both ] && label="onion + irc, $IRCD"
 if [ "$TLS" = 1 ]; then
   { [ "$CHANNEL" = irc ] && [ "$IRCD" = ngircd ]; } || { echo "TLS=1 needs CHANNEL=irc IRCD=ngircd" >&2; exit 97; }
   label="$label, TLS"
@@ -78,7 +80,7 @@ fetch() {  # url, sha256, destination
 export DEBIAN_FRONTEND=noninteractive
 packages=(python3 python3-venv python3-dev build-essential autoconf automake libtool pkg-config libffi-dev
   libssl-dev libsodium23 git curl ca-certificates)
-[ "$CHANNEL" = irc ] && [ "$IRCD" = ngircd ] && packages+=(ngircd)
+[ "$CHANNEL" != onion ] && [ "$IRCD" = ngircd ] && packages+=(ngircd)
 [ "$TLS" = 1 ] && packages+=(openssl)
 apt-get update -qq >/dev/null
 apt-get install -y -qq --no-install-recommends "${packages[@]}" >/dev/null 2>&1
@@ -128,9 +130,10 @@ echo "bitcoind $("$bin/bitcoind" -version | head -1) at height $(cli getblockcou
 bot_pid=
 start_bot() {
   local role=$1 name=$2 index=$3; shift 3
-  local seed
+  local seed channel=$CHANNEL
+  [ "$role" = directory ] && channel=onion  # a directory node is on the onion channel only
   seed=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  env "$@" REF_RPC_PORT="$PORT" REF_COOKIE="$cookie" REF_WALLET="jm-$name" REF_MINE_TO="$funder" REF_SEED="$seed" REF_CHANNEL="$CHANNEL" \
+  env "$@" REF_RPC_PORT="$PORT" REF_COOKIE="$cookie" REF_WALLET="jm-$name" REF_MINE_TO="$funder" REF_SEED="$seed" REF_CHANNEL="$channel" \
     REF_DIRECTORY="127.0.0.1:$DIRECTORY_PORT" REF_SERVE_PORT=$((DIRECTORY_PORT + index)) REF_INDEX="$index" \
     REF_IRC="127.0.0.1:$IRC_PORT" \
     python3 "$here/ref_bot.py" "$role" "$name" "$work/bots/$name" "$work/bots" >"$logs/$name.log" 2>&1 &
@@ -151,7 +154,7 @@ fund_bot() {
 
 # Where everyone meets.
 meet_env=()
-if [ "$CHANNEL" = onion ]; then
+if [ "$CHANNEL" != irc ]; then
   start_bot directory directory 0
   for _ in $(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null && break; sleep 1; done
   (exec 3<>/dev/tcp/127.0.0.1/$DIRECTORY_PORT) 2>/dev/null || { show "$logs/directory.log" 40; exit 26; }
@@ -159,7 +162,8 @@ if [ "$CHANNEL" = onion ]; then
   # Our makers serve on loopback, as the reference's do in its testing mode, so its taker connects directly.
   meet_env=("VORTEX_NG_INTEROP_DIRECTORY=127.0.0.1:$DIRECTORY_PORT" VORTEX_NG_INTEROP_ONION_NETWORK=testnet
     VORTEX_NG_INTEROP_SERVE=loopback)
-else
+fi
+if [ "$CHANNEL" != onion ]; then
   if [ "$IRCD" = ngircd ]; then
     cat >"$work/ngircd.conf" <<EOF
 [Global]
@@ -179,7 +183,7 @@ PAM = no
 Ident = no
 DNS = no
 EOF
-    meet_env=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT" "VORTEX_NG_INTEROP_IRC_NETWORK=$IRC_NETWORK")
+    meet_env+=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT" "VORTEX_NG_INTEROP_IRC_NETWORK=$IRC_NETWORK")
     if [ "$TLS" = 1 ]; then
       # A throwaway authority and a certificate for 127.0.0.1, which only this run trusts.
       mkdir -p "$work/tls"
@@ -211,7 +215,7 @@ EOF
     tar -xzf "$work/miniircd.tar.gz" -C "$work/miniircd" --strip-components=1
     # It refuses to run as root without dropping to another account after binding.
     python3 "$work/miniircd/miniircd" --listen=127.0.0.1 --ports="$IRC_PORT" --setuid=nobody >"$logs/ircd.log" 2>&1 &
-    meet_env=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT")
+    meet_env+=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT")
   fi
   pids+=($!)
   for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/$IRC_PORT) 2>/dev/null && break; sleep 1; done
@@ -307,10 +311,11 @@ else
   echo "txid $txid at height $(cli getblockcount)"
 fi
 
-if [ "$CHANNEL" = onion ]; then
+if [ "$CHANNEL" != irc ]; then
   echo "-- directory"; bot_report directory 10
   [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] || show "$logs/directory.log" 40
-else
+fi
+if [ "$CHANNEL" != onion ]; then
   [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] || show "$logs/ircd.log" 20
 fi
 [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ] && { echo "== both directions passed"; exit 0; }

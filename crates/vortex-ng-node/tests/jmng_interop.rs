@@ -9,8 +9,9 @@
 //! both sides meet on a directory node the harness runs instead; `VORTEX_NG_INTEROP_ONION_NETWORK` is the
 //! network name the directory expects (`regtest`, or `testnet` for joinmarket-clientserver, which runs regtest
 //! as testnet). With `VORTEX_NG_INTEROP_IRC=<host:port>` (and `VORTEX_NG_INTEROP_IRC_NETWORK`, the `NETWORK`
-//! name the server announces, if any) both sides meet on an IRC server. Either way this side writes where to
-//! meet to `<dir>/relay.url` once the chain is ready, and the harness then starts the other side.
+//! name the server announces, if any) both sides meet on an IRC server; with both set, on the two at once,
+//! a maker with one nick on both and a taker with a nick of its own on each. Either way this side writes
+//! where to meet to `<dir>/relay.url` once the chain is ready, and the harness then starts the other side.
 //!
 //! `taker_with_joinmarket_ng_makers` (`VORTEX_NG_INTEROP_ROLE=taker`): a vortex-ng taker waits until the
 //! joinmarket-ng makers have announced their offers, asks them for the orderbook, and runs a round with them
@@ -27,7 +28,7 @@
 // A test harness: a failed step should panic with its error.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -124,18 +125,30 @@ impl Harness {
 
     /// Where the sides meet, for the log.
     fn place(&self, url: &str) -> String {
-        match (&self.irc, &self.directory) {
-            (Some(irc), _) => format!(
+        let mut places = Vec::new();
+        if let Some(directory) = &self.directory {
+            places.push(format!(
+                "directory at {}:{}",
+                directory.host, directory.port
+            ));
+        }
+        if let Some(irc) = &self.irc {
+            places.push(format!(
                 "IRC server at {}:{}{}",
                 irc.host,
                 irc.port,
                 if irc.tls { " over TLS" } else { "" }
-            ),
-            (None, Some(directory)) => {
-                format!("directory at {}:{}", directory.host, directory.port)
-            }
-            (None, None) => format!("relay at {url}"),
+            ));
         }
+        if places.is_empty() {
+            places.push(format!("relay at {url}"));
+        }
+        places.join(" and ")
+    }
+
+    /// How many legacy channels this run meets on.
+    fn legacy_channels(&self) -> usize {
+        usize::from(self.directory.is_some()) + usize::from(self.irc.is_some())
     }
 
     fn rpc(&self) -> CoreRpc {
@@ -160,97 +173,115 @@ fn sink() -> vortex_ng_core::bitcoin::Address {
         .unwrap()
 }
 
-/// A channel for a new nick: on the IRC server or the directory when one is given, else on the relay at `url`.
-/// A maker (`serve`) on the directory serves on loopback when `VORTEX_NG_INTEROP_SERVE=loopback`, so the
-/// other side's taker can connect to it: joinmarket-clientserver's regtest testing mode only, since
-/// JoinMarket-NG's directories refuse a location that is not a v3 onion.
+/// Channels for a new participant: on the directory and the IRC server when they are given (both, with
+/// `CHANNEL=both`), else on the relay at `url`. A maker (`serve`) keeps one nick on all of them, anyone else
+/// takes a nick of its own on each (ADR 0007). A maker on the directory serves on loopback when
+/// `VORTEX_NG_INTEROP_SERVE=loopback`, so the other side's taker can connect to it:
+/// joinmarket-clientserver's regtest testing mode only, since JoinMarket-NG's directories refuse a location
+/// that is not a v3 onion.
 async fn meet(harness: &Harness, url: &str, serve: bool) -> ChannelSet {
-    let channel: Box<dyn vortex_ng_channel::set::DynChannel> =
-        match (&harness.irc, &harness.directory) {
-            (Some(server), _) => {
-                let config = IrcConfig {
-                    server: server.clone(),
-                    network: "regtest".into(),
+    let maker = NickIdentity::generate();
+    let identity = || {
+        if serve {
+            maker.clone()
+        } else {
+            NickIdentity::generate()
+        }
+    };
+    let mut channels: Vec<Box<dyn vortex_ng_channel::set::DynChannel>> = Vec::new();
+    if let Some(directory) = &harness.directory {
+        channels.push(Box::new(
+            OnionChannel::connect(
+                identity(),
+                OnionConfig {
+                    directories: vec![directory.clone()],
+                    network: harness.onion_network.clone(),
                     timeout: Duration::from_secs(60),
-                };
-                let identity = NickIdentity::generate();
-                // A server with a certificate from the harness's own authority.
-                let connected = match std::env::var("VORTEX_NG_INTEROP_IRC_CA") {
-                    Ok(path) => {
-                        let der = std::fs::read(&path).expect("the CA certificate");
-                        let roots = vortex_ng_irc::testing::roots_from_der(&der);
-                        IrcChannel::connect_with_roots(identity, config, &Outbound::Direct, roots)
-                            .await
-                    }
-                    Err(_) => IrcChannel::connect(identity, config, &Outbound::Direct).await,
-                };
-                let channel = connected.unwrap_or_else(|e| panic!("the IRC server: {e}"));
-                println!("IRC signature domain {:?}", channel.hostid());
-                Box::new(channel)
-            }
-            (None, Some(directory)) => Box::new(
-                OnionChannel::connect(
-                    NickIdentity::generate(),
-                    OnionConfig {
-                        directories: vec![directory.clone()],
-                        network: harness.onion_network.clone(),
-                        timeout: Duration::from_secs(60),
-                        // The reference's makers serve on loopback in its testing mode: a taker reaches
-                        // them directly once the directory names them.
-                        peers: PeerPolicy::Local,
-                        serve: if serve && harness.serve_loopback {
-                            Serve::Loopback
-                        } else {
-                            Serve::None
-                        },
+                    // The reference's makers serve on loopback in its testing mode: a taker reaches
+                    // them directly once the directory names them.
+                    peers: PeerPolicy::Local,
+                    serve: if serve && harness.serve_loopback {
+                        Serve::Loopback
+                    } else {
+                        Serve::None
                     },
-                    &Outbound::Direct,
-                )
-                .await
-                .unwrap_or_else(|e| panic!("the directory: {e}")),
-            ),
-            (None, None) => Box::new(
-                NickClient::connect(
-                    NickKeys::generate(),
-                    "regtest",
-                    &[url.to_string()],
-                    None,
-                    CONNECT_TIMEOUT,
-                )
-                .await
-                .unwrap(),
-            ),
+                },
+                &Outbound::Direct,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the directory: {e}")),
+        ));
+    }
+    if let Some(server) = &harness.irc {
+        let config = IrcConfig {
+            server: server.clone(),
+            network: "regtest".into(),
+            timeout: Duration::from_secs(60),
         };
-    ChannelSet::new(vec![channel]).unwrap()
+        // A server with a certificate from the harness's own authority.
+        let connected = match std::env::var("VORTEX_NG_INTEROP_IRC_CA") {
+            Ok(path) => {
+                let der = std::fs::read(&path).expect("the CA certificate");
+                let roots = vortex_ng_irc::testing::roots_from_der(&der);
+                IrcChannel::connect_with_roots(identity(), config, &Outbound::Direct, roots).await
+            }
+            Err(_) => IrcChannel::connect(identity(), config, &Outbound::Direct).await,
+        };
+        let channel = connected.unwrap_or_else(|e| panic!("the IRC server: {e}"));
+        println!("IRC signature domain {:?}", channel.hostid());
+        channels.push(Box::new(channel));
+    }
+    if channels.is_empty() {
+        channels.push(Box::new(
+            NickClient::connect(
+                NickKeys::generate(),
+                "regtest",
+                &[url.to_string()],
+                None,
+                CONNECT_TIMEOUT,
+            )
+            .await
+            .unwrap(),
+        ));
+    }
+    ChannelSet::new(channels).unwrap()
 }
 
-/// Wait until `count` different makers answer `!orderbook` on the directory or IRC server (asked every five
-/// seconds).
+/// Wait until `count` different makers answer `!orderbook` on every legacy channel of this run (asked every
+/// five seconds). Our side has a different nick on each channel, which is checked here too.
 async fn wait_for_answering_makers(harness: &Harness, count: usize, limit: Duration) {
+    let channels = harness.legacy_channels();
     let mut observer = meet(harness, "", false).await;
     observer.listen(true, false).await.unwrap();
     let until = Instant::now() + limit;
-    let mut seen = HashSet::new();
+    let mut seen: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut ours = HashSet::new();
     let mut asked: Option<Instant> = None;
-    while seen.len() < count {
+    loop {
+        let ready = seen.values().filter(|on| on.len() == channels).count();
+        if ready >= count {
+            break;
+        }
         assert!(
             Instant::now() < until,
-            "only {} of {count} makers answered",
-            seen.len()
+            "only {ready} of {count} makers answered on all {channels} channel(s)"
         );
         if asked.is_none_or(|at| at.elapsed() >= Duration::from_secs(5)) {
             observer.ask_orderbook().await.unwrap();
             asked = Some(Instant::now());
         }
-        let nick = match observer.receive(Duration::from_secs(1)).await {
-            Next::Message(Arrived::Private { msg, .. }) => msg.from,
-            Next::Message(Arrived::Offers { nick, .. }) => nick,
+        let (nick, route) = match observer.receive(Duration::from_secs(1)).await {
+            Next::Message(Arrived::Private { msg, route }) => (msg.from, route),
+            Next::Message(Arrived::Offers { nick, route, .. }) => (nick, route),
             _ => continue,
         };
-        if seen.insert(nick.clone()) {
+        ours.insert(observer.nick_on(&route).to_string());
+        let on = seen.entry(nick.clone()).or_default();
+        if on.insert(observer.channel_of(&route)) && on.len() == channels {
             println!("maker {nick} answered on the {}", harness.place(""));
         }
     }
+    assert_eq!(ours.len(), channels, "our side has one nick per channel");
     observer.shutdown().await;
 }
 
