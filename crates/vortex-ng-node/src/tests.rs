@@ -985,6 +985,76 @@ async fn one_maker_on_three_channels_serves_a_taker_on_each() {
 /// the taker's private lines goes through the directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_whole_coinjoin_over_direct_connections() {
+    coinjoin_over_direct_connections(false).await;
+}
+
+/// The same with a taker that connects as joinmarket-clientserver's does: it sends `!fill` through the
+/// directory and connects to the maker as it does. The makers answer that `!fill` there, then follow the
+/// taker onto the connection with its `!auth`: nothing else of the round goes through the directory (#46).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taker_that_connects_after_its_fill_has_the_rest_of_the_round_direct() {
+    coinjoin_over_direct_connections(true).await;
+}
+
+/// An onion channel that opens a direct connection to a maker only once it has sent the maker its `!fill`,
+/// through the directory: joinmarket-clientserver's taker (`onionmc.py`, `_privmsg`).
+struct ConnectsAfterFill(vortex_ng_onion::OnionChannel);
+
+impl Channel for ConnectsAfterFill {
+    type Route = vortex_ng_onion::OnionRoute;
+
+    fn nick(&self) -> &str {
+        self.0.nick()
+    }
+
+    fn authenticates(&self, route: &Self::Route) -> bool {
+        self.0.authenticates(route)
+    }
+
+    async fn listen(&self, offers: bool, public: bool) -> Result<(), ChannelError> {
+        self.0.listen(offers, public).await
+    }
+
+    async fn send_private(
+        &self,
+        route: &Self::Route,
+        to: &str,
+        command: &str,
+        body: &str,
+    ) -> Result<(), ChannelError> {
+        self.0.send_private(route, to, command, body).await?;
+        if command == "fill" {
+            self.0.prepare(&[(to.to_string(), route.clone())]).await;
+        }
+        Ok(())
+    }
+
+    async fn ask_orderbook(&self) -> Result<(), ChannelError> {
+        self.0.ask_orderbook().await
+    }
+
+    async fn announce_offers(&self, pit: Pit, offers: &[Offer]) -> Result<(), ChannelError> {
+        self.0.announce_offers(pit, offers).await
+    }
+
+    async fn withdraw_offers(&self, pit: Pit) -> Result<(), ChannelError> {
+        self.0.withdraw_offers(pit).await
+    }
+
+    async fn publish_unlinked(&self, line: &str) -> Result<(), ChannelError> {
+        self.0.publish_unlinked(line).await
+    }
+
+    async fn receive(&mut self, wait: Duration) -> Next<Self::Route> {
+        self.0.receive(wait).await
+    }
+
+    async fn shutdown(&self) {
+        self.0.shutdown().await
+    }
+}
+
+async fn coinjoin_over_direct_connections(late: bool) {
     use vortex_ng_channel::set::{ChannelSet, DynChannel};
     use vortex_ng_channel::socks::Outbound;
     use vortex_ng_core::nick::NickIdentity;
@@ -1020,6 +1090,7 @@ async fn a_whole_coinjoin_over_direct_connections() {
 
     let mut handles = Vec::new();
     let mut entries = Vec::new();
+    let mut maker_nicks = Vec::new();
     for (i, wallet) in maker_wallets.into_iter().enumerate() {
         let mut channel = OnionChannel::connect(
             NickIdentity::generate(),
@@ -1028,6 +1099,7 @@ async fn a_whole_coinjoin_over_direct_connections() {
         )
         .await
         .unwrap();
+        maker_nicks.push(channel.nick().to_string());
         entries.push(format!(
             "{};{}",
             channel.nick(),
@@ -1087,7 +1159,11 @@ async fn a_whole_coinjoin_over_direct_connections() {
     .await
     .unwrap();
     let taker_nick = onion.nick().to_string();
-    let channels: Vec<Box<dyn DynChannel>> = vec![Box::new(onion)];
+    let channels: Vec<Box<dyn DynChannel>> = if late {
+        vec![Box::new(ConnectsAfterFill(onion))]
+    } else {
+        vec![Box::new(onion)]
+    };
     let mut client = ChannelSet::new(channels).unwrap();
     let tx = run_taker(
         &mut taker,
@@ -1102,18 +1178,44 @@ async fn a_whole_coinjoin_over_direct_connections() {
     .unwrap();
     assert_eq!(tx.input.len(), 3);
     assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
-    // The directory carried the taker's `!orderbook` and nothing private from it.
-    let from_taker: Vec<u64> = directory
-        .received()
-        .iter()
-        .filter(|(from, _, _)| *from == taker_nick)
-        .map(|(_, kind, _)| *kind)
-        .collect();
-    assert!(from_taker.contains(&vortex_ng_onion::wire::PUBMSG));
+    let received = directory.received();
+    let private_from = |nick: &str| -> Vec<String> {
+        received
+            .iter()
+            .filter(|(from, kind, _)| from == nick && *kind == vortex_ng_onion::wire::PRIVMSG)
+            .map(|(_, _, line)| line.clone())
+            .collect()
+    };
+    // The directory carried the taker's `!orderbook`; of its private lines, at most the `!fill`s.
     assert!(
-        !from_taker.contains(&vortex_ng_onion::wire::PRIVMSG),
-        "{from_taker:?}"
+        received
+            .iter()
+            .any(|(from, kind, _)| *from == taker_nick && *kind == vortex_ng_onion::wire::PUBMSG)
     );
+    let taker_lines = private_from(&taker_nick);
+    if late {
+        assert_eq!(taker_lines.len(), 2, "{taker_lines:?}");
+        assert!(taker_lines.iter().all(|line| line.contains("!fill ")));
+    } else {
+        assert!(taker_lines.is_empty(), "{taker_lines:?}");
+    }
+    // Of each maker's round lines, only the `!pubkey` answering a `!fill` that came that way.
+    for nick in &maker_nicks {
+        let round: Vec<String> = private_from(nick)
+            .into_iter()
+            .filter(|line| {
+                ["!pubkey ", "!ioauth ", "!sig "]
+                    .iter()
+                    .any(|c| line.contains(c))
+            })
+            .collect();
+        if late {
+            assert_eq!(round.len(), 1, "{round:?}");
+            assert!(round[0].contains("!pubkey "), "{round:?}");
+        } else {
+            assert!(round.is_empty(), "{round:?}");
+        }
+    }
     for handle in handles {
         handle.abort();
     }

@@ -88,8 +88,12 @@ struct Filled {
     offer: Offer,
     amount: u64,
     commitment: [u8; 32],
+    /// The taker's NaCl public key, hex, as its `!fill` gave it.
+    taker_nacl: String,
     /// Our NaCl public key for this session, hex, as sent in `!pubkey`.
     our_nacl: String,
+    /// How many times the same `!fill` was answered again (at most [`MAX_FILL_REPEATS`]).
+    repeats: u8,
     session: Session,
 }
 
@@ -146,6 +150,8 @@ impl std::fmt::Debug for Maker {
 /// Most sessions a maker keeps open past `!auth`, each of which proved a coin; further ones are refused until
 /// some end.
 pub const MAX_SESSIONS: usize = 64;
+/// Most times one session's `!fill`, arriving again, is answered again.
+const MAX_FILL_REPEATS: u8 = 3;
 /// Most sessions waiting for their `!auth`. A `!fill` costs its sender nothing, so these have a table of their
 /// own, large enough that a burst of them does not push out a real taker between its `!fill` and its `!auth`.
 pub const MAX_WAITING_SESSIONS: usize = 4_096;
@@ -425,9 +431,29 @@ impl Maker {
         taker_nacl: &str,
         commitment: [u8; 32],
     ) -> Result<Vec<Outgoing>, MakerError> {
-        if self.sessions.contains_key(from) {
-            // The taker's own `!fill` again (a duplicate delivery), or a copy of one it sent to another maker.
-            return Err(MakerError::Stray("session exists"));
+        if let Some(stage) = self.sessions.get_mut(from) {
+            // The taker's own `!fill` again, another way: joinmarket-clientserver's taker sends it through a
+            // directory and connects directly meanwhile, and anyone who saw it can deliver it again. While the
+            // session waits for `!auth`, the same `!fill` gets the same answer, wherever it came from: the
+            // `!pubkey` is public, and only the taker can use it. A few times only, so copies cannot draw a
+            // stream of answers. Anything else is stray.
+            return match stage {
+                Stage::Filled(filled)
+                    if filled.offer.oid == oid
+                        && filled.amount == amount
+                        && filled.taker_nacl == taker_nacl
+                        && filled.commitment == commitment
+                        && filled.repeats < MAX_FILL_REPEATS =>
+                {
+                    filled.repeats += 1;
+                    Ok(vec![Outgoing::Private {
+                        to: from.to_string(),
+                        command: "pubkey".into(),
+                        body: filled.our_nacl.clone(),
+                    }])
+                }
+                _ => Err(MakerError::Stray("session exists")),
+            };
         }
         let offer = self
             .config
@@ -470,7 +496,9 @@ impl Maker {
                 offer,
                 amount,
                 commitment,
+                taker_nacl: taker_nacl.to_string(),
                 our_nacl: ours.public_hex(),
+                repeats: 0,
                 session,
             }),
         );
@@ -498,14 +526,29 @@ impl Maker {
         }
     }
 
-    /// Whether `nick` has a session open at `now`. Its route must not move while it does: a line can be
-    /// delivered again through another channel or directory by anyone who saw it.
+    /// Whether `nick` has a session open at `now`.
     pub fn in_session(&self, nick: &str, now: u64) -> bool {
-        self.sessions.get(nick).is_some_and(|stage| {
-            self.started
-                .get(nick)
-                .is_some_and(|at| now.saturating_sub(*at) <= stage.time_limit())
-        })
+        self.progress(nick, now) > 0
+    }
+
+    /// How far `nick`'s session has come at `now`: 0 none, 1 its `!fill` answered, 2 its `!auth` answered,
+    /// 3 its `!tx` signed. Past 1 it moves only on a line encrypted for the session, which only the taker
+    /// could have written; a line delivered again, relabelled or not for this session leaves it where it is.
+    /// So where such a line came from is where the taker is (the driver sends the rest of the round there).
+    pub fn progress(&self, nick: &str, now: u64) -> u8 {
+        let Some(stage) = self.sessions.get(nick) else {
+            return 0;
+        };
+        let open = self
+            .started
+            .get(nick)
+            .is_some_and(|at| now.saturating_sub(*at) <= stage.time_limit());
+        match stage {
+            _ if !open => 0,
+            Stage::Filled(_) => 1,
+            Stage::Authed(_) => 2,
+            Stage::Signed(_) => 3,
+        }
     }
 
     fn on_auth(

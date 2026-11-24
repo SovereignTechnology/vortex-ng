@@ -295,6 +295,7 @@ fn full_session_signs_a_valid_coinjoin() {
     assert_eq!(out.len(), 1);
     let (cmd, sig_ct) = private(&out[0]);
     assert_eq!(cmd, "sig");
+    assert_eq!(maker.progress("J5taker", NOW), 3);
     let payload = session.decrypt(sig_ct).unwrap();
     let prevouts = vec![
         maker
@@ -633,12 +634,34 @@ fn a_stray_line_leaves_the_session_as_it_was() {
     }
     assert!(maker.sessions.is_empty());
 
+    assert_eq!(maker.progress("J5taker", NOW), 0);
     let out = maker.handle("J5taker", fill.clone(), &chain, NOW);
     assert_eq!(private(&out[0]).0, "pubkey");
-    let session = taker.nacl.session(private(&out[0]).1).unwrap();
-    // Filled: the same `!fill` again, lines not encrypted for this session, lines out of order.
+    let pubkey = private(&out[0]).1.to_string();
+    let session = taker.nacl.session(&pubkey).unwrap();
+    assert_eq!(maker.progress("J5taker", NOW), 1);
+    // The same `!fill` again, delivered another way: the same answer, and the session as it was. A few
+    // times only: copies cannot draw a stream of answers.
+    for _ in 0..MAX_FILL_REPEATS {
+        let again = maker.handle("J5taker", fill.clone(), &chain, NOW);
+        assert_eq!(private(&again[0]), ("pubkey", pubkey.as_str()));
+        assert_eq!(maker.progress("J5taker", NOW), 1);
+    }
+    assert!(
+        maker
+            .handle("J5taker", fill.clone(), &chain, NOW)
+            .is_empty()
+    );
+    assert_eq!(maker.progress("J5taker", NOW), 1);
+    // Filled: another `!fill`, lines not encrypted for this session, lines out of order.
+    let other_fill = Command::Fill {
+        oid: 0,
+        amount: AMOUNT + 1,
+        nacl_pubkey: taker.nacl.public_hex(),
+        commitment: podle.commitment(),
+    };
     for stray in [
-        fill.clone(),
+        other_fill,
         garbage("auth"),
         garbage("tx"),
         garbage("sig"),
@@ -668,14 +691,17 @@ fn a_stray_line_leaves_the_session_as_it_was() {
         name: "auth".into(),
         ciphertext: session.encrypt(&podle.revelation()).unwrap(),
     };
+    assert_eq!(maker.progress("J5taker", NOW), 1);
     let out = maker.handle("J5taker", auth.clone(), &chain, NOW);
     assert_eq!(private(&out[0]).0, "ioauth");
+    assert_eq!(maker.progress("J5taker", NOW), 2);
     for stray in [auth, fill, garbage("tx")] {
         assert!(maker.handle("J5taker", stray, &chain, NOW).is_empty());
         assert!(matches!(
             maker.sessions.get("J5taker"),
             Some(Stage::Authed(_))
         ));
+        assert_eq!(maker.progress("J5taker", NOW), 2);
     }
 }
 

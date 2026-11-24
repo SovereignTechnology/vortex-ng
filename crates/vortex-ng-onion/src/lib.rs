@@ -28,10 +28,11 @@
 //! pending at once. The nick in a handshake proves nothing, so a connection is never chosen for a nick: an
 //! answer goes back on it only when the line being answered, signed by that nick, came in on it.
 //!
-//! That is not yet enough to serve in public, and the commands do not: a line's signature does not cover its
-//! recipient, so a maker chosen for a round can hand the taker's signed `!fill` to another maker over a
-//! connection of its own and take that session's place. Serving outside regtest needs a challenge the nick
-//! key answers, which JoinMarket's peers do not speak today. This is the project's only inbound listener
+//! A line's signature does not cover its recipient, so a maker chosen for a round can hand the taker's signed
+//! `!fill` to another maker over a connection of its own. The maker driver keeps that from taking the
+//! session away (`vortex-ng-node`, `maker_step`): the real taker's `!fill` is answered too, with the same
+//! `!pubkey`, and from `!auth` on the round follows only lines encrypted for the session, which only the
+//! taker can write. The commands do not serve yet (issue #52). This is the project's only inbound listener
 //! (ADR 0007).
 //!
 //! Each directory has a task that connects (through the nick's own [`NickConnector`], so a Tor daemon gives

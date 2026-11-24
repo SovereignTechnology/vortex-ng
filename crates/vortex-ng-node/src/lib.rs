@@ -344,12 +344,22 @@ fn maker_step<C: Channel>(
             out
         }
         Incoming::Private { msg, route } => {
-            // A session keeps the route it started on: its lines can be delivered again by another way.
-            let settled = maker.in_session(&msg.from, unix_now());
-            remember(peers, &msg.from, &route, !settled);
+            // Where a session's answers go. Until its `!auth` has been answered, the route follows the
+            // taker's latest line, so a `!fill` that arrives again another way is answered there too (the
+            // same `!pubkey`). After that only a line that moves the session forward moves the route: an
+            // encrypted step only the taker could write, so the round follows the taker onto a direct
+            // connection it opened meanwhile (joinmarket-clientserver's taker sends `!fill` through a
+            // directory, then connects). A line delivered again by a directory or a peer that saw it never
+            // takes a session away.
+            let now = unix_now();
+            let before = maker.progress(&msg.from, now);
+            remember(peers, &msg.from, &route, before <= 1);
             let mut out = Vec::new();
             for cmd in commands(&msg) {
                 out.extend(blocking(|| maker.handle(&msg.from, cmd, chain, unix_now())));
+            }
+            if before >= 1 && maker.progress(&msg.from, unix_now()) > before {
+                peers.insert(msg.from.clone(), route);
             }
             out
         }

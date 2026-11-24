@@ -60,9 +60,12 @@ only as trustworthy as the directory or server that forwarded the line.
    to directory relay for a maker it cannot reach or whose connection drops (issue #45). A maker can serve
    an onion of its own, the project's first inbound listener (issue #46): published through Tor's control
    port with `SAFECOOKIE` authentication, or one the operator's Tor already forwards to it. Takers of both
-   reference implementations reach such a maker directly on regtest. The commands' makers still advertise
-   `NOT-SERVING-ONION` and rely on directory relay until a peer on a direct connection can be made to prove
-   its nick (issue #52).
+   reference implementations reach such a maker directly on regtest. While a maker's session waits for
+   `!auth`, its answers follow the taker's latest line, and a repeated `!fill` is answered again with the same
+   `!pubkey` (a few times at most), so a copy handed over by someone who saw it does not keep the taker from
+   its answer. From `!auth` on, the session moves to another route only with a step encrypted for it, which
+   only the taker can write. The commands' makers still advertise
+   `NOT-SERVING-ONION` and rely on directory relay for now (issue #52).
 5. **IRC's signature domain** comes from the server. vortex-ng takes it once per connection, checks its length
    and characters, compares it with the value configured for that server, and freezes it; a channel whose
    domain could be confused with another active channel's does not start. TLS certificates are checked for
