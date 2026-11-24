@@ -46,12 +46,14 @@ pub const MAX_KNOWN_PEERS: usize = 10_000;
 /// A taker asks again (`!orderbook`) at most this often while it discovers makers that have not answered.
 pub const REASK_INTERVAL: Duration = Duration::from_secs(1);
 /// Most maker nicks a taker keeps answers from per channel in one gathering, and most offers it keeps per nick.
-/// Past this a random sample of the nicks is kept, so whoever answers first cannot fill the book.
+/// Past this a random sample of the nicks is kept, so whoever answers first cannot fill the book; a nick whose
+/// bond proof stands up on the chain keeps its place, and gets one (see [`fetch_orderbook_with_bonds`]).
 pub const MAX_ANSWERING_NICKS: usize = 1_000;
 /// See [`MAX_ANSWERING_NICKS`].
 pub const MAX_OFFERS_PER_NICK: usize = 16;
-/// Most bond proofs a taker checks against the chain per round (up to two lookups each). Anyone can sign a proof
-/// with a key of their own, so the signature alone does not earn a lookup.
+/// Most bond proofs a taker checks against the chain per round (up to two lookups each), while it gathers
+/// answers and again when it chooses makers. Anyone can sign a proof with a key of their own, so the signature
+/// alone does not earn a lookup.
 pub const MAX_BOND_LOOKUPS: usize = 2_048;
 
 /// Run synchronous work that may block on the chain backend (`ChainLookup` is a blocking call, a JSON-RPC
@@ -584,15 +586,20 @@ struct Answer<R> {
     offers: Vec<Offer>,
     /// The first `!tbond` proof made out to the nick the maker knows us by there.
     proof: Option<String>,
+    /// Whether that proof stands for a real bond, once the chain was asked (only while its channel is full).
+    bonded: Option<bool>,
     /// When its first line came, in order of arrival.
     arrived: u64,
 }
 
 /// The answers gathered on one channel: at most [`MAX_ANSWERING_NICKS`] nicks, a random sample of those heard
-/// once there are more.
+/// once there are more. Nicks cost nothing, bonds do: once the channel is full, a nick whose bond proof stands
+/// up on the chain keeps its place, and a newcomer with one gets a place.
 struct ChannelAnswers<R> {
     answers: HashMap<String, Answer<R>>,
     nicks_heard: u64,
+    /// Whether the places have run out, and the proofs of the nicks holding them were checked.
+    full: bool,
 }
 
 impl<R: Clone> ChannelAnswers<R> {
@@ -600,19 +607,51 @@ impl<R: Clone> ChannelAnswers<R> {
         ChannelAnswers {
             answers: HashMap::new(),
             nicks_heard: 0,
+            full: false,
         }
     }
 
-    /// The place for `nick`'s answer, if it has or gets one. `draw` is a random number.
-    fn place(&mut self, nick: &str, route: &R, arrived: u64, draw: u64) -> Option<&mut Answer<R>> {
+    /// The place for `nick`'s answer, if it has or gets one. `draw` is a random number; `proof` is the bond
+    /// proof made out to us that `nick`'s line carries, and `real` says whether a proof stands for a real
+    /// bond, asking the chain (called only once the places have run out).
+    fn place(
+        &mut self,
+        nick: &str,
+        route: &R,
+        arrived: u64,
+        draw: u64,
+        proof: Option<&str>,
+        real: &mut dyn FnMut(&str, &str) -> bool,
+    ) -> Option<&mut Answer<R>> {
         if !self.answers.contains_key(nick) {
             self.nicks_heard += 1;
+            let mut bonded = None;
             if self.answers.len() >= MAX_ANSWERING_NICKS {
+                if !self.full {
+                    self.full = true;
+                    for (maker, answer) in &mut self.answers {
+                        if let Some(shown) = &answer.proof {
+                            answer.bonded = Some(real(maker, shown));
+                        }
+                    }
+                }
+                bonded = proof.map(|shown| real(nick, shown));
+                // A nick without a real bond is sampled as before; one with a bond always gets in. Either
+                // way it takes the place of a nick without one, at random.
                 let at = draw % self.nicks_heard;
-                if at >= MAX_ANSWERING_NICKS as u64 {
+                if bonded != Some(true) && at >= MAX_ANSWERING_NICKS as u64 {
                     return None;
                 }
-                let out = self.answers.keys().nth(at as usize).cloned()?;
+                let open: Vec<&String> = self
+                    .answers
+                    .iter()
+                    .filter(|(_, answer)| answer.bonded != Some(true))
+                    .map(|(name, _)| name)
+                    .collect();
+                if open.is_empty() {
+                    return None;
+                }
+                let out = open[(draw % open.len() as u64) as usize].clone();
                 self.answers.remove(&out);
             }
             self.answers.insert(
@@ -621,6 +660,7 @@ impl<R: Clone> ChannelAnswers<R> {
                     route: route.clone(),
                     offers: Vec::new(),
                     proof: None,
+                    bonded,
                     arrived,
                 },
             );
@@ -677,7 +717,34 @@ pub async fn fetch_orderbook_for<C: Channel>(
     gather: Duration,
     cost: impl Fn(&Offer) -> Option<u64>,
 ) -> Result<Orderbook<C::Route>, NodeError> {
+    fetch_orderbook_with_bonds(client, network, gather, cost, |_, _, _| false).await
+}
+
+/// [`fetch_orderbook_for`], where `bond_is_real(maker, proof, us)` says whether `maker`'s `!tbond` proof,
+/// made out to the nick `us` it knows us by, stands for a real bond, by the chain. It is asked only once a
+/// channel's places for answers have run out ([`MAX_ANSWERING_NICKS`]), at most [`MAX_BOND_LOOKUPS`] times in
+/// all and never past the end of `gather`: from then on a nick with a real bond keeps its place and a newcomer
+/// with one gets a place, so a flood of nicks, which cost nothing, cannot push a bonded maker out of the
+/// taker's sample. Past those limits nicks are sampled at random again.
+pub async fn fetch_orderbook_with_bonds<C: Channel>(
+    client: &mut C,
+    network: &str,
+    gather: Duration,
+    cost: impl Fn(&Offer) -> Option<u64>,
+    mut bond_is_real: impl FnMut(&str, &str, &str) -> bool,
+) -> Result<Orderbook<C::Route>, NodeError> {
     let _ = network;
+    let gather_until = Instant::now() + gather;
+    // Checking costs chain lookups, which a slow node makes slow: never more than allowed, nor past the
+    // gathering's end.
+    let mut lookups = 0usize;
+    let mut real = |maker: &str, proof: &str, us: &str| {
+        if lookups >= MAX_BOND_LOOKUPS || Instant::now() >= gather_until {
+            return false;
+        }
+        lookups += 1;
+        bond_is_real(maker, proof, us)
+    };
     client.listen(true, false).await?;
     client.ask_orderbook().await?;
     let mut asked = Instant::now();
@@ -686,7 +753,6 @@ pub async fn fetch_orderbook_for<C: Channel>(
     // Kept per channel until the end: what one channel delivers first cannot take a maker off another.
     let mut channels: HashMap<usize, ChannelAnswers<C::Route>> = HashMap::new();
     let mut arrived = 0u64;
-    let gather_until = Instant::now() + gather;
     while Instant::now() < gather_until {
         if ask_again.is_some_and(|at| Instant::now() >= at) {
             ask_again = None;
@@ -709,9 +775,12 @@ pub async fn fetch_orderbook_for<C: Channel>(
             }
             Next::Message(Incoming::Private { msg, route }) => {
                 let line = commands(&msg);
+                let us = client.nick_on(&route).to_string();
                 let answers = channels
                     .entry(client.channel_of(&route))
                     .or_insert_with(ChannelAnswers::new);
+                let full = answers.full;
+                let mut real_here = |maker: &str, proof: &str| real(maker, proof, &us);
                 // Only a nick that answers with an offer we can use gets a place: senders of anything else
                 // cannot grow the taker's state.
                 let has_usable = line
@@ -720,7 +789,13 @@ pub async fn fetch_orderbook_for<C: Channel>(
                 let answer = if has_usable {
                     arrived += 1;
                     let draw = u64::from_be_bytes(vortex_ng_core::tx::random_bytes::<8>());
-                    answers.place(&msg.from, &route, arrived, draw)
+                    let proof = line.iter().find_map(|c| match c {
+                        Command::Tbond(proof) if proof_for_us(proof, &us, &msg.from) => {
+                            Some(proof.as_str())
+                        }
+                        _ => None,
+                    });
+                    answers.place(&msg.from, &route, arrived, draw, proof, &mut real_here)
                 } else {
                     answers.answers.get_mut(&msg.from)
                 };
@@ -749,9 +824,12 @@ pub async fn fetch_orderbook_for<C: Channel>(
                             }
                         }
                         Command::Tbond(proof)
-                            if answer.proof.is_none()
-                                && proof_for_us(&proof, client.nick_on(&route), &msg.from) =>
+                            if answer.proof.is_none() && proof_for_us(&proof, &us, &msg.from) =>
                         {
+                            // A proof that comes after the places ran out is checked as it comes.
+                            if full && answer.bonded.is_none() {
+                                answer.bonded = Some(real_here(&msg.from, &proof));
+                            }
                             answer.proof = Some(proof);
                         }
                         _ => {}
@@ -786,11 +864,29 @@ pub async fn run_taker<C: Channel>(
     until: Instant,
 ) -> Result<Transaction, NodeError> {
     let network = channel_network(cfg.network);
+    // Only asked once a channel's places for answers run out; the tip is read the first time.
+    let mut tip: Option<Option<u32>> = None;
+    let bond_is_real = |maker: &str, proof: &str, us: &str| {
+        blocking(|| {
+            let height = *tip.get_or_insert_with(|| chain.tip_height().ok());
+            height.is_some_and(|height| {
+                verify_bond(proof, us, maker, chain, height, unix_now(), cfg.bond_params)
+                    .is_ok_and(|bond| bond.value > 0)
+            })
+        })
+    };
     let Orderbook {
         offers,
         proofs,
         peers,
-    } = fetch_orderbook_for(client, network, gather, |offer| usable_fee(offer, cfg)).await?;
+    } = fetch_orderbook_with_bonds(
+        client,
+        network,
+        gather,
+        |offer| usable_fee(offer, cfg),
+        bond_is_real,
+    )
+    .await?;
     let candidates = candidate_nicks(&offers, cfg);
     // Each maker made its proof out to the nick it knows us by, on the channel it answered on.
     let me = |maker: &str| match peers.get(maker) {

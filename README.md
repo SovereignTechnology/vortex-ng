@@ -106,7 +106,8 @@ What each channel shows, and to whom (ADR 0007 has the reasons):
 | an IRC server | everything a relaying directory node sees, in its own logs | the same as on the directories |
 
 A maker's single nick, and the nick key its private lines carry, link its presence on all its channels, as in
-JoinMarket. A taker's nicks differ per channel.
+JoinMarket. A taker's nicks differ per channel, so they cannot be linked from one round to the next; within
+one round the makers can link them, since every one of them sees the round's commitment and transaction.
 
 `node` is `--rpc-url <url>` with `--rpc-cookie-file <file>` (or `--rpc-user <name>` and
 `--rpc-password-file <file>`): a Bitcoin Core compatible node on the wallet's network.

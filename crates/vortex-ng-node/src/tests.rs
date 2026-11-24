@@ -1444,22 +1444,77 @@ fn a_line_of_thousands_of_commands_is_not_read() {
 #[test]
 fn past_the_cap_a_channel_keeps_a_sample_of_who_answered() {
     let mut book: ChannelAnswers<u8> = ChannelAnswers::new();
+    let mut no_bonds = |_: &str, _: &str| false;
     for i in 0..MAX_ANSWERING_NICKS {
         assert!(
-            book.place(&format!("J5first{i}"), &0, i as u64, 0)
+            book.place(&format!("J5first{i}"), &0, i as u64, 0, None, &mut no_bonds)
                 .is_some()
         );
     }
     // A later nick gets a place when its draw lands inside the table, and pushes one out.
     let heard = MAX_ANSWERING_NICKS as u64 + 1;
-    assert!(book.place("J5late", &0, heard, 3).is_some());
+    assert!(
+        book.place("J5late", &0, heard, 3, None, &mut no_bonds)
+            .is_some()
+    );
     assert_eq!(book.answers.len(), MAX_ANSWERING_NICKS);
     assert!(book.answers.contains_key("J5late"));
     // When it lands past the table it does not, and nothing moves.
     let past = MAX_ANSWERING_NICKS as u64 + 1;
-    assert!(book.place("J5unlucky", &0, heard + 1, past).is_none());
+    assert!(
+        book.place("J5unlucky", &0, heard + 1, past, None, &mut no_bonds)
+            .is_none()
+    );
     assert!(!book.answers.contains_key("J5unlucky"));
     assert_eq!(book.answers.len(), MAX_ANSWERING_NICKS);
+}
+
+#[test]
+fn past_the_cap_a_real_bond_keeps_its_place_and_gets_one() {
+    let mut book: ChannelAnswers<u8> = ChannelAnswers::new();
+    let asked = std::cell::Cell::new(0usize);
+    let mut real = |maker: &str, _: &str| {
+        asked.set(asked.get() + 1);
+        maker.starts_with("J5bond")
+    };
+    // Every nick shows a proof; only the bonds' stand up.
+    for i in 0..MAX_ANSWERING_NICKS {
+        let nick = if i == 0 {
+            "J5bond0".to_string()
+        } else {
+            format!("J5first{i}")
+        };
+        let answer = book.place(&nick, &0, i as u64, 0, None, &mut real).unwrap();
+        answer.proof = Some("a proof".into());
+    }
+    // Nothing is asked of the chain while there are places left.
+    assert_eq!(asked.get(), 0);
+    // Later nicks land inside the table and push others out, but never the bond.
+    for i in 0..5 * MAX_ANSWERING_NICKS as u64 {
+        book.place(
+            &format!("J5later{i}"),
+            &0,
+            0,
+            i * 7_919,
+            Some("a proof"),
+            &mut real,
+        );
+    }
+    assert!(book.answers.contains_key("J5bond0"));
+    assert_eq!(book.answers.len(), MAX_ANSWERING_NICKS);
+    // A draw past the table turns a newcomer away, unless its bond is real.
+    let past = MAX_ANSWERING_NICKS as u64;
+    assert!(
+        book.place("J5plain", &0, 0, past, Some("a proof"), &mut real)
+            .is_none()
+    );
+    assert!(
+        book.place("J5bond1", &0, 0, past, Some("a proof"), &mut real)
+            .is_some()
+    );
+    assert!(book.answers.contains_key("J5bond0") && book.answers.contains_key("J5bond1"));
+    // The proofs held when the places ran out, then one per newcomer.
+    assert!(asked.get() > MAX_ANSWERING_NICKS);
 }
 
 #[tokio::test]
@@ -1615,5 +1670,89 @@ async fn a_replayed_offer_does_not_cost_a_maker_its_bond_or_its_route() {
         kept.verify_signatures(&secp, "J5takerOnB", maker.nick())
             .is_ok(),
         "the proof made out to us"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flood_of_nicks_does_not_push_out_a_real_bond() {
+    use vortex_ng_channel::testing::mock_channel;
+    use vortex_ng_core::bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use vortex_ng_core::bond::BondTemplate;
+    use vortex_ng_core::nick::NickIdentity;
+
+    let secp = Secp256k1::new();
+    let bond = |byte: u8| {
+        let key = SecretKey::from_slice(&[byte; 32]).unwrap();
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([byte; 32]),
+            vout: 0,
+        };
+        BondTemplate::new(&secp, &key, outpoint, 1_893_456_000, 300)
+    };
+    let line = |maker: &NickIdentity, template: &BondTemplate| {
+        let proof = template.proof(&secp, "J5taker", maker.nick());
+        format!(
+            "0 10000 100000000 0 500!tbond {}",
+            proof.to_base64().unwrap()
+        )
+    };
+    let (mut channel, handle) = mock_channel("J5taker", false);
+    // A maker with a real bond answers first, and another one once the flood has filled the places. Every nick
+    // of the flood shows a proof of its own: signed, made out to us, and backed by nothing.
+    let (early, late) = (NickIdentity::generate(), NickIdentity::generate());
+    let (early_bond, late_bond, nothing) = (bond(1), bond(2), bond(3));
+    handle.deliver_private(
+        &early,
+        "J5taker",
+        "sw0absoffer",
+        &line(&early, &early_bond),
+        "a",
+    );
+    // Enough nicks after the places run out to use up the lookups allowed.
+    for i in 0..2 * MAX_ANSWERING_NICKS + 100 {
+        if i == MAX_ANSWERING_NICKS + 500 {
+            handle.deliver_private(
+                &late,
+                "J5taker",
+                "sw0absoffer",
+                &line(&late, &late_bond),
+                "a",
+            );
+        }
+        let sybil = NickIdentity::generate();
+        handle.deliver_private(
+            &sybil,
+            "J5taker",
+            "sw0absoffer",
+            &line(&sybil, &nothing),
+            "a",
+        );
+    }
+    let bonded = [early.nick().to_string(), late.nick().to_string()];
+    let mut asked = 0usize;
+    let book = fetch_orderbook_with_bonds(
+        &mut channel,
+        "regtest",
+        // Room to check every line's signatures in an unoptimised build.
+        Duration::from_secs(15),
+        |_| Some(0),
+        |maker, _proof, us| {
+            asked += 1;
+            assert_eq!(us, "J5taker");
+            bonded.iter().any(|nick| nick == maker)
+        },
+    )
+    .await
+    .unwrap();
+    for nick in &bonded {
+        assert!(book.proofs.contains_key(nick), "{nick} kept its place");
+    }
+    let makers: std::collections::HashSet<&String> =
+        book.offers.iter().map(|(nick, _)| nick).collect();
+    assert_eq!(makers.len(), MAX_ANSWERING_NICKS);
+    // The chain was asked only after the places ran out, and no more than allowed.
+    assert!(
+        asked > MAX_ANSWERING_NICKS && asked <= MAX_BOND_LOOKUPS,
+        "{asked}"
     );
 }

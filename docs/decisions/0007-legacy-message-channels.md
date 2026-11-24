@@ -47,7 +47,9 @@ only as trustworthy as the directory or server that forwarded the line.
    - A maker keeps one nick on every channel, as JoinMarket does. A session belongs to the channel its
      `!fill` arrived on; that nick's lines on other channels are ignored while the session lives.
    - A taker uses a different nick on each channel, so a maker never has to choose which channel to answer on,
-     and the taker's channels cannot be linked through its nick.
+     and the taker's channels cannot be linked through its nick. Within one round they can be linked anyway:
+     every maker in it gets the same commitment and encryption key, and in the end the same transaction
+     (issue #52). Keeping a separate key per maker would not change that, as the transaction is the same.
    - A line is verified against the `hostid` of the channel it arrived on. Routes are learned only from
      verified private lines, never from unsigned public ones. The strict nick check is used everywhere.
 3. **No legacy channel is switched on before the maker and taker tolerate stray lines.** A line that verifies
