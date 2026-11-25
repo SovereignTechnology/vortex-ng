@@ -219,6 +219,27 @@ async fn admission(
     Ok(())
 }
 
+/// Whether `tx` may be returned: every coin it spends is unspent on `chain`, or `chain` already has the
+/// transaction (its first output is there).
+///
+/// The coins are asked first and the transaction second, and the order matters. Every peer finishes the round
+/// at the same moment, and any of them may broadcast it. Asked the other way round, a peer finds the
+/// transaction absent, a second peer broadcasts it, and the peer then finds its coins spent and fails a round
+/// that is done. Asked in this order, a coin that is seen spent was spent by something that was already on the
+/// node, and the transaction is looked for after that: if it is ours, it is there.
+fn coins_unspent_or_tx_known(chain: &impl ChainLookup, tx: &Transaction) -> bool {
+    tx.input
+        .iter()
+        .all(|i| matches!(chain.utxo(&i.previous_output), Ok(Some(_))))
+        || matches!(
+            chain.utxo(&OutPoint {
+                txid: tx.compute_txid(),
+                vout: 0
+            }),
+            Ok(Some(_))
+        )
+}
+
 /// Run `peer`'s session on the pool's channel until it yields the transaction, and return it.
 ///
 /// `client` is connected as the pool key (see [`pool_client`]) and reads the channel from `since`, which
@@ -249,15 +270,7 @@ pub async fn run_pool(
             match action {
                 Action::Send(text) => client.send(&pool_key, &text).await?,
                 Action::Broadcast(tx) => {
-                    let unspent = blocking(|| {
-                        let txid = tx.compute_txid();
-                        matches!(chain.utxo(&OutPoint { txid, vout: 0 }), Ok(Some(_)))
-                            || tx
-                                .input
-                                .iter()
-                                .all(|i| matches!(chain.utxo(&i.previous_output), Ok(Some(_))))
-                    });
-                    if !unspent {
+                    if !blocking(|| coins_unspent_or_tx_known(chain, &tx)) {
                         return Err(NodeError::Pool(
                             "the transaction spends a coin that is not unspent".into(),
                         ));
@@ -319,13 +332,17 @@ pub async fn run_pool(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use nostr_sdk::prelude::MockRelay;
     use vortex_ng_chain::Utxo;
+    use vortex_ng_core::bitcoin::absolute::LockTime;
     use vortex_ng_core::bitcoin::hashes::Hash;
     use vortex_ng_core::bitcoin::secp256k1::Secp256k1;
+    use vortex_ng_core::bitcoin::transaction::Version;
     use vortex_ng_core::bitcoin::{
-        Address, Amount, CompressedPublicKey, Network, OutPoint, TxOut, Txid,
+        Address, Amount, CompressedPublicKey, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxOut,
+        Txid, Witness,
     };
 
     use super::*;
@@ -607,6 +624,76 @@ mod tests {
         let joiner = tokio::spawn(join_and_run(2, url, since, WAIT));
         let tx = creator.await.unwrap().unwrap();
         assert_eq!(joiner.await.unwrap().unwrap(), tx);
+    }
+
+    /// A chain on which another peer's broadcast of the round lands after `before` questions: until then the
+    /// round's coins are unspent and its first output is absent, afterwards the coins are spent and the output
+    /// is there.
+    struct BroadcastAfter {
+        asked: AtomicUsize,
+        before: usize,
+    }
+
+    impl ChainLookup for BroadcastAfter {
+        fn utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, String> {
+            let broadcast = self.asked.fetch_add(1, Ordering::SeqCst) >= self.before;
+            let is_coin = (1..=3u8).any(|i| coin(i).0 == *outpoint);
+            Ok((is_coin != broadcast).then(|| Utxo {
+                value: Amount::from_sat(99_750),
+                script_pubkey: address(&key(150)).script_pubkey(),
+                confirmations: 0,
+                coinbase: false,
+            }))
+        }
+        fn tip_height(&self) -> Result<u32, String> {
+            Ok(300)
+        }
+        fn block_time(&self, height: u32) -> Result<u32, String> {
+            Ok(1_700_000_000 + height * 600)
+        }
+    }
+
+    /// A round of the coins `coin(1)` to `coin(3)`.
+    fn round_of_three() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: (1..=3u8)
+                .map(|i| TxIn {
+                    previous_output: coin(i).0,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![coin(4).1],
+        }
+    }
+
+    #[test]
+    fn a_broadcast_landing_between_the_questions_does_not_fail_the_round() {
+        let tx = round_of_three();
+        // Three coins and then the transaction are asked at most: the other peer's broadcast may land before
+        // any of those four, or after all of them.
+        for before in 0..=4 {
+            let chain = BroadcastAfter {
+                asked: AtomicUsize::new(0),
+                before,
+            };
+            assert!(
+                coins_unspent_or_tx_known(&chain, &tx),
+                "the broadcast landed after {before} questions"
+            );
+        }
+    }
+
+    #[test]
+    fn coins_spent_by_another_transaction_still_fail_the_round() {
+        // `Coins::default()` holds nothing: the coins are spent and the round's own output was never there.
+        assert!(!coins_unspent_or_tx_known(
+            &Coins::default(),
+            &round_of_three()
+        ));
     }
 
     /// A stand-in aut-ct server speaking the real framing. A proof is the proving key itself, and its key
