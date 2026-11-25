@@ -1,6 +1,7 @@
 //! `vortex-ng lnd-coins`, and the LND half of `vortex-ng coinjoin --from-lnd`: the coins a channel close
 //! left in an LND node's own wallet, spent with the node signing (ADR 0008).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use vortex_ng_core::bitcoin::{Network, OutPoint, Script, TxOut};
@@ -109,6 +110,15 @@ pub(crate) struct Selection {
     pub(crate) committed_sats: u64,
 }
 
+/// How a selection may spend the wallet.
+#[derive(Clone, Copy)]
+pub(crate) struct Spend<'a> {
+    /// Whether the node's channel-close coins may be merged into one round.
+    pub(crate) merge: bool,
+    /// Coins another command on this wallet holds, which are not ours to spend.
+    pub(crate) held: &'a HashSet<OutPoint>,
+}
+
 /// Choose the node's close coins for a round in `cfg`'s pit, leaving what the node must keep for its anchor
 /// channels, and a commitment from `mixdepth` of `wallet`.
 pub(crate) fn select(
@@ -118,8 +128,9 @@ pub(crate) fn select(
     mixdepth: u32,
     height: u32,
     log: &PodleLog,
-    merge: bool,
+    spend: Spend<'_>,
 ) -> Result<Selection, Failure> {
+    let Spend { merge, held } = spend;
     let coins = lnd.coins().map_err(failed)?;
     let closes: Vec<_> = coins
         .iter()
@@ -156,7 +167,7 @@ pub(crate) fn select(
              force close of its open anchor channels: nothing was sent"
         )));
     }
-    let (podle, committed_sats) = commitment(wallet, mixdepth, cfg.amount, height, log)?;
+    let (podle, committed_sats) = commitment(wallet, mixdepth, cfg.amount, height, log, held)?;
     Ok(Selection {
         inputs,
         podle,
@@ -174,10 +185,13 @@ fn commitment(
     amount: u64,
     height: u32,
     log: &PodleLog,
+    held: &HashSet<OutPoint>,
 ) -> Result<(Podle, u64), Failure> {
     let mut fit = Vec::new();
+    // A coin another command on this wallet holds is not ours to show makers as a commitment either.
     for coin in confirmed_coins(wallet, mixdepth, height)? {
-        if coin.fit_to_commit(amount)
+        if !held.contains(&coin.utxo.outpoint)
+            && coin.fit_to_commit(amount)
             && !wallet
                 .came_from_coinjoin(mixdepth, &coin.utxo.outpoint)
                 .map_err(failed)?

@@ -94,10 +94,13 @@ What each channel shows, and to whom:
 | channel | the operator sees | others on the channel see |
 |---|---|---|
 | Nostr (ADR 0002) | the recipient's key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
-| onion directories, relayed (`NOT-SERVING-ONION`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are in clear text | public offers, `!orderbook`, `!hp2`; a nick's presence |
+| onion directories, relayed (`NOT-SERVING-ONION`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted from an operator that only reads them, but `!fill` (order id, amount, commitment) and `!pubkey` are in clear text | public offers, `!orderbook`, `!hp2`; a nick's presence |
 | onion directories, a taker connected directly | that two nicks are in contact (the maker's offer to the taker), none of the rest of their round, except a `!fill` the taker sends through the directories before it connects, as some do, with the maker's `!pubkey`, and the answers of a maker that replies through the directories anyway, as some do, `!pubkey` in clear text | the same |
 | IRC | everything a directory sees, plus the server's own logs | the same as on onion |
 
+- The table describes an operator that reads. One that also adds or changes lines can do more, because the
+  signature covers neither the command nor the recipient (Context); how far that goes, and what to do about it,
+  is tracked in issue #52.
 - A maker's single nick, and the nick key's public key that every private line carries, link its presence on
   all its channels. That is JoinMarket's existing behaviour; vortex-ng documents it rather than changing it.
 - The legacy channels add a dependency on a Tor daemon for anything beyond regtest, which ADR 0002 avoided.

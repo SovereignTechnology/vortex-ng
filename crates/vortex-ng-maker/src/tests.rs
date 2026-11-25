@@ -1229,3 +1229,141 @@ fn the_keeper_is_rewritten_from_what_is_remembered_when_it_asks() {
     assert_eq!(keeper.0.lock().unwrap().rewrites, 1);
     assert_eq!(keeper.kept().len(), 3);
 }
+
+/// Claims in memory, shared with the test: coins held by another user of the wallet, those held for the
+/// maker, and the highest address index handed out on each chain (mixdepth, change).
+#[derive(Clone, Default)]
+struct MemoryClaims(std::sync::Arc<std::sync::Mutex<ClaimsState>>);
+
+#[derive(Default)]
+struct ClaimsState {
+    elsewhere: HashSet<OutPoint>,
+    ours: Vec<OutPoint>,
+    issued: HashMap<(u32, bool), u32>,
+}
+
+impl WalletClaims for MemoryClaims {
+    fn held_elsewhere(&self) -> Result<HashSet<OutPoint>, String> {
+        Ok(self.0.lock().unwrap().elsewhere.clone())
+    }
+
+    fn hold(&self, coins: &[OutPoint], _seconds: u64) -> Result<bool, String> {
+        let mut state = self.0.lock().unwrap();
+        if coins.iter().any(|c| state.elsewhere.contains(c)) {
+            return Ok(false);
+        }
+        state.ours.extend_from_slice(coins);
+        Ok(true)
+    }
+
+    fn fresh_address(
+        &self,
+        wallet: &mut PitWallet,
+        mixdepth: u32,
+        change: bool,
+    ) -> Result<vortex_ng_core::bitcoin::Address, String> {
+        let mut state = self.0.lock().unwrap();
+        if let Some(highest) = state.issued.get(&(mixdepth, change)) {
+            wallet
+                .reveal_through(mixdepth, change, *highest)
+                .map_err(|e| e.to_string())?;
+        }
+        let (index, address) = wallet
+            .next_address_indexed(mixdepth, change)
+            .map_err(|e| e.to_string())?;
+        state.issued.insert((mixdepth, change), index);
+        Ok(address)
+    }
+}
+
+#[test]
+fn a_coin_held_by_another_user_of_the_wallet_is_never_offered_or_spent() {
+    let (taker, chain) = new_taker();
+    let coins: Vec<OutPoint> = maker_coins().into_iter().map(|(coin, _)| coin).collect();
+    let big = coins
+        .iter()
+        .copied()
+        .find(|c| {
+            maker_coins()
+                .iter()
+                .any(|(o, u)| o == c && u.value.to_sat() == 500_000)
+        })
+        .unwrap();
+    let claims = MemoryClaims::default();
+    let mut maker = funded_maker();
+    assert_eq!(maker.liquidity().unwrap(), 800_000);
+    maker.share_wallet(Box::new(claims.clone()));
+    // A joinstr round in another process holds the 500,000 coin.
+    claims.0.lock().unwrap().elsewhere.insert(big);
+    assert_eq!(
+        maker.liquidity().unwrap(),
+        300_000,
+        "only what nobody else holds"
+    );
+    // A round the other coin covers goes ahead without it; the coins shown are now held for the maker.
+    let ioauth = auth_round(&mut maker, &taker, &chain, 200_000).expect("an !ioauth");
+    assert!(!ioauth.utxos.contains(&big));
+    assert_eq!(claims.0.lock().unwrap().ours, ioauth.utxos);
+}
+
+#[test]
+fn a_round_is_refused_when_its_coins_are_taken_meanwhile_and_addresses_are_handed_out_once() {
+    let (taker, chain) = new_taker();
+    let claims = MemoryClaims::default();
+    let mut maker = funded_maker();
+    maker.share_wallet(Box::new(claims.clone()));
+    // Another user of the wallet already took the first addresses this maker would hand out: index 0 of
+    // mixdepth 1's receiving chain (the round's output) and of mixdepth 0's change chain.
+    {
+        let mut state = claims.0.lock().unwrap();
+        state.issued.insert((1, false), 0);
+        state.issued.insert((0, true), 0);
+    }
+    let ioauth = auth_round(&mut maker, &taker, &chain, 200_000).expect("an !ioauth");
+    let reference = maker_wallet();
+    assert_eq!(
+        ioauth.cj_address,
+        reference.peek_address(1, false, 1).unwrap().to_string()
+    );
+    assert_eq!(
+        ioauth.change_address,
+        reference.peek_address(0, true, 1).unwrap().to_string()
+    );
+    let state = claims.0.lock().unwrap();
+    assert_eq!(
+        (state.issued[&(1, false)], state.issued[&(0, true)]),
+        (1, 1),
+        "what was handed out is written down"
+    );
+    drop(state);
+
+    // Its coins held elsewhere between the choice and the hold: the round is refused, nothing shown.
+    let mut maker = funded_maker();
+    let racing = MemoryClaims::default();
+    maker.share_wallet(Box::new(RaceClaims(racing.clone())));
+    assert!(auth_round(&mut maker, &taker, &chain, 200_000).is_none());
+    assert!(racing.0.lock().unwrap().ours.is_empty());
+}
+
+/// Claims that let the maker choose any coin and then refuse to hold it, as when another process holds it
+/// between the two.
+struct RaceClaims(MemoryClaims);
+
+impl WalletClaims for RaceClaims {
+    fn held_elsewhere(&self) -> Result<HashSet<OutPoint>, String> {
+        Ok(HashSet::new())
+    }
+
+    fn hold(&self, _coins: &[OutPoint], _seconds: u64) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn fresh_address(
+        &self,
+        wallet: &mut PitWallet,
+        mixdepth: u32,
+        change: bool,
+    ) -> Result<vortex_ng_core::bitcoin::Address, String> {
+        self.0.fresh_address(wallet, mixdepth, change)
+    }
+}

@@ -37,8 +37,11 @@ REF_COMMIT=77a426c504cbf6fa56ba0316dfd8da63a76d2bbf  # v0.9.12, docs/upstream-pi
 # What the reference's install.sh builds (v0.9.12 install.sh: libsecp256k1_install).
 SECP_VERSION=0.5.0
 SECP_SHA256=07934fde88c677abbc4d42c36ef7ef8d3850cd0c065e4f976f66f4f97502c95a
-# The reference's own IRC test server (v0.9.12 test/run_tests.sh).
-MINIIRCD_SHA256=ce3a4ddc777343645ccd06ca36233b5777e218ee89d887ef529ece86a917fc33
+# The reference's own IRC test server. v0.9.12's test/run_tests.sh fetches its master.tar.gz and checks it
+# against ce3a4ddc…a917fc33, which master moving would break; this is the commit that archive holds (its files are
+# identical, 2026-11-25), checked out by git, which checks it.
+MINIIRCD_REPO=https://github.com/JoinMarket-Org/miniircd.git
+MINIIRCD_COMMIT=20a391f490a58ba9ef295b0d813a95a7e9337382
 CORE_VERSION=32.1
 CORE_SHA256=61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963
 PORT=18443
@@ -214,9 +217,9 @@ EOF
     fi
     ngircd -n -f "$work/ngircd.conf" >"$logs/ircd.log" 2>&1 &
   else
-    fetch https://github.com/JoinMarket-Org/miniircd/archive/master.tar.gz "$MINIIRCD_SHA256" "$work/miniircd.tar.gz"
-    mkdir -p "$work/miniircd"
-    tar -xzf "$work/miniircd.tar.gz" -C "$work/miniircd" --strip-components=1
+    git clone -q "$MINIIRCD_REPO" "$work/miniircd"
+    git -C "$work/miniircd" -c advice.detachedHead=false checkout -q "$MINIIRCD_COMMIT"
+    [ "$(git -C "$work/miniircd" rev-parse HEAD)" = "$MINIIRCD_COMMIT" ] || { echo "miniircd is not at the pin" >&2; exit 97; }
     # It refuses to run as root without dropping to another account after binding.
     python3 "$work/miniircd/miniircd" --listen=127.0.0.1 --ports="$IRC_PORT" --setuid=nobody >"$logs/ircd.log" 2>&1 &
     meet_env+=("VORTEX_NG_INTEROP_IRC=127.0.0.1:$IRC_PORT")

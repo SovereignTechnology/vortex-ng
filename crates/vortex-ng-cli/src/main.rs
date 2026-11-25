@@ -5,14 +5,16 @@
 //! what they offer; `maker` offers the wallet's coins until stopped; `coinjoin` does one CoinJoin as the
 //! taker; `balance` shows what the wallet holds; `coins` lists its coins and marks the ones a Lightning
 //! channel close paid it (`coinjoin --from-closes` spends only those); `lnd-coins` does the same for an LND node's wallet, and
-//! `coinjoin --from-lnd` spends from it with the node signing. Exit status 0 on success, 1 when the command
-//! failed, 2 when it was not understood.
+//! `coinjoin --from-lnd` spends from it with the node signing; `pools`, `pool join` and `pool create` take part
+//! in joinstr pools (ADR 0006). Exit status 0 on success, 1 when the command failed, 2 when it was not
+//! understood.
 
 mod args;
-mod issued;
+mod claims;
 mod lightning;
 mod market;
 mod podle_log;
+mod pool;
 mod secret;
 mod seen_log;
 mod wallet;
@@ -50,6 +52,12 @@ Usage:
   vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only]
                       [--outpoints]
   vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
+  vortex-ng pools     --relays <url[,url...]> [--wait <seconds>] [--proxy <address>]
+  vortex-ng pool join   --wallet <file> --relays <url[,url...]> --pool <id|key> node [--pit sw0|tr0]
+                        [--mixdepth 0-4] [--wait <seconds>] [--proxy <address>] [--yes]
+  vortex-ng pool create --wallet <file> --relays <url> --denomination <sats> --peers <n> node
+                        [--pit sw0|tr0] [--mixdepth 0-4] [--fee-rate <sat/vB>] [--expires <seconds>]
+                        [--proxy <address>] [--yes]
   vortex-ng --version
 
 where: at least one of these. None is on by default.
@@ -69,12 +77,21 @@ Who sees what:
   a Nostr relay      the recipient key and timing of private messages; public messages.
   a directory node   offers and who is present. For each private line it relays: sender, recipient, size and
                      timing, with `!fill` (order id, amount, commitment) and `!pubkey` in plain text. The
-                     encrypted steps stay encrypted. When a taker connects to a maker's onion directly, the
+                     encrypted steps stay encrypted from a directory that only reads them; one that also
+                     alters lines can do more (README, issue #52). When a taker connects to a maker's onion directly, the
                      rest of their round leaves the directory, except a `!fill` some takers still send
                      through it first (and its `!pubkey`) and the answers of a maker that replies through
                      it anyway.
   an IRC server      the same as a relaying directory node, in its own logs.
 A maker's one nick and its key link its presence on all its channels. More: the README, 'Command line'.
+
+Pools are joinstr's (another protocol, over Nostr relays): one coin worth the denomination plus 500 to 5000 sat
+goes in, one output of the denomination less a share of the mining fee comes out, in the next mixdepth; nobody
+is paid. `coinjoin --amount <sats>` leaves a coin of exactly that much in the next mixdepth. Relays see who
+writes to a pool and when, and every peer can read every pool message.
+
+Commands on one wallet share <wallet>.claims: a coin held by a maker's round, a coinjoin or a pool is never put
+into another, and no address is handed out twice, so `maker` and `pool` can run on one wallet at once.
 
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
@@ -127,6 +144,10 @@ fn run(args: &[String]) -> Result<(), Failure> {
         [command, rest @ ..] if command == "balance" => market::balance(rest),
         [command, rest @ ..] if command == "coins" => market::coins(rest),
         [command, rest @ ..] if command == "lnd-coins" => lightning::lnd_coins(rest),
+        [command, rest @ ..] if command == "pools" => pool::pools(rest),
+        [group, command, rest @ ..] if group == "pool" && command == "join" => pool::join(rest),
+        [group, command, rest @ ..] if group == "pool" && command == "create" => pool::create(rest),
+        [group, ..] if group == "pool" => Err(Failure::Usage("pool: join or create?".into())),
         [group] if group == "wallet" => Err(Failure::Usage("wallet: which command?".into())),
         [other, ..] => Err(Failure::Usage(format!("unknown command `{other}`"))),
     }

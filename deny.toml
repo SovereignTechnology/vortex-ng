@@ -10,7 +10,7 @@ yanked = "deny"
 unsound = "all"
 unmaintained = "all"
 ignore = [
-    # The three below arrive only with vortex-ng-nostr's opt-in `tor` feature (arti 0.47).
+    # The four below arrive only with vortex-ng-nostr's opt-in `tor` feature (arti 0.47).
     # C SQLite CVE-2026-119375 in BUNDLED libsqlite3-sys < 0.39. Our build does not enable `bundled`
     # (`cargo tree -e features -i libsqlite3-sys` shows default/pkg-config only): it links the system
     # SQLite, which the distro patches. arti 0.47 and 0.48 cap rusqlite < 0.41, so no arti release can take
@@ -20,6 +20,23 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa used for signature verification only (arti)" },
     # paste is unmaintained, a build-time proc macro with no maintained replacement in arti's tree.
     { id = "RUSTSEC-2024-0436", reason = "build-time proc macro via arti's pwd-grp; no safe upgrade" },
+    # humantime is flagged unmaintained because chrono is; arti-client uses it to read durations. No other crate
+    # in arti's tree does that job.
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained; arti's tree only (feature tor), no replacement there" },
+    # heapless 0.8.0 reaches us through faster-hex 0.10 (nostr 0.45's hex encoding), which uses only a
+    # `heapless::Vec` and `String` (`hex_string::<N>`, its src/encode.rs): never an IntoIter, Deque, IndexMap,
+    # Spsc, sorted list or treiber stack, which is every API the nine advisories of 2026-11-18 name. The fix is
+    # heapless 0.9.4, which nostr's faster-hex requirement keeps out of reach; re-check at each nostr bump and
+    # drop these when it takes a faster-hex that uses 0.9.
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.8 via faster-hex: sorted_linked_list::FindMutView not used" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.8 via faster-hex: spsc::Spsc not used" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.8 via faster-hex: IndexMap not used" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.8 via faster-hex: only Vec::new/extend/String::from_utf8 used, no IntoIter, Deque, HistoryBuf or IndexMap" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.8 via faster-hex: SortedLinkedList not used" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.8 via faster-hex: Deque not used" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.8 via faster-hex: treiber stack (pool) not used" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.8 via faster-hex: Deque not used" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.8 via faster-hex: IndexMap not used" },
 ]
 
 [licenses]
@@ -81,6 +98,9 @@ skip = [
     { name = "windows-sys", version = "=0.52.0" },
     # Build-time only: curve25519-dalek-derive (crypto_box) on syn 2; serde_derive, displaydoc and others on syn 3.
     { name = "syn", version = "=2.0.119" },
+    # webpki-roots 0.26.11 holds no code of its own: it is a "semver trick" release that re-exports 1.x, which
+    # is the other copy. tokio-tungstenite 0.28 (nostr-sdk's WebSocket stack) still asks for 0.26.
+    { name = "webpki-roots", version = "=0.26.11" },
 ]
 
 [sources]

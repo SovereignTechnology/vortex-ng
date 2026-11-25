@@ -16,8 +16,8 @@ use vortex_ng_autct::keyfile::KeyFile;
 use vortex_ng_autct::rpc::Client as AutctClient;
 
 use vortex_ng_chain::ChainLookup;
-use vortex_ng_core::bitcoin::Transaction;
 use vortex_ng_core::bitcoin::secp256k1::SecretKey;
+use vortex_ng_core::bitcoin::{OutPoint, Transaction};
 use vortex_ng_joinstr::message::{PoolMessage, admit_join};
 use vortex_ng_joinstr::pool::{Pool, Transport, accept_credentials};
 use vortex_ng_joinstr::session::{Action, Peer};
@@ -226,7 +226,8 @@ async fn admission(
 /// requests: with the credentials, or, in an aut-ct pool, with a `reject` when the proof is missing, does not
 /// verify, or reuses a key image. If our registration has been out for
 /// `input_wait` without the round completing, the recovery round starts. Every coin the finished
-/// transaction spends must be an unspent output on `chain`.
+/// transaction spends must be an unspent output on `chain`, unless `chain` already has the transaction
+/// itself: any peer may broadcast it, and the first to do so spends every coin in it.
 pub async fn run_pool(
     peer: &mut Peer,
     client: &mut PoolClient,
@@ -249,9 +250,12 @@ pub async fn run_pool(
                 Action::Send(text) => client.send(&pool_key, &text).await?,
                 Action::Broadcast(tx) => {
                     let unspent = blocking(|| {
-                        tx.input
-                            .iter()
-                            .all(|i| matches!(chain.utxo(&i.previous_output), Ok(Some(_))))
+                        let txid = tx.compute_txid();
+                        matches!(chain.utxo(&OutPoint { txid, vout: 0 }), Ok(Some(_)))
+                            || tx
+                                .input
+                                .iter()
+                                .all(|i| matches!(chain.utxo(&i.previous_output), Ok(Some(_))))
                     });
                     if !unspent {
                         return Err(NodeError::Pool(
@@ -547,6 +551,64 @@ mod tests {
         assert!(matches!(creator.await.unwrap(), Err(NodeError::Pool(_))));
         assert!(joiner.await.unwrap().is_ok());
     }
+    /// A chain on which another peer has already broadcast the round: its coins are spent, and every other
+    /// output it is asked about (the round's own) is there.
+    #[derive(Clone)]
+    struct AlreadyBroadcast;
+
+    impl ChainLookup for AlreadyBroadcast {
+        fn utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, String> {
+            if (1..=3u8).any(|i| coin(i).0 == *outpoint) {
+                return Ok(None);
+            }
+            Ok(Some(Utxo {
+                value: vortex_ng_core::bitcoin::Amount::from_sat(99_750),
+                script_pubkey: address(&key(150)).script_pubkey(),
+                confirmations: 0,
+                coinbase: false,
+            }))
+        }
+        fn tip_height(&self) -> Result<u32, String> {
+            Ok(300)
+        }
+        fn block_time(&self, height: u32) -> Result<u32, String> {
+            Ok(1_700_000_000 + height * 600)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_round_another_peer_broadcast_first_is_still_returned() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let since = unix_now() - 60;
+        let pool_key = key(204);
+        let pool = Pool::create(&pool_key, "pool5", 0.001, 2, now() + 3600, &url, 2.5).unwrap();
+        let host_pool = pool.clone();
+        let creator = tokio::spawn(async move {
+            let mut client = pool_client(&pool_key, &host_pool.relay, None).await?;
+            client.announce(&host_pool.announcement()).await?;
+            let mut peer = peer(1, &host_pool);
+            let hosting = Some(Hosting {
+                pool: &host_pool,
+                key: &pool_key,
+                autct: None,
+            });
+            run_pool(
+                &mut peer,
+                &mut client,
+                hosting,
+                &AlreadyBroadcast,
+                since,
+                WAIT,
+                Instant::now() + WAIT,
+            )
+            .await
+        });
+        let joiner = tokio::spawn(join_and_run(2, url, since, WAIT));
+        let tx = creator.await.unwrap().unwrap();
+        assert_eq!(joiner.await.unwrap().unwrap(), tx);
+    }
+
     /// A stand-in aut-ct server speaking the real framing. A proof is the proving key itself, and its key
     /// image is derived from that key, so one key gives one image as in aut-ct.
     async fn fake_autct() -> AutctClient {

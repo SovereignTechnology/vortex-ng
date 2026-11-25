@@ -23,6 +23,7 @@ vortex-ng-nostr = { workspace = true }
 vortex-ng-maker = { workspace = true }
 vortex-ng-taker = { workspace = true }
 vortex-ng-node = { workspace = true }
+vortex-ng-joinstr = { workspace = true }
 tokio = { workspace = true }
 zeroize = { workspace = true }
 rustix = { workspace = true }

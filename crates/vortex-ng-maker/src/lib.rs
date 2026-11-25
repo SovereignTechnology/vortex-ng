@@ -75,6 +75,25 @@ pub trait CommitmentKeeper: Send {
     fn rewrite(&mut self, remembered: &[(Seen, [u8; 32])]) -> Result<(), String>;
 }
 
+/// What a maker shares its wallet through with other users of it, such as a joinstr pool round run by
+/// another process (issue #51): a coin one of them holds is never offered by another, and an address is
+/// handed out once. The maker does no I/O itself; the implementation does, on each call.
+pub trait WalletClaims: Send {
+    /// The coins held by someone else now.
+    fn held_elsewhere(&self) -> Result<HashSet<OutPoint>, String>;
+    /// Hold `coins` for this maker for `seconds`. `Ok(false)`, and nothing held, if one of them is held
+    /// elsewhere already.
+    fn hold(&self, coins: &[OutPoint], seconds: u64) -> Result<bool, String>;
+    /// The next address of `wallet`'s mixdepth `mixdepth` (its change chain when `change`) that no other user
+    /// of the wallet has been given, now taken for good: `wallet` is moved past what others took.
+    fn fresh_address(
+        &self,
+        wallet: &mut PitWallet,
+        mixdepth: u32,
+        change: bool,
+    ) -> Result<vortex_ng_core::bitcoin::Address, String>;
+}
+
 /// Why the maker dropped a session, or did nothing. Only a fixed `!error` reaches the taker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MakerError {
@@ -156,6 +175,8 @@ pub struct Maker {
     used_commitments: Commitments,
     /// Where seen commitments are kept beyond this process, if anywhere.
     keeper: Option<Box<dyn CommitmentKeeper>>,
+    /// Who else uses the wallet, if anyone.
+    claims: Option<Box<dyn WalletClaims>>,
     /// When we announced commitments handed to us privately, within the last window.
     hp2_relayed: std::collections::VecDeque<u64>,
     bond: Option<BondTemplate>,
@@ -274,6 +295,7 @@ impl Maker {
             pruned_at: None,
             used_commitments: Commitments::default(),
             keeper: None,
+            claims: None,
             hp2_relayed: std::collections::VecDeque::new(),
             bond: None,
         })
@@ -313,6 +335,41 @@ impl Maker {
         }
         self.keeper = Some(keeper);
         self.rewrite_if_wanted();
+    }
+
+    /// Share the wallet with other users of it through `claims`: from now on the maker offers and spends only
+    /// coins nobody else holds, holds the coins it shows a taker, and takes every address it hands out.
+    pub fn share_wallet(&mut self, claims: Box<dyn WalletClaims>) {
+        self.claims = Some(claims);
+    }
+
+    /// The coins held by other users of the wallet: none when it is not shared.
+    fn held_elsewhere(&self) -> Result<HashSet<OutPoint>, MakerError> {
+        match &self.claims {
+            Some(claims) => claims.held_elsewhere().map_err(MakerError::Internal),
+            None => Ok(HashSet::new()),
+        }
+    }
+
+    /// The next address of `mixdepth`'s receiving or change chain, one no other user of the wallet was given.
+    fn fresh_address(
+        &mut self,
+        mixdepth: u32,
+        change: bool,
+    ) -> Result<vortex_ng_core::bitcoin::Address, MakerError> {
+        match &self.claims {
+            Some(claims) => claims
+                .fresh_address(&mut self.wallet, mixdepth, change)
+                .map_err(MakerError::Internal),
+            None => {
+                let address = if change {
+                    self.wallet.next_change_address(mixdepth)
+                } else {
+                    self.wallet.next_receive_address(mixdepth)
+                };
+                address.map_err(|e| MakerError::Internal(e.to_string()))
+            }
+        }
     }
 
     /// How many commitments are remembered as used: verified, announced.
@@ -708,14 +765,19 @@ impl Maker {
         let needed =
             (filled.amount + filled.offer.txfee + MAKER_CHANGE_THRESHOLD_SAT).saturating_sub(cjfee);
         let (mixdepth, selected) = self.select(needed, chain)?;
-        let cj = self
-            .wallet
-            .next_receive_address((mixdepth + 1) % MIXDEPTHS)
-            .map_err(|e| MakerError::Internal(e.to_string()))?;
-        let change = self
-            .wallet
-            .next_change_address(mixdepth)
-            .map_err(|e| MakerError::Internal(e.to_string()))?;
+        // Held for the session's lifetime before they are shown: another user of the wallet that holds one
+        // meanwhile wins it, and this round is refused.
+        if let Some(claims) = &self.claims {
+            let coins: Vec<OutPoint> = selected.iter().map(|u| u.outpoint).collect();
+            if !claims
+                .hold(&coins, SESSION_TTL)
+                .map_err(MakerError::Internal)?
+            {
+                return Err(MakerError::Liquidity);
+            }
+        }
+        let cj = self.fresh_address((mixdepth + 1) % MIXDEPTHS, false)?;
+        let change = self.fresh_address(mixdepth, true)?;
         let keys = self
             .wallet
             .utxo_keys(mixdepth, &selected[0])
@@ -762,10 +824,12 @@ impl Maker {
         ])
     }
 
-    /// Confirmed UTXOs per mixdepth, largest first, with each mixdepth's total.
+    /// Confirmed UTXOs per mixdepth that no other user of the wallet holds, largest first, with each
+    /// mixdepth's total.
     fn confirmed(
         &self,
     ) -> Result<Vec<(u64, u32, Vec<vortex_ng_wallet::bdk_wallet::LocalOutput>)>, MakerError> {
+        let held = self.held_elsewhere()?;
         let mut all = Vec::new();
         for m in 0..MIXDEPTHS {
             let mut utxos: Vec<_> = self
@@ -773,7 +837,7 @@ impl Maker {
                 .utxos(m)
                 .map_err(|e| MakerError::Internal(e.to_string()))?
                 .into_iter()
-                .filter(|u| u.chain_position.is_confirmed())
+                .filter(|u| u.chain_position.is_confirmed() && !held.contains(&u.outpoint))
                 .collect();
             utxos.sort_by_key(|u| std::cmp::Reverse(u.txout.value));
             let total = utxos.iter().map(|u| u.txout.value.to_sat()).sum();
@@ -783,7 +847,8 @@ impl Maker {
     }
 
     /// The most one round can draw on: the largest confirmed total of any one mixdepth (a round spends
-    /// from a single mixdepth). What the wallet knows, without asking the node.
+    /// from a single mixdepth), less coins another user of the wallet holds. What the wallet knows, without
+    /// asking the node.
     pub fn liquidity(&self) -> Result<u64, MakerError> {
         Ok(self
             .confirmed()?

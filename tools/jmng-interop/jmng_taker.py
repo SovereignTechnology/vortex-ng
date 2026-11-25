@@ -17,6 +17,10 @@ once started and `JMNG_TXID=<txid>` at the end.
 
 With `JMNG_SOCKS=<host>:<port>` its way to the makers' onions is that SOCKS proxy (the harness's stand-in for
 Tor) instead of a Tor daemon; it still reaches a directory on loopback directly.
+
+tools/mixed-interop/run.sh also sets `JMNG_NETWORK=testnet` (the network name in the directory handshake,
+which joinmarket-clientserver's directory expects on regtest), `JMNG_MAKERS` (how many makers, 2 by default)
+and `JMNG_BROADCAST` (joinmarket-ng's broadcast policy, `not-self` by default).
 """
 
 import asyncio
@@ -70,21 +74,22 @@ async def main() -> int:
     if os.environ.get("JMNG_SOCKS"):
         host, port = os.environ["JMNG_SOCKS"].rsplit(":", 1)
         socks = {"socks_host": host, "socks_port": int(port)}
+    makers = int(os.environ.get("JMNG_MAKERS", "2"))
     config = TakerConfig(
         mnemonic=TAKER_MNEMONIC,
-        network=NetworkType.REGTEST,
+        network=NetworkType(os.environ.get("JMNG_NETWORK", "regtest")),
         bitcoin_network=NetworkType.REGTEST,
         backend_type="descriptor_wallet",
         backend_config={"rpc_url": rpc_url, "rpc_user": user, "rpc_password": password},
         directory_servers=[directory],
         allow_clearnet_connections=True,
-        counterparty_count=2,
-        minimum_makers=2,
+        counterparty_count=makers,
+        minimum_makers=makers,
         maker_timeout_sec=60,
         order_wait_time=20.0,
         bondless_makers_allowance_require_zero_fee=bonds,
         max_cj_fee=MaxCjFee(abs_fee=10_000, rel_fee="0.01"),
-        tx_broadcast=BroadcastPolicy.NOT_SELF,
+        tx_broadcast=BroadcastPolicy(os.environ.get("JMNG_BROADCAST", "not-self")),
         data_dir=data_dir,
         **config_pit,
         **socks,

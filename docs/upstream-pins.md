@@ -12,6 +12,7 @@ references and test vectors, and record the reason below.
 | `joinmarket-ng/joinmarket-ng` PR #643 head (`feat/taproot-pit-ring-market`, draft) | `606765ba3efa3bcda9f3c5b271da684ac48a3c8a` | 2026-10-27 | `tr0` and rings as implemented; where code and JMP drafts differ, both are noted in our specs |
 | `joinmarket-ng/joinmarket-ng` branch `nostr` (offer PoC) | `f9a99b342e6011b594c7a6c152ea1cf05fd6bc0d` | 2025-12-06 | kind 31402 offer events |
 | `JoinMarket-Org/joinmarket-clientserver` release | `v0.9.12` (`77a426c504cbf6fa56ba0316dfd8da63a76d2bbf`) | 2026-04-20 | the reference implementation's behaviour, and the onion and IRC channels' wire format (ADR 0007); announced as its final release, the repository to be archived |
+| `JoinMarket-Org/miniircd` master | `20a391f490a58ba9ef295b0d813a95a7e9337382` | 2026-11-25 | the reference's own IRC test server, which `tools/ref-interop` runs (the reference's v0.9.12 test script fetches the same content as `master.tar.gz`) |
 | `joinmarket-ng/joinmarket-ng` main, `directory_server/` and `jmcore` directory client | `c3312cb4ede6de89bd36a1d5b26786905ffc210f` (release 0.43.0) | 2026-11-05 | the onion directory channel as JoinMarket-NG runs it: handshake features, nick authentication (JMP-0005), ping 798/799, directory limits |
 
 ## joinstr (ADR 0006)

@@ -91,8 +91,9 @@ Facts that shape it:
    spends money without a person is a separate decision, and mainnet wallets stay refused in the CLI.
 6. **An address is never handed out twice.** The wallet lives in memory and learns what is used from the chain,
    so a failed or unconfirmed round's addresses used to come back in the next one, linking the two for good.
-   `coinjoin` now writes each to `<wallet>.issued` before it leaves the process, and every command starts past
-   them. A maker's own addresses are not covered by this change.
+   Every address is now written to `<wallet>.claims` (the highest index per pit, mixdepth and chain) before it
+   leaves the process, by `coinjoin`, a maker and a joinstr pool alike, and every command starts past them
+   (the file is shared with the coin holds of ADR 0006's addendum).
 
 ## Consequences
 

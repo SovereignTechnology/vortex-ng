@@ -61,7 +61,12 @@ rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Ecl
 
 ## Command line
 
+<<<<<<< HEAD
 `vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin`, `balance`, `coins` and `lnd-coins`.
+=======
+`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin`, `balance`, and `pools`, `pool join` and
+`pool create` for joinstr pools.
+>>>>>>> github/main
 
 ```
 vortex-ng wallet new          --wallet <file> --network <network> [--words 12|24] [--birthday <height>]
@@ -108,9 +113,13 @@ What each channel shows, and to whom (ADR 0007 has the reasons):
 | channel | its operator sees | others on it see |
 |---|---|---|
 | Nostr relays | the recipient key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
-| onion directory nodes, relaying (a maker that serves no onion: a vortex-ng maker without `--serve-onion`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
+| onion directory nodes, relaying (a maker that serves no onion: a vortex-ng maker without `--serve-onion`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted from an operator that only reads them, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
 | onion directory nodes, when a taker connects to a maker's onion directly | that the two nicks are in contact (the maker's offer to the taker), none of the rest of their round, with two exceptions: a taker that sends its `!fill` through the directories before it connects, as some do, shows them that `!fill` and the maker's `!pubkey`; a maker that answers through the directories anyway, as some do, shows them its answers, `!pubkey` in plain text | the same |
 | an IRC server | everything a relaying directory node sees, in its own logs | the same as on the directories |
+
+The table describes an operator that reads. A relaying operator that also adds or changes lines can do more,
+because a line's signature covers neither its command nor its recipient; how far that goes, and what vortex-ng
+can do about it, is tracked in issue #52.
 
 A maker's single nick, and the nick key its private lines carry, link its presence on all its channels, as in
 JoinMarket. A taker's nicks differ per channel, so they cannot be linked from one round to the next; within
@@ -167,8 +176,9 @@ one round the makers can link them, since every one of them sees the round's com
     ```
 
     The first four calls are enough for `lnd-coins`.
-- `coinjoin` never hands out an address twice: each is written to `<wallet>.issued` before it is used, so a
-  failed or unconfirmed round's addresses do not come back in the next one.
+- No command hands out an address twice: each is written to `<wallet>.claims` (the highest index per pit,
+  mixdepth and chain) before it leaves the process, and every command starts past them, so a failed or
+  unconfirmed round's addresses do not come back in the next one, whichever command or process asks.
 - By default `coinjoin` needs every maker it asked for. With `--min-makers <n>` it leaves out a maker that fails
   or does not answer within 60 seconds and goes on with at least `n`, up to the moment the transaction goes out;
   after that every maker in it has to sign. Fewer makers is a smaller anonymity set, and another maker in the
@@ -182,6 +192,18 @@ one round the makers can link them, since every one of them sees the round's com
   from what the maker remembers when it grows, so a flood of announcements cannot fill the disk.
 - `orderbook` lists what the makers answer, with the channel each answered on, and verifies their fidelity
   bonds when given a node.
+- `pools` lists the open joinstr pools on the relays named (ADR 0006): reached over Tor, without an aut-ct
+  requirement. `pool join --pool <id>` joins one with a confirmed coin of the wallet's `--mixdepth` (0 by
+  default) worth the pool's denomination plus 500 to 5000 sat; `pool create --denomination <sats> --peers <n>`
+  announces a pool on the first relay named, hosts it and joins it the same way. The output, the denomination
+  less a share of the mining fee, goes to the next mixdepth; nobody is paid, and there is no change, so the coin
+  must be the right size first (`coinjoin --amount <sats>` leaves one in the next mixdepth). Relays see who
+  writes to a pool's key and when; every peer holds the pool's key and can read every pool message; a pool
+  without aut-ct has no defence against one party taking many places.
+- The commands that spend coins share `<wallet>.claims` beside the wallet file: every coin a maker's round, a
+  `coinjoin` or a pool holds, until when, and the highest address index handed out on each chain, read and
+  written under a file lock. A coin one of them holds is never put into another's transaction and no address
+  is handed out twice, so a `maker` and `pool` commands can run on one wallet at the same time (issue #51).
 - `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
   username and password, such as a Tor daemon's SOCKS port (`127.0.0.1:9050`). Every nick then reaches its
   channels under credentials of its own, so Tor gives it circuits of its own: a maker and the throwaway nick it
