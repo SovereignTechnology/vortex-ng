@@ -843,6 +843,7 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
         &[
             "yes",
             "allow-bondless-fees",
+            "strict-routes",
             "from-closes",
             "from-lnd",
             "merge-closes",
@@ -1061,6 +1062,9 @@ pub(crate) fn coinjoin(rest: &[String]) -> Result<(), Failure> {
     )
     .and_then(|taker| taker.allow_fewer_makers(min_makers))
     .map_err(taker_failed)?;
+    if args.flag("strict-routes") {
+        taker = taker.require_first_hand();
+    }
     let outbound = outbound(&args)?;
     let channel = channel_network(network);
     let tx = runtime()?.block_on(async {

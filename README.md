@@ -82,7 +82,8 @@ vortex-ng maker     --wallet <file> where node (--fee-rel <fraction> | --fee-abs
 vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
                     [--min-makers <n>] [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                     [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
-                    [--allow-bondless-fees] [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
+                    [--allow-bondless-fees] [--strict-routes]
+                    [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
 vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
 vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only] [--outpoints]
 vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
@@ -143,6 +144,13 @@ one round the makers can link them, since every one of them sees the round's com
   and at least 2,000 sat unless `--max-maker-fee` says otherwise), takes makers without a fidelity bond only
   at a zero fee unless `--allow-bondless-fees`, shows what it is about to do and asks before sending anything
   (`--yes` skips the question). The transaction is checked with the node before it is broadcast.
+- `coinjoin --strict-routes` answers a maker's `!pubkey` only when it came by a route no relay could have added
+  it to: Nostr, or a direct connection to the maker's onion. A directory or an IRC server can deliver any line a
+  maker ever signed (a line's signature covers neither its command nor its recipient), and without the switch
+  the taker answers such a line too, up to sixteen per maker, in a table separate from the first-hand keys,
+  which relayed ones cannot crowd out. With it, a maker that answers only through a relay (JoinMarket-NG's makers
+  do, whatever route the `!fill` took, and joinmarket-clientserver's on IRC) cannot be filled at all. Off by
+  default for that reason.
 - **Channel closes.** Close a channel with one of the wallet's addresses as the delivery address (LND
   `closechannel --delivery_addr`, Core Lightning `close <id> <timeout> <address>`; `wallet addresses` lists
   them). `coins` then marks what the close paid, `coins --closes-only` shows only those, and

@@ -527,6 +527,10 @@ async fn the_commands_work_on_each_channel_through_the_proxy() {
             "--allow-bondless-fees",
         ];
         args.extend(channels);
+        // On Nostr every line is first-hand, so a taker that answers first-hand keys only still fills.
+        if *name == "Nostr" {
+            args.push("--strict-routes");
+        }
         let round = run(&args);
         assert!(
             round.status.success(),
