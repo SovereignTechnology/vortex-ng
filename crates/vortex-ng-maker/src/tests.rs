@@ -1250,7 +1250,7 @@ fn the_keeper_is_rewritten_from_what_is_remembered_when_it_asks() {
 }
 
 /// Claims in memory, shared with the test: coins held by another user of the wallet, those held for the
-/// maker, and the addresses taken.
+/// maker, and the highest address index handed out on each chain (mixdepth, change).
 #[derive(Clone, Default)]
 struct MemoryClaims(std::sync::Arc<std::sync::Mutex<ClaimsState>>);
 
@@ -1258,7 +1258,7 @@ struct MemoryClaims(std::sync::Arc<std::sync::Mutex<ClaimsState>>);
 struct ClaimsState {
     elsewhere: HashSet<OutPoint>,
     ours: Vec<OutPoint>,
-    taken: HashSet<String>,
+    issued: HashMap<(u32, bool), u32>,
 }
 
 impl WalletClaims for MemoryClaims {
@@ -1275,8 +1275,23 @@ impl WalletClaims for MemoryClaims {
         Ok(true)
     }
 
-    fn take_address(&self, address: &vortex_ng_core::bitcoin::Address) -> Result<bool, String> {
-        Ok(self.0.lock().unwrap().taken.insert(address.to_string()))
+    fn fresh_address(
+        &self,
+        wallet: &mut PitWallet,
+        mixdepth: u32,
+        change: bool,
+    ) -> Result<vortex_ng_core::bitcoin::Address, String> {
+        let mut state = self.0.lock().unwrap();
+        if let Some(highest) = state.issued.get(&(mixdepth, change)) {
+            wallet
+                .reveal_through(mixdepth, change, *highest)
+                .map_err(|e| e.to_string())?;
+        }
+        let (index, address) = wallet
+            .next_address_indexed(mixdepth, change)
+            .map_err(|e| e.to_string())?;
+        state.issued.insert((mixdepth, change), index);
+        Ok(address)
     }
 }
 
@@ -1316,21 +1331,28 @@ fn a_round_is_refused_when_its_coins_are_taken_meanwhile_and_addresses_are_hande
     let claims = MemoryClaims::default();
     let mut maker = funded_maker();
     maker.share_wallet(Box::new(claims.clone()));
-    // Another user of the wallet already took the first addresses this maker would hand out.
-    let mut probe = maker_wallet();
-    let first_cj = probe.next_receive_address(1).unwrap();
-    let first_change = probe.next_change_address(0).unwrap();
+    // Another user of the wallet already took the first addresses this maker would hand out: index 0 of
+    // mixdepth 1's receiving chain (the round's output) and of mixdepth 0's change chain.
     {
         let mut state = claims.0.lock().unwrap();
-        state.taken.insert(first_cj.to_string());
-        state.taken.insert(first_change.to_string());
+        state.issued.insert((1, false), 0);
+        state.issued.insert((0, true), 0);
     }
     let ioauth = auth_round(&mut maker, &taker, &chain, 200_000).expect("an !ioauth");
-    assert_ne!(ioauth.cj_address, first_cj.to_string());
-    assert_ne!(ioauth.change_address, first_change.to_string());
+    let reference = maker_wallet();
+    assert_eq!(
+        ioauth.cj_address,
+        reference.peek_address(1, false, 1).unwrap().to_string()
+    );
+    assert_eq!(
+        ioauth.change_address,
+        reference.peek_address(0, true, 1).unwrap().to_string()
+    );
     let state = claims.0.lock().unwrap();
-    assert!(
-        state.taken.contains(&ioauth.cj_address) && state.taken.contains(&ioauth.change_address)
+    assert_eq!(
+        (state.issued[&(1, false)], state.issued[&(0, true)]),
+        (1, 1),
+        "what was handed out is written down"
     );
     drop(state);
 
@@ -1355,8 +1377,13 @@ impl WalletClaims for RaceClaims {
         Ok(false)
     }
 
-    fn take_address(&self, address: &vortex_ng_core::bitcoin::Address) -> Result<bool, String> {
-        self.0.take_address(address)
+    fn fresh_address(
+        &self,
+        wallet: &mut PitWallet,
+        mixdepth: u32,
+        change: bool,
+    ) -> Result<vortex_ng_core::bitcoin::Address, String> {
+        self.0.fresh_address(wallet, mixdepth, change)
     }
 }
 

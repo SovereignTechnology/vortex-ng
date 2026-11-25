@@ -100,12 +100,15 @@ pub trait WalletClaims: Send {
     /// Hold `coins` for this maker for `seconds`. `Ok(false)`, and nothing held, if one of them is held
     /// elsewhere already.
     fn hold(&self, coins: &[OutPoint], seconds: u64) -> Result<bool, String>;
-    /// Take `address` for good. `Ok(false)` if it was taken before, by anyone.
-    fn take_address(&self, address: &vortex_ng_core::bitcoin::Address) -> Result<bool, String>;
+    /// The next address of `wallet`'s mixdepth `mixdepth` (its change chain when `change`) that no other user
+    /// of the wallet has been given, now taken for good: `wallet` is moved past what others took.
+    fn fresh_address(
+        &self,
+        wallet: &mut PitWallet,
+        mixdepth: u32,
+        change: bool,
+    ) -> Result<vortex_ng_core::bitcoin::Address, String>;
 }
-
-/// Most addresses passed over in a row because another user of the wallet took them.
-const MAX_TAKEN_IN_A_ROW: usize = 1_000;
 
 /// Why the maker dropped a session, or did nothing. Only a fixed `!error` reaches the taker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -404,30 +407,25 @@ impl Maker {
         }
     }
 
-    /// The next address of `mixdepth`'s receiving or change chain that nobody has taken, now taken.
+    /// The next address of `mixdepth`'s receiving or change chain, one no other user of the wallet was given.
     fn fresh_address(
         &mut self,
         mixdepth: u32,
         change: bool,
     ) -> Result<vortex_ng_core::bitcoin::Address, MakerError> {
-        for _ in 0..MAX_TAKEN_IN_A_ROW {
-            let address = if change {
-                self.wallet.next_change_address(mixdepth)
-            } else {
-                self.wallet.next_receive_address(mixdepth)
-            }
-            .map_err(|e| MakerError::Internal(e.to_string()))?;
-            let free = match &self.claims {
-                Some(claims) => claims
-                    .take_address(&address)
-                    .map_err(MakerError::Internal)?,
-                None => true,
-            };
-            if free {
-                return Ok(address);
+        match &self.claims {
+            Some(claims) => claims
+                .fresh_address(&mut self.wallet, mixdepth, change)
+                .map_err(MakerError::Internal),
+            None => {
+                let address = if change {
+                    self.wallet.next_change_address(mixdepth)
+                } else {
+                    self.wallet.next_receive_address(mixdepth)
+                };
+                address.map_err(|e| MakerError::Internal(e.to_string()))
             }
         }
-        Err(MakerError::Internal("no free address".into()))
     }
 
     /// How many commitments are remembered as used: verified, announced.

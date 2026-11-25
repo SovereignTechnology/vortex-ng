@@ -37,7 +37,13 @@
 set -euo pipefail
 
 VORTEX_NG_REPO=https://github.com/SovereignTechnology/vortex-ng.git
-VORTEX_NG_COMMIT=${VORTEX_NG_COMMIT:?set VORTEX_NG_COMMIT to the vortex-ng commit to test}
+# VORTEX_NG_SRC=<directory> builds that copy of vortex-ng instead of cloning a pushed commit.
+VORTEX_NG_SRC=${VORTEX_NG_SRC:-}
+if [ -z "$VORTEX_NG_SRC" ]; then
+  VORTEX_NG_COMMIT=${VORTEX_NG_COMMIT:?set VORTEX_NG_COMMIT to the vortex-ng commit to test, or VORTEX_NG_SRC}
+else
+  VORTEX_NG_COMMIT="local copy"
+fi
 CORE_VERSION=32.1
 CORE_SHA256=61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963
 PORT=18443
@@ -106,9 +112,13 @@ pip install -q --disable-pip-version-check --no-deps "${editable[@]}"
 echo "joinmarket-ng $(git -C "$jmng" rev-parse --short=12 HEAD 2>/dev/null || echo snapshot), $(python3 --version)"
 
 # vortex-ng at the given commit; the test is built before anything starts.
-git clone -q "$VORTEX_NG_REPO" "$work/vortex-ng"
-git -C "$work/vortex-ng" -c advice.detachedHead=false checkout -q "$VORTEX_NG_COMMIT"
-[ "$(git -C "$work/vortex-ng" rev-parse HEAD)" = "$VORTEX_NG_COMMIT" ] || { echo "vortex-ng is not at the pin" >&2; exit 97; }
+if [ -n "$VORTEX_NG_SRC" ]; then
+  cp -r "$VORTEX_NG_SRC" "$work/vortex-ng"
+else
+  git clone -q "$VORTEX_NG_REPO" "$work/vortex-ng"
+  git -C "$work/vortex-ng" -c advice.detachedHead=false checkout -q "$VORTEX_NG_COMMIT"
+  [ "$(git -C "$work/vortex-ng" rev-parse HEAD)" = "$VORTEX_NG_COMMIT" ] || { echo "vortex-ng is not at the pin" >&2; exit 97; }
+fi
 (cd "$work/vortex-ng" && cargo test --locked -p vortex-ng-node --test jmng_interop --no-run >"$logs/build.log" 2>&1) \
   || { show "$logs/build.log" 30; exit 12; }
 echo "vortex-ng $VORTEX_NG_COMMIT built"

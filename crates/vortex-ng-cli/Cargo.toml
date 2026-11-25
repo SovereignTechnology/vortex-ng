@@ -18,6 +18,7 @@ vortex-ng-channel = { workspace = true }
 vortex-ng-onion = { workspace = true }
 vortex-ng-irc = { workspace = true }
 vortex-ng-chain = { workspace = true }
+vortex-ng-ln = { workspace = true }
 vortex-ng-nostr = { workspace = true }
 vortex-ng-maker = { workspace = true }
 vortex-ng-taker = { workspace = true }

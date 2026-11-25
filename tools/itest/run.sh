@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Run the regtest tests (crates/vortex-ng-node/tests/regtest.rs for JoinMarket rounds, regtest_joinstr.rs
 # for joinstr pools, regtest_channels.rs for one maker on three channels at once,
-# crates/vortex-ng-cli/tests/regtest_maker.rs for the command line's maker, and its regtest_channels.rs for
-# the commands on each channel, and regtest_pools.rs for a maker and a joinstr pool on one wallet) against a
-# pinned Bitcoin Core. ITEST_ONLY=<test name> runs one of them alone.
+# crates/vortex-ng-cli/tests/regtest_maker.rs for the command line's maker, its regtest_channels.rs for
+# the commands on each channel, regtest_close.rs for `coins` on channel closes, and regtest_pools.rs for a
+# maker and a joinstr pool on one wallet) against a pinned Bitcoin Core. ITEST_ONLY=<test name> runs one of
+# them alone.
 #
 #   kata-run --net --cwd ~/Projects/vortex-ng -- bash tools/itest/run.sh
 #
@@ -44,7 +45,7 @@ for _ in $(seq 1 60); do [ -s "$cookie" ] && break; sleep 1; done
 
 cd "$repo"
 # ITEST_ONLY=<test> runs that one test alone (regtest, regtest_joinstr, regtest_pools, regtest_maker,
-# regtest_channels): iterate on it, then run them all once.
+# regtest_channels, regtest_close): iterate on it, then run them all once.
 only=${ITEST_ONLY:-}
 ran=0
 itest() {  # crate, test names
@@ -74,4 +75,7 @@ itest vortex-ng-cli regtest_maker
 itest vortex-ng-cli regtest_channels
 # One maker on a Nostr relay, an onion directory and an IRC server at once, with a taker on each.
 itest vortex-ng-node regtest_channels
+# Channel closes (a mutual close, a force close, the sweep of its delayed output) paying a wallet: `coins`
+# marks each and leaves a plain coinbase alone.
+itest vortex-ng-cli regtest_close
 [ "$ran" -gt 0 ] || { echo "ITEST_ONLY=$only: no such test" >&2; exit 97; }

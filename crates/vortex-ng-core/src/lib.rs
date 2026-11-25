@@ -9,6 +9,7 @@
 pub mod bond;
 pub mod command;
 pub mod line;
+pub mod lnclose;
 pub mod nacl;
 pub mod nick;
 pub mod offer;

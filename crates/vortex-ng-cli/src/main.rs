@@ -3,12 +3,15 @@
 //! The wallet commands create or restore a wallet file (a seed encrypted at rest, see
 //! `vortex_ng_wallet::file`) and read addresses out of it; `orderbook` asks the makers on a set of relays
 //! what they offer; `maker` offers the wallet's coins until stopped; `coinjoin` does one CoinJoin as the
-//! taker; `balance` shows what the wallet holds; `pools`, `pool join` and `pool create` take part in joinstr
-//! pools (ADR 0006). Exit status 0 on success, 1 when the command
-//! failed, 2 when it was not understood.
+//! taker; `balance` shows what the wallet holds; `coins` lists its coins and marks the ones a Lightning
+//! channel close paid it (`coinjoin --from-closes` spends only those); `lnd-coins` does the same for an LND node's wallet, and
+//! `coinjoin --from-lnd` spends from it with the node signing; `pools`, `pool join` and `pool create` take part
+//! in joinstr pools (ADR 0006). Exit status 0 on success, 1 when the command failed, 2 when it was not
+//! understood.
 
 mod args;
 mod claims;
+mod lightning;
 mod market;
 mod podle_log;
 mod pool;
@@ -44,8 +47,11 @@ Usage:
   vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
                       [--min-makers <n>] [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                       [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
-                      [--allow-bondless-fees] [--yes]
+                      [--allow-bondless-fees] [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
   vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
+  vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only]
+                      [--outpoints]
+  vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
   vortex-ng pools     --relays <url[,url...]> [--wait <seconds>] [--proxy <address>]
   vortex-ng pool join   --wallet <file> --relays <url[,url...]> --pool <id|key> node [--pit sw0|tr0]
                         [--mixdepth 0-4] [--wait <seconds>] [--proxy <address>] [--yes]
@@ -90,6 +96,25 @@ into another, and no address is handed out twice, so `maker` and `pool` can run 
 node: --rpc-url <url> with --rpc-cookie-file <file>, or with --rpc-user <name> [--rpc-password-file <file>].
 A Bitcoin Core compatible node on the wallet's network. `orderbook` verifies fidelity bonds when given one.
 
+lnd: --lnd-rest <host:port> --lnd-tls-cert <file> --lnd-macaroon <file>. The node's `tls.cert` is pinned. The
+macaroon must be in a file only you can read (mode 600): one that may sign can spend every coin of the node's
+wallet. Bake it by `uri:` permission, as the README shows, not with `signer:generate`.
+
+Channel closes: close a channel with one of the wallet's addresses as the delivery address (`vortex-ng wallet
+addresses` lists them; LND `closechannel --delivery_addr`, CLN `close <id> <timeout> <address>`). `coins` then
+marks what the close paid, and `coinjoin --from-closes` spends those coins and no others, so they are not
+merged with coins that have another history. Only the transaction that created a coin is read: a force close
+that the node sweeps into its own wallet, and the coin sent on from there, look like an ordinary payment and
+are not recognised here. The recognition is evidence, not proof, and a mutual close of a taproot channel is
+not recognised.
+
+From an LND node's own wallet, force closes included: `lnd-coins` marks the coins by the node's close records,
+and `coinjoin --from-lnd --mixdepth <n>` spends one of them, the node signing. The amount goes to this wallet
+and the change back to the node. It never takes what the node must keep to fee-bump its open anchor channels,
+and it merges coins of different channels only with `--merge-closes`. The node cannot prove a PoDLE, so mixdepth
+<n> must hold a coin of the pit to commit to (five confirmations, a fifth of the amount, not from a CoinJoin,
+never committed to before). The makers see that coin and can link it to the round: keep a small one for it.
+
 `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
 username and password, such as a Tor daemon's SOCKS port (127.0.0.1:9050). Every nick, a maker's throwaway
 `!hp2` nick included, then reaches its channels under credentials of its own. Without it every relay,
@@ -117,6 +142,8 @@ fn run(args: &[String]) -> Result<(), Failure> {
         [command, rest @ ..] if command == "maker" => market::maker(rest),
         [command, rest @ ..] if command == "coinjoin" => market::coinjoin(rest),
         [command, rest @ ..] if command == "balance" => market::balance(rest),
+        [command, rest @ ..] if command == "coins" => market::coins(rest),
+        [command, rest @ ..] if command == "lnd-coins" => lightning::lnd_coins(rest),
         [command, rest @ ..] if command == "pools" => pool::pools(rest),
         [group, command, rest @ ..] if group == "pool" && command == "join" => pool::join(rest),
         [group, command, rest @ ..] if group == "pool" && command == "create" => pool::create(rest),

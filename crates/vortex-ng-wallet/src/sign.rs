@@ -4,7 +4,9 @@
 use bdk_wallet::bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bdk_wallet::bitcoin::{OutPoint, Psbt, Transaction, TxOut};
 use vortex_ng_core::offer::Pit;
-use vortex_ng_core::sig::{encode_sw0, encode_tr0, encode_wsh0, verify_sig, wsh0_keys};
+use vortex_ng_core::sig::{
+    InputSigner, encode_sw0, encode_tr0, encode_wsh0, verify_sig, wsh0_keys,
+};
 
 use crate::{PitWallet, WalletError};
 
@@ -97,6 +99,19 @@ impl PitWallet {
             out.push((i, payload));
         }
         Ok(out)
+    }
+}
+
+impl InputSigner for PitWallet {
+    fn sign_own_inputs(
+        &self,
+        mixdepth: u32,
+        tx: &Transaction,
+        prevouts: &[TxOut],
+        declared: &[OutPoint],
+    ) -> Result<Vec<(usize, String)>, String> {
+        self.sign_inputs(mixdepth, tx, prevouts, declared)
+            .map_err(|e| e.to_string())
     }
 }
 
