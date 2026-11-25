@@ -205,10 +205,13 @@ are signed for `nostr-network` (see Motivation).
 recipient, size and timing, and the contents of the plain-text steps (`!fill`'s order id, amount and
 commitment, `!pubkey`); public messages; the nick's presence. In addition it learns the client's relay set and
 the timing of its Nostr traffic. It does not learn the client's IP address, which only the client's relays see,
-and it cannot read the encrypted steps of a round, which are encrypted end to end between taker and maker.
+and, as long as it only relays what it is given, it cannot read the encrypted steps of a round, which are
+encrypted end to end between taker and maker. A bridge that also adds or changes lines can do more than this
+section says, as a directory node can: the draft does not claim otherwise.
 
-**What the bridge cannot do:** sign a line as the client, change a line without breaking its signature, or
-complete nick authentication without the client.
+**What the bridge cannot do:** sign a line as the client, change a line's body or sender without breaking its
+signature, or complete nick authentication without the client. A line's command and recipient are not covered by
+its signature, so a bridge can relabel those, as a directory can.
 
 **What the bridge can do:** drop, delay or reorder the client's traffic; replay lines it has seen (as a
 directory can; peers treat a line that does not fit their state as stray and ignore it); and show the client a

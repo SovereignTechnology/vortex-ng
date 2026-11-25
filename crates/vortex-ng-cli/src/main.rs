@@ -71,7 +71,8 @@ Who sees what:
   a Nostr relay      the recipient key and timing of private messages; public messages.
   a directory node   offers and who is present. For each private line it relays: sender, recipient, size and
                      timing, with `!fill` (order id, amount, commitment) and `!pubkey` in plain text. The
-                     encrypted steps stay encrypted. When a taker connects to a maker's onion directly, the
+                     encrypted steps stay encrypted from a directory that only reads them; one that also
+                     alters lines can do more (README, issue #52). When a taker connects to a maker's onion directly, the
                      rest of their round leaves the directory, except a `!fill` some takers still send
                      through it first (and its `!pubkey`) and the answers of a maker that replies through
                      it anyway.

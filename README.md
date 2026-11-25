@@ -102,9 +102,13 @@ What each channel shows, and to whom (ADR 0007 has the reasons):
 | channel | its operator sees | others on it see |
 |---|---|---|
 | Nostr relays | the recipient key and timing of private messages; public messages | offers, `!orderbook`, `!hp2` |
-| onion directory nodes, relaying (a maker that serves no onion: a vortex-ng maker without `--serve-onion`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
+| onion directory nodes, relaying (a maker that serves no onion: a vortex-ng maker without `--serve-onion`) | every private line's sender, recipient, size and timing; the encrypted steps stay encrypted from an operator that only reads them, but `!fill` (order id, amount, commitment) and `!pubkey` are plain text | offers, `!orderbook`, `!hp2`; a nick's presence |
 | onion directory nodes, when a taker connects to a maker's onion directly | that the two nicks are in contact (the maker's offer to the taker), none of the rest of their round, with two exceptions: a taker that sends its `!fill` through the directories before it connects, as some do, shows them that `!fill` and the maker's `!pubkey`; a maker that answers through the directories anyway, as some do, shows them its answers, `!pubkey` in plain text | the same |
 | an IRC server | everything a relaying directory node sees, in its own logs | the same as on the directories |
+
+The table describes an operator that reads. A relaying operator that also adds or changes lines can do more,
+because a line's signature covers neither its command nor its recipient; how far that goes, and what vortex-ng
+can do about it, is tracked in issue #52.
 
 A maker's single nick, and the nick key its private lines carry, link its presence on all its channels, as in
 JoinMarket. A taker's nicks differ per channel, so they cannot be linked from one round to the next; within
