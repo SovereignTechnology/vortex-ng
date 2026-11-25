@@ -197,6 +197,25 @@ async fn deliver<C: Channel>(
     result
 }
 
+/// Send the round's `!fill`s all at once. Sent one after another, each waits out the route's round trip (a
+/// relay's, say) before the next goes, so the last maker hears of the round long after the first, and a maker
+/// that is itself against the round gets a head start. If a `!fill` cannot go the round is over; the others
+/// have gone by then, and their sessions expire.
+async fn send_fills<C: Channel>(
+    client: &C,
+    peers: &HashMap<String, C::Route>,
+    chain: &impl ChainLookup,
+    fills: Vec<Outgoing>,
+) -> Result<(), NodeError> {
+    let sends = fills
+        .into_iter()
+        .map(|fill| deliver(client, peers, chain, vec![fill]));
+    for sent in futures::future::join_all(sends).await {
+        sent?;
+    }
+    Ok(())
+}
+
 /// Whether `proof` is a `!tbond` that `maker` made out to `me`. A proof names the taker it is for, so unlike the
 /// rest of a signed line it cannot have been harvested from another exchange and delivered here.
 fn proof_for_us(proof: &str, me: &str, maker: &str) -> bool {
@@ -339,7 +358,7 @@ fn maker_step<C: Channel>(
                         let _ = blocking(|| maker.refresh_bond(chain, unix_now()));
                         out.extend(maker.on_orderbook(&nick, me));
                     }
-                    Command::Hp2(c) => maker.on_hp2(c),
+                    Command::Hp2(c) => maker.on_hp2(c, unix_now()),
                     _ => {}
                 }
             }
@@ -902,10 +921,13 @@ pub async fn run_taker<C: Channel>(
         .filter_map(|(nick, _)| Some((nick.clone(), peers.get(nick)?.clone())))
         .collect();
     client.prepare(&ready).await;
-    // One at a time: if a `!fill` cannot go the round is over, and the makers after it need not hear of it.
-    for fill in taker.start(chosen).map_err(NodeError::Taker)? {
-        deliver(client, &peers, chain, vec![fill]).await?;
-    }
+    // A maker answers where it was filled: the channel each `!fill` goes out on.
+    let fill_channel: HashMap<String, usize> = ready
+        .iter()
+        .map(|(nick, route)| (nick.clone(), client.channel_of(route)))
+        .collect();
+    let fills = taker.start(chosen).map_err(NodeError::Taker)?;
+    send_fills(client, &peers, chain, fills).await?;
     let now = Instant::now();
     let answer_by = now + MAKER_ANSWER_TIME.min(until.saturating_duration_since(now) / 2);
     while let Some(left) = until.checked_duration_since(Instant::now()) {
@@ -917,17 +939,26 @@ pub async fn run_taker<C: Channel>(
         match client.receive(wait).await {
             // Anyone who can reach our nick can write to us: only the round's makers are heard, so an outsider
             // cannot abort the round.
-            Next::Message(Incoming::Private { msg, route }) if in_round.contains(&msg.from) => {
+            Next::Message(Incoming::Private { msg, route })
+                if in_round.contains(&msg.from)
+                    && fill_channel
+                        .get(&msg.from)
+                        .is_none_or(|channel| *channel == client.channel_of(&route)) =>
+            {
                 // The route stays the one the maker answered the orderbook on: a line delivered again through
-                // another directory or channel must not move the round's replies there.
+                // another directory or channel must not move the round's replies there. And only the channel
+                // our `!fill` went out on is heard: a maker answers there, so its lines on another channel
+                // (a taker has a different nick on each) are somebody else's, signed lines harvested from it.
+                let first_hand = client.first_hand(&route);
                 for cmd in commands(&msg) {
                     // Where anyone could have delivered it, a lone `!error` says nothing about the maker: the
                     // round's deadline decides.
                     if matches!(cmd, Command::Error(_)) && !client.authenticates(&route) {
                         continue;
                     }
-                    let (outgoing, progress) = blocking(|| taker.handle(&msg.from, cmd, chain))
-                        .map_err(NodeError::Taker)?;
+                    let (outgoing, progress) =
+                        blocking(|| taker.handle_from(&msg.from, cmd, chain, first_hand))
+                            .map_err(NodeError::Taker)?;
                     // A line that could not go (a full queue, say) does not end the round: the deadline does.
                     let _ = deliver(client, &peers, chain, outgoing).await;
                     if progress == Progress::MakersSigned {

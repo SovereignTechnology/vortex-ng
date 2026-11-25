@@ -592,13 +592,23 @@ async fn a_maker_serving_a_configured_onion_is_reached_through_the_proxy() {
         .send_private(&back, taker.nick(), "pubkey", &"ab".repeat(32))
         .await
         .unwrap();
-    let Next::Message(Incoming::Private { msg, .. }) = taker.receive(WAIT).await else {
+    let Next::Message(Incoming::Private {
+        msg,
+        route: answered,
+    }) = taker.receive(WAIT).await
+    else {
         panic!("the answer")
     };
     assert_eq!(
         (msg.from.as_str(), msg.command.as_str()),
         (identity.nick(), "pubkey")
     );
+    // A line on a direct connection came from the peer on the other end, in either direction; a line a
+    // directory relayed can be any line it was ever handed. Neither route is authenticated: a directory chose
+    // whom the taker connected to.
+    assert!(taker.first_hand(&answered) && maker.first_hand(&back));
+    assert!(!taker.first_hand(&route));
+    assert!(!taker.authenticates(&answered) && !maker.authenticates(&back));
     assert!(
         !directory
             .received()

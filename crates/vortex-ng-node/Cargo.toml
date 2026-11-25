@@ -23,6 +23,7 @@ vortex-ng-maker = { workspace = true }
 vortex-ng-taker = { workspace = true }
 nostr = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 vortex-ng-channel = { workspace = true, features = ["test-util"] }
@@ -30,5 +31,4 @@ vortex-ng-onion = { workspace = true, features = ["test-util"] }
 vortex-ng-irc = { workspace = true, features = ["test-util"] }
 nostr-sdk = { workspace = true, features = ["local-relay"] }
 tokio-tungstenite = { workspace = true }
-futures = { workspace = true }
 serde_json = { workspace = true }

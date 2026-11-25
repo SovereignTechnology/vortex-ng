@@ -39,7 +39,22 @@ pub struct MakerConfig {
     pub taker_utxo_amtpercent: u64,
     /// The bond value formula's parameters, for choosing which of our bonds to prove.
     pub bond_params: BondValueParams,
+    /// Seconds a commitment announced by others (`!hp2`) is still taken at `!fill` after we first heard it
+    /// announced; from then on it is refused. `0` refuses it at once. See [`ANNOUNCED_GRACE`].
+    pub announced_grace: u64,
 }
+
+/// How long, in seconds, a maker still takes a `!fill` with a commitment it has heard announced, by default.
+///
+/// An announcement is unsigned and free to send, and a taker's `!fill` shows its commitment in plain text to
+/// whoever carries it, so anyone who sees the `!fill` can announce its commitment before the other makers in
+/// the round have read theirs: they would refuse it, and the round would be spoiled. A round's `!fill`s all go
+/// out together and its honest announcements follow the first `!ioauth`, so a commitment that has only just
+/// been announced is almost always the round's own. What the refusal is for is a taker using one commitment
+/// again, after the round: that is refused once the announcement is older than this, which also covers a
+/// replacement maker being filled with the same commitment a minute into a round. Commitments this maker
+/// verified itself, and every commitment loaded from an earlier run, are refused at once.
+pub const ANNOUNCED_GRACE: u64 = 300;
 
 impl MakerConfig {
     /// A config for `offers` with the deployed defaults (indices 0..=2, 5 confirmations, 20 %).
@@ -50,6 +65,7 @@ impl MakerConfig {
             taker_utxo_age: 5,
             taker_utxo_amtpercent: 20,
             bond_params: BondValueParams::default(),
+            announced_grace: ANNOUNCED_GRACE,
         }
     }
 }
@@ -236,23 +252,62 @@ impl BoundedCommitments {
     }
 }
 
+/// Commitments announced by others, bounded like [`BoundedCommitments`], with the time each was first heard
+/// (`0` for one loaded from an earlier run, which is old whatever the clock says).
+#[derive(Default)]
+struct AnnouncedCommitments {
+    first_seen: HashMap<[u8; 32], u64>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl AnnouncedCommitments {
+    /// Remember `commitment`, heard at `now`; whether it was new.
+    fn insert(&mut self, commitment: [u8; 32], now: u64) -> bool {
+        if self.first_seen.contains_key(&commitment) {
+            return false;
+        }
+        self.first_seen.insert(commitment, now);
+        self.order.push_back(commitment);
+        while self.order.len() > MAX_COMMITMENTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.first_seen.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
 /// PoDLE commitments seen used. The ones this maker verified itself, after which it showed its coins, are
 /// kept apart from the ones merely announced by others (`!hp2`, unsigned and free to send), so a flood of
 /// announcements cannot push a verified commitment out and let it be used again to see the coins twice.
 #[derive(Default)]
 struct Commitments {
     verified: BoundedCommitments,
-    announced: BoundedCommitments,
+    announced: AnnouncedCommitments,
 }
 
 impl Commitments {
+    /// Whether `commitment` is known at all, verified or announced.
+    #[cfg(test)]
     fn contains(&self, commitment: &[u8; 32]) -> bool {
-        self.verified.seen.contains(commitment) || self.announced.seen.contains(commitment)
+        self.verified.seen.contains(commitment)
+            || self.announced.first_seen.contains_key(commitment)
     }
 
-    /// Remember a commitment someone announced; whether it was new.
-    fn insert(&mut self, commitment: [u8; 32]) -> bool {
-        !self.verified.seen.contains(&commitment) && self.announced.insert(commitment)
+    /// Whether a `!fill` with `commitment` at `now` is refused: when this maker verified it, or when it was
+    /// announced at least `grace` seconds ago.
+    fn refuses(&self, commitment: &[u8; 32], now: u64, grace: u64) -> bool {
+        self.verified.seen.contains(commitment)
+            || self
+                .announced
+                .first_seen
+                .get(commitment)
+                .is_some_and(|heard| now.saturating_sub(*heard) >= grace)
+    }
+
+    /// Remember a commitment someone announced, heard at `now`; whether it was new.
+    fn insert(&mut self, commitment: [u8; 32], now: u64) -> bool {
+        !self.verified.seen.contains(&commitment) && self.announced.insert(commitment, now)
     }
 
     /// Remember a commitment this maker verified.
@@ -309,8 +364,8 @@ impl Maker {
     }
 
     /// Record a commitment another maker broadcast (`!hp2`).
-    pub fn on_hp2(&mut self, commitment: [u8; 32]) {
-        if self.used_commitments.insert(commitment) {
+    pub fn on_hp2(&mut self, commitment: [u8; 32], now: u64) {
+        if self.used_commitments.insert(commitment, now) {
             self.keep_announced(&commitment);
         }
     }
@@ -325,8 +380,9 @@ impl Maker {
         for (seen, commitment) in remembered {
             match seen {
                 Seen::Verified => self.used_commitments.insert_verified(commitment),
+                // Announced in an earlier run: old.
                 Seen::Announced => {
-                    self.used_commitments.insert(commitment);
+                    self.used_commitments.insert(commitment, 0);
                 }
             }
         }
@@ -378,7 +434,7 @@ impl Maker {
     pub fn remembered_commitments(&self) -> (usize, usize) {
         (
             self.used_commitments.verified.seen.len(),
-            self.used_commitments.announced.seen.len(),
+            self.used_commitments.announced.first_seen.len(),
         )
     }
 
@@ -405,7 +461,7 @@ impl Maker {
     /// filled). Recorded; announced unlinked from our nick if it is new and we have announced fewer than
     /// [`HP2_RELAYS_PER_WINDOW`] such in the last [`HP2_RELAY_WINDOW`] seconds.
     fn on_private_hp2(&mut self, commitment: [u8; 32], now: u64) -> Vec<Outgoing> {
-        if !self.used_commitments.insert(commitment) {
+        if !self.used_commitments.insert(commitment, now) {
             return Vec::new();
         }
         self.keep_announced(&commitment);
@@ -534,7 +590,7 @@ impl Maker {
                 amount,
                 nacl_pubkey,
                 commitment,
-            } => self.on_fill(from, oid, amount, &nacl_pubkey, commitment),
+            } => self.on_fill(from, oid, amount, &nacl_pubkey, commitment, now),
             Command::Encrypted { name, ciphertext } if name == "auth" => {
                 self.on_auth(from, &ciphertext, chain)
             }
@@ -568,6 +624,7 @@ impl Maker {
         amount: u64,
         taker_nacl: &str,
         commitment: [u8; 32],
+        now: u64,
     ) -> Result<Vec<Outgoing>, MakerError> {
         if let Some(stage) = self.sessions.get_mut(from) {
             // The taker's own `!fill` again, another way: joinmarket-clientserver's taker sends it through a
@@ -607,7 +664,10 @@ impl Maker {
         if cjfee < offer.txfee {
             return Err(MakerError::Offer("unprofitable at this amount"));
         }
-        if self.used_commitments.contains(&commitment) {
+        if self
+            .used_commitments
+            .refuses(&commitment, now, self.config.announced_grace)
+        {
             return Err(MakerError::Podle("commitment already used".into()));
         }
         // One commitment, one session: a copy under another nick would see our coins on the same proof.

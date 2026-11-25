@@ -82,6 +82,8 @@ pub trait DynChannel: Send + Sync {
     fn erased_nick_on(&self, route: &AnyRoute) -> Option<&str>;
     /// [`Channel::authenticates`]; `false` for a route of another channel.
     fn erased_authenticates(&self, route: &AnyRoute) -> bool;
+    /// [`Channel::first_hand`]; `false` for a route of another channel.
+    fn erased_first_hand(&self, route: &AnyRoute) -> bool;
     /// [`Channel::listen`].
     fn erased_listen(&self, offers: bool, public: bool) -> BoxFuture<'_, Result<(), ChannelError>>;
     /// [`Channel::send_private`].
@@ -130,6 +132,13 @@ impl<C: Channel> DynChannel for C {
             .0
             .downcast_ref::<C::Route>()
             .is_some_and(|route| Channel::authenticates(self, route))
+    }
+
+    fn erased_first_hand(&self, route: &AnyRoute) -> bool {
+        route
+            .0
+            .downcast_ref::<C::Route>()
+            .is_some_and(|route| Channel::first_hand(self, route))
     }
 
     fn erased_listen(&self, offers: bool, public: bool) -> BoxFuture<'_, Result<(), ChannelError>> {
@@ -334,6 +343,12 @@ impl Channel for ChannelSet {
         self.channels
             .get(route.channel)
             .is_some_and(|c| c.erased_authenticates(&route.route))
+    }
+
+    fn first_hand(&self, route: &SetRoute) -> bool {
+        self.channels
+            .get(route.channel)
+            .is_some_and(|c| c.erased_first_hand(&route.route))
     }
 
     async fn listen(&self, offers: bool, public: bool) -> Result<(), ChannelError> {
@@ -620,6 +635,7 @@ mod tests {
             Err(ChannelError::Invalid("a route of another channel"))
         );
         assert!(!DynChannel::erased_authenticates(&channel, &wrong));
+        assert!(!DynChannel::erased_first_hand(&channel, &wrong));
         assert_eq!(DynChannel::erased_nick_on(&channel, &wrong), None);
     }
 }

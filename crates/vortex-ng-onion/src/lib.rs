@@ -818,6 +818,12 @@ impl Channel for OnionChannel {
         false
     }
 
+    // A connection to the peer itself carries only what the peer on the other end sends: no directory can add
+    // a line to it. (That peer is where a directory said it was: see `authenticates`.)
+    fn first_hand(&self, route: &OnionRoute) -> bool {
+        matches!(route.via, Via::Peer(_) | Via::Inbound(..))
+    }
+
     async fn listen(&self, offers: bool, public: bool) -> Result<(), ChannelError> {
         self.wants
             .store(u8::from(offers) | (u8::from(public) << 1), Ordering::SeqCst);

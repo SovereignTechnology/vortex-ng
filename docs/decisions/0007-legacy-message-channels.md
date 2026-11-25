@@ -133,3 +133,47 @@ Decision: keep the Tor daemon, for both directions, for now. Connecting through 
 wanted: `onion-service-client` in the `tor` feature, so the legacy channels can reach `.onion` hosts without a
 daemon, once there is a Tor network to test it on. A maker's onion stays with the operator's Tor
 (`--serve-onion`, or later the control port) until arti's proof-of-work defence leaves `experimental`.
+
+## Addendum: where a line came from, and how long an announcement is believed (issue #52, 2026-11-25)
+
+A line's signature covers neither its command nor its recipient (Context), so on a channel where a directory or
+a server forwards lines, anyone on the path can deliver a line a peer once signed. Four changes narrow what that
+can do to a round, none of which changes what a peer sends.
+
+- **A maker is heard on the channel its `!fill` went out on.** A taker has a different nick on each channel and a
+  maker answers where it was filled, so the same maker's lines on another channel are somebody else's.
+- **First-hand and relayed keys have tables of their own.** `Channel::first_hand` says a line can only have been
+  written by the peer it names: on Nostr (the seal names the writer), and on a direct onion connection (no
+  directory can add a line to it). It is not `Channel::authenticates`, which a direct onion connection fails,
+  because a directory chose whom the taker connected to. A taker answers a maker's `!pubkey` from each route
+  kind separately: the first sixteen relayed ones, as before, and the newest four first-hand ones. A maker that
+  starts the exchange again (joinmarket-clientserver's does when it gets a `!fill` twice) answers with a new key
+  and only that one is live, which is why the newest are kept. Relayed keys can no longer crowd out the maker's
+  own.
+- **The `!fill`s go out together.** One at a time, each waited out the route's round trip, so the last maker
+  heard of the round long after the first. All makers hear of it at once, and a participant that is against the
+  round gets no head start.
+- **Taker: `Taker::require_first_hand`** answers a `!pubkey` only when it came first-hand. It is off by default,
+  because it would leave out every maker that answers through a relay whatever route the `!fill` took
+  (JoinMarket-NG's makers), and joinmarket-clientserver's on IRC.
+
+**A maker believes an announced commitment only after a delay** (`MakerConfig::announced_grace`, 300 seconds).
+A `!fill` shows its commitment in plain text to whoever carries it, an `!hp2` announcement is unsigned and free
+to send, and a maker refuses a `!fill` whose commitment it has heard announced. So whoever sees a round's
+`!fill` can announce its commitment before the other makers have read theirs, and they refuse it. A round's
+`!fill`s go out together and its honest announcements follow the first `!ioauth`, so a commitment announced
+moments before a `!fill` is, in practice, that `!fill`'s own. What the refusal is for is a taker using a
+commitment again: it limits how many probing rounds one coin buys, since each coin has three commitments and
+each probe uses one. That is untouched in the case that matters: a maker still refuses a commitment it verified
+itself at once, one loaded from an earlier run, and any announcement older than the window.
+
+What the window costs: a commitment can be used against makers, one after another, for up to the window after
+its first announcement. It could already be used against every maker at once, within seconds, by sending all the
+`!fill`s together, so the window adds a slower way to reach the same makers and no more makers; the cost to the
+prober, a coin's commitment, is the same. A maker can set the window to `0` to refuse at once, as before. The
+two harnesses that check that every maker refuses an announced commitment set it to 2 seconds for the vortex-ng
+maker they run, since they probe 5 seconds after the announcement.
+
+Left as it was: a maker keeps one waiting session per commitment. Letting several wait (so that a throwaway
+`!fill` could not hold the commitment) would let a copy under another nick see the maker's coins on the same
+proof, which that rule exists to stop.

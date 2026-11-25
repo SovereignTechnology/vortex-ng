@@ -313,6 +313,12 @@ impl Channel for MockChannel {
         self.authenticated
     }
 
+    // A route named `direct…` stands for a direct connection to the peer: first-hand without being
+    // authenticated, as on the onion channel.
+    fn first_hand(&self, route: &MockRoute) -> bool {
+        self.authenticated || route.0.starts_with("direct")
+    }
+
     async fn listen(&self, offers: bool, public: bool) -> Result<(), ChannelError> {
         self.record(Sent::Listen { offers, public })
     }

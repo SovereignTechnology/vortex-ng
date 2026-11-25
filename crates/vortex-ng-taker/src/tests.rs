@@ -129,12 +129,18 @@ fn is_same_pubkey(out: &Outgoing, taker: &str, earlier: Option<&String>) -> bool
 /// line the taker sent also reaches the other maker. None of that may change the round. A maker may answer a
 /// repeated `!fill` with the `!pubkey` it already sent (the taker may have moved to another connection).
 fn coinjoin_with(pit: Pit, noisy: bool) -> (Transaction, PitWallet) {
-    coinjoin_after(pit, noisy, 0)
+    coinjoin_after(pit, noisy, 0, false)
 }
 
 /// As [`coinjoin_with`]. `stale_pubkeys` `!pubkey` lines of each maker from other exchanges (keys the round
-/// does not use) reach the taker before anything else.
-fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkeys: usize) -> (Transaction, PitWallet) {
+/// does not use) reach the taker before anything else, relayed. With `first_hand` the makers' own lines come
+/// first-hand, as on Nostr or a direct connection.
+fn coinjoin_after(
+    pit: Pit,
+    noisy: bool,
+    stale_pubkeys: usize,
+    first_hand: bool,
+) -> (Transaction, PitWallet) {
     let mut chain = FakeChain::default();
     let mut makers: BTreeMap<String, Maker> = BTreeMap::new();
     for (i, nick) in ["J5makerA", "J5makerB"].iter().enumerate() {
@@ -191,14 +197,17 @@ fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkeys: usize) -> (Transaction, 
         .into_iter()
         .map(|o| ("J5taker".to_string(), o))
         .collect();
+    let mut stale: std::collections::HashSet<String> = std::collections::HashSet::new();
     for _ in 0..stale_pubkeys {
         for nick in makers.keys() {
+            let body = vortex_ng_core::nacl::NaclKeypair::generate().public_hex();
+            stale.insert(body.clone());
             queue.push_front((
                 nick.clone(),
                 Outgoing::Private {
                     to: "J5taker".into(),
                     command: "pubkey".into(),
-                    body: vortex_ng_core::nacl::NaclKeypair::generate().public_hex(),
+                    body,
                 },
             ));
         }
@@ -223,7 +232,9 @@ fn coinjoin_after(pit: Pit, noisy: bool, stale_pubkeys: usize) -> (Transaction, 
             }
         } else {
             assert_eq!(to, "J5taker");
-            let (outs, p) = taker.handle(&from, cmd, &chain).unwrap();
+            // The stale keys are what someone delivered again; the maker's own lines may be first-hand.
+            let own = first_hand && !(command == "pubkey" && stale.contains(&body));
+            let (outs, p) = taker.handle_from(&from, cmd, &chain, own).unwrap();
             progress = p;
             queue.extend(outs.into_iter().map(|o| ("J5taker".to_string(), o)));
         }
@@ -277,7 +288,7 @@ fn check(pit: Pit) {
 fn a_pubkey_from_another_exchange_does_not_end_the_round() {
     // As many as leave room for the real key, which then still wins.
     for stale in [1, MAX_PUBKEY_CANDIDATES - 1] {
-        let (tx, _) = coinjoin_after(Pit::Sw0, false, stale);
+        let (tx, _) = coinjoin_after(Pit::Sw0, false, stale, false);
         assert_eq!(tx.input.len(), 3);
         assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
     }
@@ -1076,4 +1087,116 @@ fn coins_are_chosen_for_the_commitment_first_and_no_more_than_needed() {
     )
     .unwrap();
     assert_eq!(exact.len(), 2);
+}
+
+#[test]
+fn harvested_keys_cannot_crowd_out_a_makers_own() {
+    // More stale keys than the relayed table holds, delivered first: the maker's own lines, first-hand, have
+    // a table of their own and the round completes.
+    let (tx, _) = coinjoin_after(Pit::Sw0, false, MAX_PUBKEY_CANDIDATES + 8, true);
+    assert_eq!(tx.input.len(), 3);
+    assert!(tx.input.iter().all(|i| !i.witness.is_empty()));
+}
+
+/// A taker with two makers, `J5makerA` and `J5makerB`, whose `!fill`s have gone out.
+fn started_taker() -> (Taker, FakeChain) {
+    let mut chain = FakeChain::default();
+    let wallet = funded(Pit::Sw0, "taker", 600_000, 20, &mut chain);
+    let utxo = wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&wallet, 0, &utxo, 0).unwrap();
+    let mut wallet = wallet;
+    let cj = wallet.next_receive_address(1).unwrap().script_pubkey();
+    let change = wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(
+        choice_cfg(AMOUNT),
+        0,
+        vec![(utxo.outpoint, utxo.txout)],
+        podle,
+        cj,
+        change,
+    )
+    .unwrap();
+    let chosen = vec![
+        ("J5makerA".to_string(), offer(Pit::Sw0, 0)),
+        ("J5makerB".to_string(), offer(Pit::Sw0, 1)),
+    ];
+    assert_eq!(taker.start(chosen).unwrap().len(), 2);
+    (taker, chain)
+}
+
+fn new_key() -> String {
+    vortex_ng_core::nacl::NaclKeypair::generate().public_hex()
+}
+
+/// How many `!auth` lines `outs` holds.
+fn auths(outs: &[Outgoing]) -> usize {
+    outs.iter()
+        .filter(|o| matches!(o, Outgoing::Private { command, .. } if command == "auth"))
+        .count()
+}
+
+#[test]
+fn relayed_and_first_hand_keys_have_tables_of_their_own() {
+    let (mut taker, chain) = started_taker();
+    let mut answered = 0;
+    for _ in 0..MAX_PUBKEY_CANDIDATES + 5 {
+        let (outs, _) = taker
+            .handle("J5makerA", to_command("pubkey", &new_key()), &chain)
+            .unwrap();
+        answered += auths(&outs);
+    }
+    assert_eq!(
+        answered, MAX_PUBKEY_CANDIDATES,
+        "relayed keys: the first ones"
+    );
+    // The maker's own key, first-hand, still gets its `!auth`; and so does a first-hand one after it.
+    for _ in 0..2 {
+        let (outs, _) = taker
+            .handle_from("J5makerA", to_command("pubkey", &new_key()), &chain, true)
+            .unwrap();
+        assert_eq!(auths(&outs), 1);
+    }
+    // Another maker's table is its own.
+    let (outs, _) = taker
+        .handle("J5makerB", to_command("pubkey", &new_key()), &chain)
+        .unwrap();
+    assert_eq!(auths(&outs), 1);
+}
+
+#[test]
+fn a_makers_newest_first_hand_keys_are_the_ones_kept() {
+    let (mut taker, chain) = started_taker();
+    let keys: Vec<String> = (0..MAX_FIRST_HAND_PUBKEYS + 2).map(|_| new_key()).collect();
+    for key in &keys {
+        let (outs, _) = taker
+            .handle_from("J5makerA", to_command("pubkey", key), &chain, true)
+            .unwrap();
+        assert_eq!(auths(&outs), 1, "each is answered");
+    }
+    let kept: Vec<&str> = taker.makers["J5makerA"]
+        .candidates
+        .iter()
+        .map(|c| c.key.as_str())
+        .collect();
+    assert_eq!(kept.len(), MAX_FIRST_HAND_PUBKEYS);
+    assert_eq!(
+        kept,
+        keys[2..].iter().map(String::as_str).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_taker_that_requires_first_hand_keys_answers_no_relayed_one() {
+    let (taker, chain) = started_taker();
+    let mut taker = taker.require_first_hand();
+    for _ in 0..3 {
+        let (outs, progress) = taker
+            .handle("J5makerA", to_command("pubkey", &new_key()), &chain)
+            .unwrap();
+        assert!(outs.is_empty() && progress == Progress::Waiting);
+    }
+    let (outs, _) = taker
+        .handle_from("J5makerA", to_command("pubkey", &new_key()), &chain, true)
+        .unwrap();
+    assert_eq!(auths(&outs), 1);
 }

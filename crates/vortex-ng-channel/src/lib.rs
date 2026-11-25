@@ -171,6 +171,17 @@ pub trait Channel: Send + Sync {
     /// not act on a lone `!error`.
     fn authenticates(&self, route: &Self::Route) -> bool;
 
+    /// Whether a private line that came by `route` can only have been written by the peer it names, or
+    /// delivered by that peer's own connection to us, which no directory or server in between can add lines
+    /// to: on Nostr the gift wrap's sender, on onion a direct connection. A relaying directory or an IRC
+    /// server can deliver any line a peer ever signed (the signature covers neither the command nor the
+    /// recipient), so what arrives that way can be a signed line of another exchange. Not the same as
+    /// [`Channel::authenticates`], which a direct onion connection fails: the directory chose whom we
+    /// connected to. Defaults to `authenticates`.
+    fn first_hand(&self, route: &Self::Route) -> bool {
+        self.authenticates(route)
+    }
+
     /// Start receiving private messages, and also offers and public messages as asked.
     fn listen(
         &self,

@@ -220,7 +220,9 @@ makers_up() {
   kill -0 "$refmaker_pid" 2>/dev/null || { echo "joinmarket-clientserver's maker exited"; show "$logs/refmaker.log" 40; return 1; }
   kill -0 "$jmng_maker_pid" 2>/dev/null || { echo "joinmarket-ng's maker exited"; show "$logs/jmng-maker.log" 40; return 1; }
 }
-our_maker=(VORTEX_NG_INTEROP_MAKERS=1 VORTEX_NG_INTEROP_ROUND_MAKERS=3)
+# GRACE_SECS: our maker takes a commitment it has heard announced for 2 seconds, not 5 minutes, so that the
+# taker's check that every maker refuses one, 5 seconds after the announcement, holds for it too.
+our_maker=(VORTEX_NG_INTEROP_MAKERS=1 VORTEX_NG_INTEROP_ROUND_MAKERS=3 VORTEX_NG_INTEROP_GRACE_SECS=2)
 # Hand the round's txid to vortex-ng's maker, which checks the transaction and its wallet, and wait for it.
 our_maker_checks() {  # its directory, txid
   printf '%s' "$2" >"$1/jmng.txid.tmp" && mv "$1/jmng.txid.tmp" "$1/jmng.txid"

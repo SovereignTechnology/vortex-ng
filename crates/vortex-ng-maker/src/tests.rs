@@ -403,11 +403,11 @@ fn a_flood_of_announcements_cannot_free_a_verified_commitment() {
     let mut commitments = Commitments::default();
     commitments.insert_verified([1; 32]);
     for i in 0..=MAX_COMMITMENTS {
-        commitments.insert(key(i));
+        commitments.insert(key(i), 0);
     }
     assert!(commitments.contains(&[1; 32]), "still refused");
     assert!(!commitments.contains(&key(0)), "announcements are bounded");
-    assert!(!commitments.insert([1; 32]), "not new");
+    assert!(!commitments.insert([1; 32], 0), "not new");
 }
 
 #[test]
@@ -460,8 +460,23 @@ fn a_line_relabelled_to_another_step_leaves_the_session() {
 
 /// Run `!fill` and `!auth` for `amount`: the maker's `!ioauth`, or `None` when it refused.
 fn auth_round(maker: &mut Maker, taker: &Taker, chain: &FakeChain, amount: u64) -> Option<Ioauth> {
+    auth_round_after(maker, taker, chain, amount, false)
+}
+
+/// [`auth_round`], where with `announced` someone has announced the round's commitment (`!hp2`) just before the
+/// `!fill` reaches the maker.
+fn auth_round_after(
+    maker: &mut Maker,
+    taker: &Taker,
+    chain: &FakeChain,
+    amount: u64,
+    announced: bool,
+) -> Option<Ioauth> {
     let secp = Secp256k1::new();
     let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    if announced {
+        maker.on_hp2(podle.commitment(), NOW);
+    }
     let fill = Command::Fill {
         oid: 0,
         amount,
@@ -547,7 +562,7 @@ fn a_commitment_handed_over_privately_is_announced_once_and_sparingly() {
             .handle("J5other", hp2([1; 32]), &chain, NOW)
             .is_empty()
     );
-    maker.on_hp2([2; 32]);
+    maker.on_hp2([2; 32], NOW);
     assert!(
         maker
             .handle("J5other", hp2([2; 32]), &chain, NOW)
@@ -571,7 +586,7 @@ fn a_commitment_handed_over_privately_is_announced_once_and_sparingly() {
         maker.handle("J5other", hp2([100; 32]), &chain, later),
         announce([100; 32])
     );
-    // Whatever was handed over, announced or not, is refused in a fill.
+    // Whatever was handed over, announced or not, is refused in a fill once the announcement is old enough.
     let secp = Secp256k1::new();
     let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
     assert!(
@@ -589,7 +604,7 @@ fn a_commitment_handed_over_privately_is_announced_once_and_sparingly() {
             commitment: podle.commitment(),
         },
         &chain,
-        later,
+        later + ANNOUNCED_GRACE,
     );
     assert_eq!(private(&out[0]).0, "error");
 }
@@ -603,13 +618,13 @@ fn remembered_commitments_are_bounded() {
         c
     };
     for i in 0..=MAX_COMMITMENTS {
-        assert!(commitments.insert(key(i)));
+        assert!(commitments.insert(key(i), 0));
     }
-    assert!(!commitments.insert(key(MAX_COMMITMENTS)));
+    assert!(!commitments.insert(key(MAX_COMMITMENTS), 0));
     // The oldest went first.
     assert!(!commitments.contains(&key(0)));
     assert!(commitments.contains(&key(1)));
-    assert_eq!(commitments.announced.seen.len(), MAX_COMMITMENTS);
+    assert_eq!(commitments.announced.first_seen.len(), MAX_COMMITMENTS);
 }
 
 #[test]
@@ -740,10 +755,14 @@ fn refusals_end_the_session_with_a_fixed_error() {
         error
     );
 
-    // A commitment seen in an !hp2 broadcast is refused.
+    // A commitment seen in an !hp2 broadcast is refused once the announcement is old; just after it, it is
+    // taken (the round's own).
     let mut maker = funded_maker();
     maker.handle("J5x", Command::Hp2(podle.commitment()), &chain, NOW);
-    assert_eq!(maker.handle("J5taker", fill(AMOUNT), &chain, NOW), error);
+    assert_eq!(
+        maker.handle("J5taker", fill(AMOUNT), &chain, NOW + ANNOUNCED_GRACE),
+        error
+    );
 
     // A PoDLE for a UTXO the chain does not know, or too young, is refused.
     for confirmations in [None, Some(4)] {
@@ -1154,8 +1173,8 @@ fn a_restarted_maker_still_refuses_the_commitments_it_saw() {
     let keeper = MemoryKeeper::default();
     let mut maker = funded_maker();
     maker.keep_commitments(Vec::new(), Box::new(keeper.clone()));
-    maker.on_hp2([7; 32]);
-    maker.on_hp2([7; 32]);
+    maker.on_hp2([7; 32], NOW);
+    maker.on_hp2([7; 32], NOW);
     assert!(auth_round(&mut maker, &taker, &chain, AMOUNT).is_some());
     // Each kept once, the announced one as announced, the round's as verified.
     let kept = keeper.kept();
@@ -1188,7 +1207,7 @@ fn coins_are_not_shown_when_the_commitment_cannot_be_kept() {
     maker.keep_commitments(Vec::new(), Box::new(keeper.clone()));
     keeper.0.lock().unwrap().failing = true;
     // An announcement is still remembered in memory: losing it on disk costs little.
-    maker.on_hp2([8; 32]);
+    maker.on_hp2([8; 32], NOW);
     assert_eq!(maker.remembered_commitments(), (0, 1));
     // The round's commitment is not on disk, so no `!ioauth`, and the commitment is not counted as used.
     assert!(auth_round(&mut maker, &taker, &chain, AMOUNT).is_none());
@@ -1225,7 +1244,7 @@ fn the_keeper_is_rewritten_from_what_is_remembered_when_it_asks() {
         keeper.kept(),
         vec![(Seen::Verified, [1; 32]), (Seen::Announced, [2; 32])]
     );
-    maker.on_hp2([3; 32]);
+    maker.on_hp2([3; 32], NOW);
     assert_eq!(keeper.0.lock().unwrap().rewrites, 1);
     assert_eq!(keeper.kept().len(), 3);
 }
@@ -1339,4 +1358,68 @@ impl WalletClaims for RaceClaims {
     fn take_address(&self, address: &vortex_ng_core::bitcoin::Address) -> Result<bool, String> {
         self.0.take_address(address)
     }
+}
+
+#[test]
+fn a_commitment_announced_in_the_round_does_not_spoil_it() {
+    // Someone saw the taker's `!fill` and announced its commitment; this maker hears the announcement just
+    // before the `!fill`, as a maker a relay serves a moment later than another does. The round goes on.
+    let (taker, chain) = new_taker();
+    let mut maker = funded_maker();
+    assert!(auth_round_after(&mut maker, &taker, &chain, AMOUNT, true).is_some());
+}
+
+#[test]
+fn an_announced_commitment_is_refused_once_the_announcement_is_old() {
+    let (taker, chain) = new_taker();
+    let secp = Secp256k1::new();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    let fill = |nick: &str, at: u64, maker: &mut Maker| {
+        let command = Command::Fill {
+            oid: 0,
+            amount: AMOUNT,
+            nacl_pubkey: taker.nacl.public_hex(),
+            commitment: podle.commitment(),
+        };
+        let out = maker.handle(nick, command, &chain, at);
+        private(&out[0]).0.to_string()
+    };
+    // Just inside the window it is taken; at its end, refused.
+    let mut maker = funded_maker();
+    maker.on_hp2(podle.commitment(), NOW);
+    assert_eq!(fill("J5a", NOW + ANNOUNCED_GRACE - 1, &mut maker), "pubkey");
+    let mut maker = funded_maker();
+    maker.on_hp2(podle.commitment(), NOW);
+    assert_eq!(fill("J5a", NOW + ANNOUNCED_GRACE, &mut maker), "error");
+    // The window is the maker's to set: none refuses at once.
+    let mut maker = funded_maker();
+    maker.config.announced_grace = 0;
+    maker.on_hp2(podle.commitment(), NOW);
+    assert_eq!(fill("J5a", NOW, &mut maker), "error");
+    // One announced in an earlier run is old.
+    let mut maker = funded_maker();
+    maker.keep_commitments(
+        vec![(Seen::Announced, podle.commitment())],
+        Box::new(MemoryKeeper::default()),
+    );
+    assert_eq!(fill("J5a", NOW, &mut maker), "error");
+}
+
+#[test]
+fn a_commitment_this_maker_verified_is_refused_at_once() {
+    let (taker, chain) = new_taker();
+    let mut maker = funded_maker();
+    assert!(auth_round(&mut maker, &taker, &chain, AMOUNT).is_some());
+    // The same commitment, announced as well, and a second `!fill` straight after: refused, whatever the age.
+    let secp = Secp256k1::new();
+    let podle = generate(&secp, &taker.key, &taker.utxo.to_string(), 0, None).unwrap();
+    maker.on_hp2(podle.commitment(), NOW);
+    let command = Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: taker.nacl.public_hex(),
+        commitment: podle.commitment(),
+    };
+    let out = maker.handle("J5other", command, &chain, NOW);
+    assert_eq!(private(&out[0]).0, "error");
 }

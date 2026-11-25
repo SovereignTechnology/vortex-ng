@@ -435,7 +435,7 @@ struct MakerSlot {
     /// answered with an `!auth`. A signed `!pubkey` from another exchange can be delivered here, since the
     /// signature does not cover the recipient, so the first one is not necessarily this round's; the one that
     /// decrypts the maker's `!ioauth` is.
-    candidates: Vec<(String, Session)>,
+    candidates: Vec<Candidate>,
     io: Option<MakerIo>,
 }
 
@@ -453,9 +453,25 @@ impl MakerSlot {
     }
 }
 
-/// Most `!pubkey` keys answered per maker. The first ones stay and later ones are ignored, so keys harvested
-/// from the maker and delivered after its real one cannot push that one out, and each costs at most one `!auth`.
+/// Most `!pubkey` keys answered per maker that came by a route where anyone could have delivered them (a
+/// relaying directory, an IRC server). The first ones stay and later ones are ignored, so keys harvested from
+/// the maker and delivered after its real one cannot push that one out, and each costs at most one `!auth`.
 pub const MAX_PUBKEY_CANDIDATES: usize = 16;
+
+/// Most `!pubkey` keys answered per maker that came first-hand (see `Channel::first_hand`): only the maker
+/// can write those, so they cannot be crowded out by keys harvested from it, and they have a table of their
+/// own. A maker that starts the exchange again (joinmarket-clientserver's does when it gets a `!fill` twice)
+/// answers with a new key and only that session is live, so when the table is full the newest replaces the
+/// oldest.
+pub const MAX_FIRST_HAND_PUBKEYS: usize = 4;
+
+/// A key a maker's `!pubkey` offered, and the session with it that its `!auth` was encrypted for.
+struct Candidate {
+    key: String,
+    session: Session,
+    /// Whether it came by a route only the maker (or the connection to it) could write to.
+    first_hand: bool,
+}
 
 /// A taker running one CoinJoin.
 pub struct Taker {
@@ -471,6 +487,9 @@ pub struct Taker {
     /// lowered it. Whoever carries the lines, or another maker in the round, can get an honest maker left
     /// out, so this floor is what stops them from whittling a round down to the makers they run.
     min_makers: usize,
+    /// Whether a `!pubkey` that did not come first-hand is ignored altogether
+    /// ([`Taker::require_first_hand`]).
+    only_first_hand: bool,
     tx: Option<Transaction>,
     prevouts: Vec<TxOut>,
     witnesses: BTreeMap<usize, Witness>,
@@ -513,6 +532,7 @@ impl Taker {
         }
         Ok(Taker {
             min_makers: cfg.makers,
+            only_first_hand: false,
             cfg,
             nacl: NaclKeypair::generate(),
             podle,
@@ -537,6 +557,16 @@ impl Taker {
         }
         self.min_makers = min_makers;
         Ok(self)
+    }
+
+    /// Answer a maker's `!pubkey` only when it came first-hand (`Channel::first_hand`: Nostr, or a direct
+    /// onion connection). A relaying directory or an IRC server can deliver any line a maker ever signed, so
+    /// the key in a relayed `!pubkey` need not be the maker's own for this round; with this, the taker never
+    /// answers one. A maker that answers only through a relay (JoinMarket-NG's makers do, whatever route the
+    /// `!fill` took) cannot be filled at all, so it is off by default.
+    pub fn require_first_hand(mut self) -> Taker {
+        self.only_first_hand = true;
+        self
     }
 
     /// How many makers are still in the round.
@@ -600,11 +630,23 @@ impl Taker {
         command: Command,
         chain: &impl ChainLookup,
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
+        self.handle_from(from, command, chain, false)
+    }
+
+    /// [`Taker::handle`] for a line that came by a route where `first_hand` says only the maker (or its own
+    /// connection to us) could have written it: `Channel::first_hand`. `handle` takes a line as relayed.
+    pub fn handle_from(
+        &mut self,
+        from: &str,
+        command: Command,
+        chain: &impl ChainLookup,
+        first_hand: bool,
+    ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
         if !self.makers.contains_key(from) {
             return Ok(self.stray());
         }
         match command {
-            Command::Pubkey { nacl_pubkey, .. } => self.on_pubkey(from, &nacl_pubkey),
+            Command::Pubkey { nacl_pubkey, .. } => self.on_pubkey(from, &nacl_pubkey, first_hand),
             Command::Encrypted { name, ciphertext } if name == "ioauth" => {
                 self.on_ioauth(from, &ciphertext, chain)
             }
@@ -629,16 +671,25 @@ impl Taker {
         &mut self,
         from: &str,
         maker_nacl: &str,
+        first_hand: bool,
     ) -> Result<(Vec<Outgoing>, Progress), TakerError> {
+        if self.only_first_hand && !first_hand {
+            return Ok(self.stray());
+        }
         let revelation = self.podle.revelation();
         let slot = self
             .makers
             .get_mut(from)
             .ok_or_else(|| err(from, "unknown"))?;
         let key = maker_nacl.to_ascii_lowercase();
+        let of_this_kind = slot
+            .candidates
+            .iter()
+            .filter(|c| c.first_hand == first_hand)
+            .count();
         if slot.session.is_some()
-            || slot.candidates.len() >= MAX_PUBKEY_CANDIDATES
-            || slot.candidates.iter().any(|(known, _)| *known == key)
+            || (!first_hand && of_this_kind >= MAX_PUBKEY_CANDIDATES)
+            || slot.candidates.iter().any(|c| c.key == key)
         {
             return Ok(self.stray());
         }
@@ -650,7 +701,17 @@ impl Taker {
         let body = session
             .encrypt(&revelation)
             .map_err(|e| TakerError::Internal(e.to_string()))?;
-        slot.candidates.push((key, session));
+        if first_hand && of_this_kind >= MAX_FIRST_HAND_PUBKEYS {
+            // The maker started again: only its newest key is live.
+            if let Some(oldest) = slot.candidates.iter().position(|c| c.first_hand) {
+                slot.candidates.remove(oldest);
+            }
+        }
+        slot.candidates.push(Candidate {
+            key,
+            session,
+            first_hand,
+        });
         Ok((
             vec![Outgoing::Private {
                 to: from.to_string(),
@@ -708,7 +769,7 @@ impl Taker {
             .makers
             .get_mut(from)
             .ok_or_else(|| err(from, "unknown"))?;
-        let (_, session) = slot.candidates.swap_remove(candidate);
+        let Candidate { session, .. } = slot.candidates.swap_remove(candidate);
         slot.candidates.clear();
         slot.session = Some(session);
         slot.maker_nacl = maker_nacl;
@@ -727,9 +788,9 @@ impl Taker {
         slot.candidates
             .iter()
             .enumerate()
-            .find_map(|(i, (key, session))| {
-                let plaintext = session.decrypt(ciphertext).ok()?;
-                Some((i, plaintext, key.clone()))
+            .find_map(|(i, candidate)| {
+                let plaintext = candidate.session.decrypt(ciphertext).ok()?;
+                Some((i, plaintext, candidate.key.clone()))
             })
     }
 

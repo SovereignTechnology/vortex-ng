@@ -31,6 +31,10 @@
 //! round's txid to `<dir>/jmng.txid`. The transaction must be on the node with both makers in it, and each
 //! maker's wallet, restored from its seed, must hold what it had plus its fee, less its mining-fee share.
 //!
+//! `VORTEX_NG_INTEROP_GRACE_SECS` (the makers' role) is how long, in seconds, a vortex-ng maker still takes a
+//! commitment it has heard announced; the default is the maker's own. `tools/mixed-interop/run.sh` sets it to
+//! 2 so that the 5 seconds the taker's role waits before probing is past it.
+//!
 //! `VORTEX_NG_INTEROP_MAKERS` is how many makers this side runs (two by default) and, for the taker, how many
 //! it chooses. `VORTEX_NG_INTEROP_ROUND_MAKERS` is how many makers the round has in all, when other
 //! implementations' makers are in it too (`tools/mixed-interop/run.sh`).
@@ -823,7 +827,16 @@ async fn makers_with_joinmarket_ng_taker() {
         handles.push(tokio::spawn(async move {
             let offer =
                 Offer::parse(offer_type, &format!("{i} 10000 100000000 {TXFEE} {CJFEE}")).unwrap();
-            let mut maker = Maker::new(MakerConfig::new(vec![offer]), w).unwrap();
+            let mut config = MakerConfig::new(vec![offer]);
+            // How long this maker still takes a commitment it has heard announced: the harness that checks
+            // that every maker refuses one sets it short.
+            if let Some(grace) = std::env::var("VORTEX_NG_INTEROP_GRACE_SECS")
+                .ok()
+                .and_then(|text| text.parse().ok())
+            {
+                config.announced_grace = grace;
+            }
+            let mut maker = Maker::new(config, w).unwrap();
             println!("maker {i} nick {}", client.nick());
             run_maker(&mut maker, &mut client, &rpc, "regtest", until).await
         }));

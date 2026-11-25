@@ -23,7 +23,7 @@ use vortex_ng_core::protocol::NOSTR_HOSTID;
 use vortex_ng_maker::MakerConfig;
 use vortex_ng_nostr::client::NickClient;
 use vortex_ng_nostr::keys::NickKeys;
-use vortex_ng_taker::podle_for;
+use vortex_ng_taker::{MAX_PUBKEY_CANDIDATES, podle_for};
 use vortex_ng_wallet::Seed;
 
 use super::*;
@@ -1755,4 +1755,266 @@ async fn a_flood_of_nicks_does_not_push_out_a_real_bond() {
         asked > MAX_ANSWERING_NICKS && asked <= MAX_BOND_LOOKUPS,
         "{asked}"
     );
+}
+
+/// A mock channel whose `!fill`s all wait until `parties` of them have been asked for: sent one after
+/// another, the first would wait for ever.
+struct Together {
+    channel: vortex_ng_channel::testing::MockChannel,
+    gate: Arc<tokio::sync::Barrier>,
+}
+
+impl Channel for Together {
+    type Route = vortex_ng_channel::testing::MockRoute;
+
+    fn nick(&self) -> &str {
+        self.channel.nick()
+    }
+
+    fn authenticates(&self, route: &Self::Route) -> bool {
+        self.channel.authenticates(route)
+    }
+
+    async fn listen(&self, offers: bool, public: bool) -> Result<(), ChannelError> {
+        self.channel.listen(offers, public).await
+    }
+
+    async fn send_private(
+        &self,
+        route: &Self::Route,
+        to: &str,
+        command: &str,
+        body: &str,
+    ) -> Result<(), ChannelError> {
+        if command == "fill" {
+            self.gate.wait().await;
+        }
+        self.channel.send_private(route, to, command, body).await
+    }
+
+    async fn ask_orderbook(&self) -> Result<(), ChannelError> {
+        self.channel.ask_orderbook().await
+    }
+
+    async fn announce_offers(&self, pit: Pit, offers: &[Offer]) -> Result<(), ChannelError> {
+        self.channel.announce_offers(pit, offers).await
+    }
+
+    async fn withdraw_offers(&self, pit: Pit) -> Result<(), ChannelError> {
+        self.channel.withdraw_offers(pit).await
+    }
+
+    async fn publish_unlinked(&self, line: &str) -> Result<(), ChannelError> {
+        self.channel.publish_unlinked(line).await
+    }
+
+    async fn receive(&mut self, wait: Duration) -> Next<Self::Route> {
+        self.channel.receive(wait).await
+    }
+
+    async fn shutdown(&self) {
+        self.channel.shutdown().await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fills_of_a_round_go_out_together() {
+    use vortex_ng_channel::testing::{MockRoute, Sent, mock_channel};
+
+    let (channel, handle) = mock_channel("J5taker", false);
+    let client = Together {
+        channel,
+        gate: Arc::new(tokio::sync::Barrier::new(3)),
+    };
+    let nicks = ["J5makerA", "J5makerB", "J5makerC"];
+    let peers: HashMap<String, MockRoute> = nicks
+        .iter()
+        .map(|nick| (nick.to_string(), MockRoute("a".into())))
+        .collect();
+    let fills: Vec<Outgoing> = nicks
+        .iter()
+        .map(|nick| Outgoing::Private {
+            to: nick.to_string(),
+            command: "fill".into(),
+            body: "0 100000 ab P00".into(),
+        })
+        .collect();
+    let chain = SharedChain(Arc::new(HashMap::new()));
+    // Sent one at a time, the first waits for the other two, which never start.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        send_fills(&client, &peers, &chain, fills),
+    )
+    .await
+    .expect("every fill is asked for before any has gone")
+    .unwrap();
+    let filled = handle
+        .sent()
+        .iter()
+        .filter(|s| matches!(s, Sent::Private { command, .. } if command == "fill"))
+        .count();
+    assert_eq!(filled, 3);
+}
+
+/// What `scripted_round` found.
+struct Scripted {
+    round: Result<Transaction, NodeError>,
+    /// The `!auth` lines the taker sent on channel A.
+    auths: usize,
+}
+
+/// A taker with one maker on two channels (A and B, a nick on each), a real maker answering on A, and mischief:
+/// after the `!fill`, `junk_on_a` signed `!pubkey` lines of the maker's, from another exchange, reach the
+/// taker on A as relayed, `junk_on_b` more on channel B, and then the maker's real answers, on route
+/// `real_route` of channel A. With `strict` the taker answers first-hand keys only.
+async fn scripted_round(
+    strict: bool,
+    junk_on_a: usize,
+    junk_on_b: usize,
+    real_route: &str,
+) -> Scripted {
+    use vortex_ng_channel::set::ChannelSet;
+    use vortex_ng_channel::testing::{Sent, mock_channel};
+    use vortex_ng_core::nick::NickIdentity;
+
+    let pit = Pit::Sw0;
+    let mut utxos = HashMap::new();
+    let maker_wallet = funded(pit, "scripted-maker", 500_000, None, 140, &mut utxos);
+    let mut taker_wallet = funded(pit, "scripted-taker", 600_000, None, 141, &mut utxos);
+    let chain = SharedChain(Arc::new(utxos));
+    let utxo = taker_wallet.utxos(0).unwrap().remove(0);
+    let podle = podle_for(&taker_wallet, 0, &utxo, 0).unwrap();
+    let cfg = TakerConfig {
+        pit,
+        makers: 1,
+        bondless_require_zero_fee: false,
+        ..pit_config()
+    };
+    let cj = taker_wallet
+        .next_receive_address(1)
+        .unwrap()
+        .script_pubkey();
+    let change = taker_wallet.next_change_address(0).unwrap().script_pubkey();
+    let mut taker = Taker::new(
+        cfg.clone(),
+        0,
+        vec![(utxo.outpoint, utxo.txout.clone())],
+        podle,
+        cj,
+        change,
+    )
+    .unwrap();
+    if strict {
+        taker = taker.require_first_hand();
+    }
+    let (a, on_a) = mock_channel("J5takerOnA", false);
+    let (b, on_b) = mock_channel("J5takerOnB", false);
+    let mut client = ChannelSet::new(vec![Box::new(a), Box::new(b)]).unwrap();
+    let identity = NickIdentity::generate();
+    on_a.deliver_private(
+        &identity,
+        "J5takerOnA",
+        "sw0absoffer",
+        "0 10000 10000000 100 500",
+        "a",
+    );
+
+    // The maker, driven by hand: it answers what the taker sent it on A.
+    let driver = {
+        let (on_a, on_b, identity, chain) =
+            (on_a.clone(), on_b.clone(), identity.clone(), chain.clone());
+        let real_route = real_route.to_string();
+        let offer = Offer::parse("sw0absoffer", "0 10000 10000000 100 500").unwrap();
+        let mut maker = Maker::new(MakerConfig::new(vec![offer]), maker_wallet).unwrap();
+        tokio::spawn(async move {
+            let mut seen = 0;
+            loop {
+                let sent = on_a.sent();
+                for line in &sent[seen..] {
+                    let Sent::Private {
+                        to, command, body, ..
+                    } = line
+                    else {
+                        continue;
+                    };
+                    if to != identity.nick() {
+                        continue;
+                    }
+                    if command == "fill" {
+                        for _ in 0..junk_on_a {
+                            let key = vortex_ng_core::nacl::NaclKeypair::generate().public_hex();
+                            on_a.deliver_private(&identity, "J5takerOnA", "pubkey", &key, "a");
+                        }
+                        for _ in 0..junk_on_b {
+                            let key = vortex_ng_core::nacl::NaclKeypair::generate().public_hex();
+                            on_b.deliver_private(&identity, "J5takerOnB", "pubkey", &key, "b");
+                        }
+                    }
+                    for cmd in parse_plaintext(&format!("!{command} {body}")).unwrap_or_default() {
+                        for out in maker.handle("J5takerOnA", cmd, &chain, unix_now()) {
+                            if let Outgoing::Private { command, body, .. } = out {
+                                on_a.deliver_private(
+                                    &identity,
+                                    "J5takerOnA",
+                                    &command,
+                                    &body,
+                                    &real_route,
+                                );
+                            }
+                        }
+                    }
+                }
+                seen = sent.len();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+    let round = run_taker(
+        &mut taker,
+        &taker_wallet,
+        &mut client,
+        &chain,
+        &cfg,
+        Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(20),
+    )
+    .await;
+    driver.abort();
+    let auths = on_a
+        .sent()
+        .iter()
+        .filter(|s| matches!(s, Sent::Private { command, .. } if command == "auth"))
+        .count();
+    Scripted { round, auths }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_makers_signed_lines_on_another_channel_than_its_fill_are_not_answered() {
+    // Keys harvested from the maker, delivered on channel B, where our `!fill` never went: no `!auth` is
+    // encrypted to any of them, and the round on A completes.
+    let found = scripted_round(false, 0, 5, "a").await;
+    let tx = found.round.expect("the round completes");
+    assert_eq!(tx.input.len(), 2);
+    assert_eq!(found.auths, 1, "one `!auth`, to the maker's own key");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_makers_first_hand_key_is_answered_after_a_flood_of_relayed_ones() {
+    // More relayed keys than the taker will answer come first; the maker's own, on a direct route, is heard.
+    let found = scripted_round(false, MAX_PUBKEY_CANDIDATES + 4, 0, "direct").await;
+    let tx = found.round.expect("the round completes");
+    assert_eq!(tx.input.len(), 2);
+    assert_eq!(found.auths, MAX_PUBKEY_CANDIDATES + 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strict_taker_sends_its_auth_to_first_hand_keys_only() {
+    let found = scripted_round(true, 3, 0, "direct").await;
+    let tx = found.round.expect("the round completes");
+    assert_eq!(tx.input.len(), 2);
+    assert_eq!(found.auths, 1, "none of the relayed keys was answered");
+    // Its maker answered through a relay only: nothing is first-hand, and nothing is answered.
+    let silent = scripted_round(true, 0, 0, "a").await;
+    assert!(silent.round.is_err());
+    assert_eq!(silent.auths, 0);
 }
