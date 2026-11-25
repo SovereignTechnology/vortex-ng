@@ -21,6 +21,7 @@ use vortex_ng_core::command::{Command, ENCRYPTED, Outgoing, parse_plaintext};
 use vortex_ng_core::line::PrivMsg;
 use vortex_ng_core::offer::{Offer, Pit};
 use vortex_ng_core::protocol::MAKER_CHANGE_THRESHOLD_SAT;
+use vortex_ng_core::sig::InputSigner;
 use vortex_ng_maker::Maker;
 pub use vortex_ng_nostr::channel::{CONNECT_TIMEOUT, OFFER_TTL};
 use vortex_ng_nostr::client::unix_now;
@@ -28,7 +29,6 @@ use vortex_ng_taker::{
     Progress, Taker, TakerConfig, TakerError, VerifiedBond, candidate_nicks, select_makers,
     usable_fee, verify_bond,
 };
-use vortex_ng_wallet::PitWallet;
 use vortex_ng_wallet::sync::BlockSource;
 
 /// A maker answers one nick's `!orderbook` at most once per this interval.
@@ -856,7 +856,7 @@ const MAKER_ANSWER_TIME: Duration = Duration::from_secs(60);
 /// after every maker; channel funding hooks in before `Taker::finish`).
 pub async fn run_taker<C: Channel>(
     taker: &mut Taker,
-    wallet: &PitWallet,
+    signer: &(impl InputSigner + ?Sized),
     client: &mut C,
     chain: &impl ChainLookup,
     cfg: &TakerConfig,
@@ -931,7 +931,7 @@ pub async fn run_taker<C: Channel>(
                     // A line that could not go (a full queue, say) does not end the round: the deadline does.
                     let _ = deliver(client, &peers, chain, outgoing).await;
                     if progress == Progress::MakersSigned {
-                        return taker.finish(wallet).map_err(NodeError::Taker);
+                        return blocking(|| taker.finish(signer)).map_err(NodeError::Taker);
                     }
                 }
             }

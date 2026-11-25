@@ -1077,3 +1077,54 @@ fn coins_are_chosen_for_the_commitment_first_and_no_more_than_needed() {
     .unwrap();
     assert_eq!(exact.len(), 2);
 }
+
+#[test]
+fn choosing_a_nodes_coins_takes_one_unless_told_to_merge() {
+    let cfg = TakerConfig {
+        pit: Pit::Sw0,
+        network: Network::Regtest,
+        amount: 1_000_000,
+        makers: 2,
+        max_cjfee: 2_000,
+        fee_rate_sat_per_kwu: 500,
+        max_maker_utxos: 20,
+        bondless_makers_allowance: DEFAULT_BONDLESS_ALLOWANCE,
+        bondless_require_zero_fee: false,
+        bond_params: Default::default(),
+    };
+    let held = |byte: u8, sats: u64| {
+        (
+            OutPoint {
+                txid: Txid::from_byte_array([byte; 32]),
+                vout: 0,
+            },
+            TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey: ScriptBuf::new(),
+            },
+        )
+    };
+    let value = |coins: &[(OutPoint, TxOut)]| -> Vec<u64> {
+        coins.iter().map(|(_, out)| out.value.to_sat()).collect()
+    };
+    // The smallest coin that covers it, so the least change: not the largest.
+    let chosen = choose_external(
+        &cfg,
+        vec![held(1, 9_000_000), held(2, 1_100_000), held(3, 400_000)],
+        false,
+    )
+    .unwrap();
+    assert_eq!(value(&chosen), vec![1_100_000]);
+    // No single coin covers it: refused unless merging was asked for, and then the fewest, largest first.
+    let short = vec![held(1, 700_000), held(2, 600_000), held(3, 100_000)];
+    assert!(matches!(
+        choose_external(&cfg, short.clone(), false),
+        Err(TakerError::Funds(_))
+    ));
+    assert_eq!(
+        value(&choose_external(&cfg, short, true).unwrap()),
+        vec![700_000, 600_000]
+    );
+    assert!(choose_external(&cfg, vec![held(1, 500)], true).is_err());
+    assert!(choose_external(&cfg, Vec::new(), true).is_err());
+}

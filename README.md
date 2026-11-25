@@ -17,6 +17,11 @@ around JoinMarket's maker/taker market instead of a central coordinator:
 - **Lightning channel opens inside the coinjoin.** A taker's equal-amount output can be the funding output of
   a taproot channel (in `tr0`) or a regular channel (in `wsh0`); makers see an ordinary output of the pit's
   type. LND, Core Lightning and LDK can open; any implementation can be the peer.
+- **CoinJoin from a channel close.** A coin a Lightning channel close paid your wallet is recognised from
+  the transaction that created it (a mutual close, a force close, or the sweep of one), and
+  `coinjoin --from-closes` spends those coins and no others, so they are not merged with coins of another
+  history. `coinjoin --from-lnd` does it from an LND node's own wallet, the node signing (ADR 0008). Closing is
+  the moment a node's coins are easiest to link; this mixes them right after.
 - **Upstreamable by construction.** Every protocol piece JoinMarket lacks is written as a JMP draft
   (`docs/jmp/`) for [joinmarket-ng](https://github.com/joinmarket-ng/joinmarket-ng) to adopt.
 
@@ -56,8 +61,12 @@ rings (JMP-0014), credential market (JMP-0012/13) · M6 external funding for Ecl
 
 ## Command line
 
+<<<<<<< HEAD
+`vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin`, `balance`, `coins` and `lnd-coins`.
+=======
 `vortex-ng` has the wallet commands, `orderbook`, `maker`, `coinjoin`, `balance`, and `pools`, `pool join` and
 `pool create` for joinstr pools.
+>>>>>>> github/main
 
 ```
 vortex-ng wallet new          --wallet <file> --network <network> [--words 12|24] [--birthday <height>]
@@ -73,8 +82,10 @@ vortex-ng maker     --wallet <file> where node (--fee-rel <fraction> | --fee-abs
 vortex-ng coinjoin  --wallet <file> where node --amount <sats> [--makers <n>]
                     [--min-makers <n>] [--mixdepth 0-4] [--destination <address>] [--pit sw0|tr0|wsh0]
                     [--fee-rate <sat/vB>] [--max-maker-fee <sats>] [--wait <seconds>]
-                    [--allow-bondless-fees] [--yes]
+                    [--allow-bondless-fees] [--from-closes | --from-lnd lnd [--merge-closes]] [--yes]
 vortex-ng balance   --wallet <file> node [--pit sw0|tr0|wsh0]
+vortex-ng coins     --wallet <file> node [--pit sw0|tr0|wsh0] [--mixdepth 0-4] [--closes-only] [--outpoints]
+vortex-ng lnd-coins --network <network> lnd [--closes-only] [--outpoints]
 ```
 
 `where` is at least one of these, and none is on by default:
@@ -132,6 +143,42 @@ one round the makers can link them, since every one of them sees the round's com
   and at least 2,000 sat unless `--max-maker-fee` says otherwise), takes makers without a fidelity bond only
   at a zero fee unless `--allow-bondless-fees`, shows what it is about to do and asks before sending anything
   (`--yes` skips the question). The transaction is checked with the node before it is broadcast.
+- **Channel closes.** Close a channel with one of the wallet's addresses as the delivery address (LND
+  `closechannel --delivery_addr`, Core Lightning `close <id> <timeout> <address>`; `wallet addresses` lists
+  them). `coins` then marks what the close paid, `coins --closes-only` shows only those, and
+  `coinjoin --from-closes` spends only those. Recognition reads the one transaction that created each coin
+  (BOLT 3's shapes), so it needs no node's help. It is evidence, not proof, and it sees only what a close or
+  a sweep pays this wallet *directly*: a force close that the node sweeps into its own wallet, and the coin
+  sent on from there, look like an ordinary payment. A taproot channel's mutual close is a lone key-path spend
+  and is not recognised either. Outpoints are printed only with `--outpoints`. Nothing watches for closes or
+  spends by itself.
+- **From an LND node's own wallet**, force closes included. `lnd-coins` marks coins by the node's close records,
+  and `coinjoin --from-lnd --mixdepth <n>` spends one with the node signing: the amount goes to this wallet, the
+  change back to the node. `lnd` is `--lnd-rest <host:port> --lnd-tls-cert <file> --lnd-macaroon <file>`.
+  - It never takes what the node must keep to fee-bump its open anchor channels, and merges coins of different
+    channels only with `--merge-closes`.
+  - LND cannot prove a PoDLE, so mixdepth `<n>` must hold a small coin of the pit to commit to: five
+    confirmations, a fifth of the amount, not from a CoinJoin, used for one round only. **The makers see that
+    coin and can link it to the round.**
+  - LND pays closes to P2TR, so its close coins need `--pit tr0`, a market that is only vortex-ng and
+    joinmarket-ng's Taproot branch today. For the wider `sw0` market, close cooperatively with a `sw0` address
+    of this wallet as the delivery address and use `--from-closes`.
+  - **A macaroon that may sign can spend every coin of the node's wallet.** Keep it mode 600, and bake it for
+    exactly these calls (not `signer:generate`, which also reaches channel and identity keys):
+
+    ```
+    lncli bakemacaroon --save_to vortex-round.macaroon \
+      uri:/lnrpc.Lightning/GetInfo uri:/walletrpc.WalletKit/ListUnspent \
+      uri:/lnrpc.Lightning/ClosedChannels uri:/lnrpc.Lightning/WalletBalance \
+      uri:/walletrpc.WalletKit/LeaseOutput uri:/walletrpc.WalletKit/ReleaseOutput \
+      uri:/walletrpc.WalletKit/NextAddr uri:/signrpc.Signer/ComputeInputScript
+    chmod 600 vortex-round.macaroon
+    ```
+
+    The first four calls are enough for `lnd-coins`.
+- No command hands out an address twice: each is written to `<wallet>.claims` (the highest index per pit,
+  mixdepth and chain) before it leaves the process, and every command starts past them, so a failed or
+  unconfirmed round's addresses do not come back in the next one, whichever command or process asks.
 - By default `coinjoin` needs every maker it asked for. With `--min-makers <n>` it leaves out a maker that fails
   or does not answer within 60 seconds and goes on with at least `n`, up to the moment the transaction goes out;
   after that every maker in it has to sign. Fewer makers is a smaller anonymity set, and another maker in the
@@ -154,9 +201,9 @@ one round the makers can link them, since every one of them sees the round's com
   writes to a pool's key and when; every peer holds the pool's key and can read every pool message; a pool
   without aut-ct has no defence against one party taking many places.
 - The commands that spend coins share `<wallet>.claims` beside the wallet file: every coin a maker's round, a
-  `coinjoin` or a pool holds, until when, and every address handed out, read and written under a file lock.
-  A coin one of them holds is never put into another's transaction and no address is handed out twice, so a
-  `maker` and `pool` commands can run on one wallet at the same time (issue #51).
+  `coinjoin` or a pool holds, until when, and the highest address index handed out on each chain, read and
+  written under a file lock. A coin one of them holds is never put into another's transaction and no address
+  is handed out twice, so a `maker` and `pool` commands can run on one wallet at the same time (issue #51).
 - `orderbook`, `maker` and `coinjoin` take `--proxy <address>`: a SOCKS5 proxy that isolates streams by
   username and password, such as a Tor daemon's SOCKS port (`127.0.0.1:9050`). Every nick then reaches its
   channels under credentials of its own, so Tor gives it circuits of its own: a maker and the throwaway nick it

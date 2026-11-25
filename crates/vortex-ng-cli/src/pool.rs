@@ -150,13 +150,16 @@ fn setup(args: &Args) -> Result<Setup, Failure> {
     let network = file.network();
     let chain = node(args, network)?;
     let mut pit_wallet = PitWallet::new(&file.seed().map_err(failed)?, pit).map_err(failed)?;
+    // Past every address a command on this wallet handed out, so that the sync watches them too.
+    let claims = Claims::open(wallet_path).map_err(failed)?;
+    claims.apply(&mut pit_wallet).map_err(failed)?;
     pit_wallet.sync(&chain, file.birthday()).map_err(failed)?;
     Ok(Setup {
         network,
         pit,
         wallet: pit_wallet,
         chain,
-        claims: Claims::open(wallet_path).map_err(failed)?,
+        claims,
         mixdepth,
         proxy: proxy(args)?,
     })

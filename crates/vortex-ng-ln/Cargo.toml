@@ -1,6 +1,6 @@
 [package]
 name = "vortex-ng-ln"
-description = "Lightning channel funding from coinjoin outputs: LND, Core Lightning, LDK"
+description = "Lightning for vortex-ng: an LND wallet as a coin source; channel funding from coinjoin outputs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,4 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+rustls = { workspace = true }
+serde_json = { workspace = true }
 vortex-ng-core = { workspace = true }
+zeroize = { workspace = true }

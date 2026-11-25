@@ -24,7 +24,7 @@ use vortex_ng_maker::MakerConfig;
 use vortex_ng_nostr::client::NickClient;
 use vortex_ng_nostr::keys::NickKeys;
 use vortex_ng_taker::podle_for;
-use vortex_ng_wallet::Seed;
+use vortex_ng_wallet::{PitWallet, Seed};
 
 use super::*;
 

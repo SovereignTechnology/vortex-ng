@@ -70,6 +70,9 @@ zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 # Terminal modes without unsafe code, for a password prompt that does not echo. Already in the tree (tokio's
 # and arti's file handling); the `termios` feature adds no crate.
 rustix = { version = "1.1.6", default-features = false, features = ["std", "termios"] }
+# TLS to an LND node's REST API, pinned to its own certificate (vortex-ng-ln). The version and the ring provider
+# nostr-sdk's websockets already bring in: no new crate.
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring"] }
 aes-gcm-siv = { version = "=0.11.1", default-features = false, features = ["aes", "alloc"] }
 # Tor in-process (feature `tor` of vortex-ng-nostr). 0.47.0 (2026-10-01): newest release at least 7 days old.
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }

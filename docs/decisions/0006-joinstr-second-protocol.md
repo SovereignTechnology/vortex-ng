@@ -67,11 +67,12 @@ transactions, and must not hand out one address twice: each process derives the 
 so both would start at the same next address.
 
 - They share `<wallet>.claims`, read and written under an exclusive file lock: each coin a process holds, with
-  a random token naming the process and a time the hold runs out, and every address handed out. A maker holds
-  the coins it shows a taker for a session's lifetime, a `coinjoin` for its round, a pool for the pool's.
-  Coins someone else holds are not offered, counted in a maker's liquidity, or chosen; an address taken is
-  passed over. A coin whose round reached the node stays held until its hold runs out, by when the node shows
-  it spent.
+  a random token naming the process and a time the hold runs out, and the highest address index handed out on
+  each chain (pit, mixdepth, receiving or change), which a wallet is moved past before it hands out the next,
+  however many were handed out before. A maker holds the coins it shows a taker for a session's lifetime, a
+  `coinjoin` for its round, a pool for the pool's. Coins someone else holds are not offered, counted in a
+  maker's liquidity, or chosen. A coin whose round reached the node stays held until its hold runs out, by
+  when the node shows it spent.
 - The maker crate still does no I/O: it reaches the file through a `WalletClaims` trait.
 - No mixdepth is reserved for pools: a pool takes a coin of the right size from the mixdepth it is told, and
   pays the next one, as a JoinMarket round does. A coin of the right size comes from a `coinjoin` of that

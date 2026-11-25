@@ -6,7 +6,9 @@
 //! single coin, so round two can only be funded with what round one paid it.
 //!
 //! A third round is then taken by `vortex-ng coinjoin` itself, from a wallet file of its own, and
-//! `vortex-ng balance` shows where the coins went.
+//! `vortex-ng balance` shows where the coins went. That wallet's only coin is the payout of a mutual
+//! channel close (a hand-made channel, `tests/common`), so the round is `coinjoin --from-closes`: the
+//! wallet says what the coin is, the command spends it, and the change is no close coin.
 //!
 //! Nobody reaches the relay directly: it is known to all by a name only the test's SOCKS proxy resolves, a
 //! proxy that, like a Tor daemon's, wants a username and password. Each nick must arrive under credentials
@@ -18,6 +20,8 @@
 // A test: a failed step should panic with its error.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -26,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::MockRelay;
 use vortex_ng_chain::{Auth, CoreRpc};
-use vortex_ng_core::bitcoin::{Address, Network, OutPoint, Transaction};
+use vortex_ng_core::bitcoin::{Address, Amount, Network, OutPoint, Transaction, TxOut};
 use vortex_ng_core::offer::Pit;
 use vortex_ng_core::tx::random_u64;
 use vortex_ng_node::{CONNECT_TIMEOUT, run_taker};
@@ -263,7 +267,11 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
         .split_whitespace()
         .nth(1)
         .unwrap();
-    rpc.generate_to_address(1, &address(first)).unwrap();
+    // Its coin is a channel's mutual close paying this address: the funding output (a coinbase stands in
+    // for the funding transaction) is spent after the 100 blocks below.
+    let cli_first = address(first);
+    let channel = common::Channel::new(40);
+    let (funding, funding_value) = common::mine_to(&rpc, &channel.funding_address());
     // The taker: two coinbases, one per round.
     let seed = Seed::from_mnemonic(WORDS, "cli-maker-taker", Network::Regtest).unwrap();
     let mut taker_wallet = PitWallet::new(&seed, Pit::Sw0).unwrap();
@@ -277,6 +285,19 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
         .next_receive_address(0)
         .unwrap();
     rpc.generate_to_address(100, &sink).unwrap();
+    let close = channel.spend(
+        funding,
+        funding_value,
+        0xffff_fffd,
+        0,
+        vec![TxOut {
+            value: funding_value - Amount::from_sat(10_000),
+            script_pubkey: cli_first.script_pubkey(),
+        }],
+    );
+    rpc.broadcast(&close).unwrap();
+    // Five confirmations by the third round: makers want that of the coin a taker commits to.
+    rpc.generate_to_address(5, &sink).unwrap();
     taker_wallet.sync(&rpc, 0).unwrap();
     let coins = taker_wallet.utxos(0).unwrap();
     assert_eq!(coins.len(), 2);
@@ -492,7 +513,24 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     let log = format!("{cli_taker}.podle");
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
 
-    let third = coinjoin(&["--yes", "--allow-bondless-fees"]);
+    // The wallet knows where its coin came from, and the round spends it and nothing else.
+    let mut args = vec![
+        "coins",
+        "--wallet",
+        &cli_taker,
+        "--password-file",
+        &password,
+        "--closes-only",
+    ];
+    args.extend(node);
+    let closes = String::from_utf8(vortex(&args).stdout).unwrap();
+    assert!(
+        closes.contains("channel close: mutual close")
+            && closes.contains("1 coin(s)")
+            && closes.contains("of it from channel closes"),
+        "{closes}"
+    );
+    let third = coinjoin(&["--yes", "--allow-bondless-fees", "--from-closes"]);
     assert!(
         third.status.success(),
         "{}\n{}",
@@ -538,6 +576,14 @@ async fn maker_processes_serve_rounds_and_the_command_line_takes_one() {
     assert!(
         line("mixdepth 0:").contains(" sat in 1 coin(s)"),
         "{balance}"
+    );
+    // The change is not a close coin, so a round from closes alone has nothing to spend.
+    let none = coinjoin(&["--yes", "--allow-bondless-fees", "--from-closes"]);
+    assert_eq!(none.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&none.stderr).contains("no confirmed coin from a channel close"),
+        "{}",
+        String::from_utf8_lossy(&none.stderr)
     );
     // A round right away has no coin to commit to: the change is one block old.
     let young = coinjoin(&["--yes", "--allow-bondless-fees"]);

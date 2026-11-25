@@ -1,14 +1,24 @@
 //! What the commands using one wallet share, kept beside the wallet file as `<wallet>.claims` (issue #51): the
 //! coins each holds, so that `maker`, `coinjoin` and a joinstr `pool` round never put one coin into two
-//! transactions, and every address handed out, so that no two rounds pay the same address.
+//! transactions, and the addresses handed out, so that no two rounds pay one address.
 //!
-//! One claim per line: `coin <txid>:<vout> <holder> <until>`, held by the process whose random token is
-//! `holder` until the unix time `until`; `address <address>`, taken for good. Every read and write happens
-//! under an exclusive lock on the file, so commands in different processes see each other's claims at once.
-//! Expired coin claims are dropped whenever the file is rewritten. A line that is not a claim is an error:
-//! read as empty, the file would let a coin into two rounds.
+//! One claim per line:
+//!
+//! - `coin <txid>:<vout> <holder> <until>`: held by the process whose random token is `holder` until the unix
+//!   time `until`;
+//! - `address <pit> <mixdepth> receive|change <index>`: the highest address index handed out on that chain,
+//!   for good. The wallet lives in memory and learns which addresses are used from the chain, so an address
+//!   given to a round that failed, or whose transaction is not confirmed yet, looks unused, and the next round
+//!   would get it again: two transactions paying one script, which links them for good, and makers that saw a
+//!   failed round could pick out the taker's outputs in the retry. Every wallet opened from the file starts
+//!   past what is recorded here, whichever command handed it out.
+//!
+//! Every read and write happens under an exclusive lock on the file, so commands in different processes see
+//! each other's claims at once. Expired coin claims are dropped whenever the file is rewritten. A line that is
+//! not a claim is an error: read as empty, the file would let a coin into two rounds and an address into two
+//! transactions. Indices and outpoints only: nothing here could spend.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -20,12 +30,12 @@ use vortex_ng_core::bitcoin::{Address, OutPoint};
 use vortex_ng_core::tx::random_bytes;
 use vortex_ng_maker::WalletClaims;
 use vortex_ng_nostr::client::unix_now;
-use vortex_ng_wallet::PitWallet;
+use vortex_ng_wallet::{MIXDEPTHS, PitWallet};
 
 /// A claims file this large is not one this program wrote.
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
-/// Most addresses passed over in a row because another command took them.
-const MAX_TAKEN_IN_A_ROW: usize = 1_000;
+/// BIP32's first hardened index: the chains here are unhardened.
+const MAX_INDEX: u32 = (1 << 31) - 1;
 
 /// One process's view of the claims file of a wallet.
 pub(crate) struct Claims {
@@ -34,10 +44,21 @@ pub(crate) struct Claims {
     holder: String,
 }
 
+/// A pit, a mixdepth and a chain (`true`: change).
+type Chain = (String, u32, bool);
+
 #[derive(Default)]
 struct State {
     coins: Vec<(OutPoint, String, u64)>,
-    addresses: Vec<String>,
+    /// The highest address index handed out, per chain.
+    issued: HashMap<Chain, u32>,
+}
+
+fn digits(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 impl State {
@@ -51,11 +72,35 @@ impl State {
                     .zip(until.parse::<u64>().ok())
                     .filter(|_| !holder.is_empty() && holder.bytes().all(|b| b.is_ascii_hexdigit()))
                     .map(|(coin, until)| state.coins.push((coin, holder.to_string(), until))),
+                ["address", pit, mixdepth, chain, index] => {
+                    let internal = match *chain {
+                        "receive" => Some(false),
+                        "change" => Some(true),
+                        _ => None,
+                    };
+                    match (
+                        matches!(*pit, "sw0" | "tr0" | "wsh0"),
+                        digits(mixdepth).filter(|m| *m < MIXDEPTHS),
+                        internal,
+                        digits(index).filter(|i| *i <= MAX_INDEX),
+                    ) {
+                        (true, Some(mixdepth), Some(internal), Some(index)) => {
+                            let entry = state
+                                .issued
+                                .entry((pit.to_string(), mixdepth, internal))
+                                .or_insert(index);
+                            *entry = (*entry).max(index);
+                            Some(())
+                        }
+                        _ => None,
+                    }
+                }
+                // An earlier version of this file named the addresses themselves: they only ever stood for
+                // addresses the wallet could be handed again, which the indices now do better.
                 ["address", address]
                     if !address.is_empty()
                         && address.bytes().all(|b| b.is_ascii_alphanumeric()) =>
                 {
-                    state.addresses.push(address.to_string());
                     Some(())
                 }
                 _ => None,
@@ -78,8 +123,11 @@ impl State {
                 text.push_str(&format!("coin {coin} {holder} {until}\n"));
             }
         }
-        for address in &self.addresses {
-            text.push_str(&format!("address {address}\n"));
+        let mut chains: Vec<_> = self.issued.iter().collect();
+        chains.sort();
+        for ((pit, mixdepth, internal), index) in chains {
+            let chain = if *internal { "change" } else { "receive" };
+            text.push_str(&format!("address {pit} {mixdepth} {chain} {index}\n"));
         }
         text
     }
@@ -94,7 +142,8 @@ impl State {
 }
 
 impl Claims {
-    /// The claims file of the wallet file `wallet`, created (empty, mode 0600) if there is none yet.
+    /// The claims file of the wallet file `wallet`. Nothing is created until a claim is made, so a command
+    /// that only reads (`balance`, `coins`) works from a directory it cannot write to.
     pub(crate) fn open(wallet: &Path) -> Result<Claims, String> {
         let mut path = wallet.as_os_str().to_owned();
         path.push(".claims");
@@ -102,16 +151,26 @@ impl Claims {
             path: PathBuf::from(path),
             holder: random_bytes::<8>().to_lower_hex_string(),
         };
-        claims.with_lock(|_, _| ((), false))?;
+        // A file that is not a claims file is an error now, not at the first claim.
+        claims.with_lock(false, |_, _| ((), false))?;
         Ok(claims)
     }
 
     /// Run `change` on the claims as they stand, under the file's lock. It returns its result and whether the
-    /// file is to be rewritten (expired claims go then too).
-    fn with_lock<T>(&self, change: impl FnOnce(&mut State, u64) -> (T, bool)) -> Result<T, String> {
+    /// file is to be rewritten (expired claims go then too). With `create`, a missing file is made; without,
+    /// it is taken as empty and never written.
+    fn with_lock<T>(
+        &self,
+        create: bool,
+        change: impl FnOnce(&mut State, u64) -> (T, bool),
+    ) -> Result<T, String> {
         let shown = |e: &dyn std::fmt::Display| format!("{}: {e}", self.path.display());
         match std::fs::symlink_metadata(&self.path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    return Ok(change(&mut State::default(), unix_now()).0);
+                }
+            }
             Err(e) => return Err(shown(&e)),
             // A symbolic link is not followed: it is not a file this program wrote.
             Ok(meta) if !meta.is_file() => return Err(shown(&"not a file")),
@@ -119,8 +178,8 @@ impl Claims {
         }
         let mut file: File = OpenOptions::new()
             .read(true)
-            .write(true)
-            .create(true)
+            .write(create)
+            .create(create)
             .truncate(false)
             .mode(0o600)
             .open(&self.path)
@@ -135,6 +194,9 @@ impl Claims {
         let now = unix_now();
         let (result, rewrite) = change(&mut state, now);
         if rewrite {
+            if !create {
+                return Err(shown(&"a write on a file opened to read"));
+            }
             let fresh = state.text(now);
             file.seek(SeekFrom::Start(0)).map_err(|e| shown(&e))?;
             file.set_len(0).map_err(|e| shown(&e))?;
@@ -148,7 +210,7 @@ impl Claims {
     /// Hold `coins` until `until` (unix time) for this process, unless another holds one of them now.
     pub(crate) fn hold_until(&self, coins: &[OutPoint], until: u64) -> Result<bool, String> {
         let holder = self.holder.clone();
-        self.with_lock(|state, now| {
+        self.with_lock(true, |state, now| {
             let elsewhere = state.held_elsewhere(&holder, now);
             if coins.iter().any(|coin| elsewhere.contains(coin)) {
                 return (false, false);
@@ -166,7 +228,7 @@ impl Claims {
     /// Let go of this process's hold on `coins`.
     pub(crate) fn release(&self, coins: &[OutPoint]) -> Result<(), String> {
         let holder = self.holder.clone();
-        self.with_lock(|state, _| {
+        self.with_lock(true, |state, _| {
             state
                 .coins
                 .retain(|(coin, who, _)| !(who == &holder && coins.contains(coin)));
@@ -174,42 +236,57 @@ impl Claims {
         })
     }
 
-    /// The next address of `mixdepth`'s receiving or change chain that no command has taken, now taken.
+    /// The coins other processes hold now.
+    pub(crate) fn held_by_others(&self) -> Result<HashSet<OutPoint>, String> {
+        let holder = self.holder.clone();
+        self.with_lock(false, |state, now| {
+            (state.held_elsewhere(&holder, now), false)
+        })
+    }
+
+    /// Move `wallet` past every address any command has handed out, before it syncs, so that the scan watches
+    /// them too.
+    pub(crate) fn apply(&self, wallet: &mut PitWallet) -> Result<(), String> {
+        let pit = wallet.pit().prefix();
+        self.with_lock(false, |state, _| {
+            let done = state
+                .issued
+                .iter()
+                .filter(|((logged, _, _), _)| logged == pit)
+                .try_for_each(|((_, mixdepth, internal), index)| {
+                    wallet
+                        .reveal_through(*mixdepth, *internal, *index)
+                        .map_err(|e| e.to_string())
+                });
+            (done, false)
+        })?
+    }
+
+    /// The next address of `mixdepth`'s receiving or change chain that no command has handed out, written
+    /// down on disk before it is returned.
     pub(crate) fn fresh_address(
         &self,
         wallet: &mut PitWallet,
         mixdepth: u32,
-        change: bool,
+        internal: bool,
     ) -> Result<Address, String> {
-        for _ in 0..MAX_TAKEN_IN_A_ROW {
-            let address = if change {
-                wallet.next_change_address(mixdepth)
-            } else {
-                wallet.next_receive_address(mixdepth)
+        let key: Chain = (wallet.pit().prefix().to_string(), mixdepth, internal);
+        self.with_lock(true, |state, _| {
+            // Another process may have handed out more since this wallet was opened.
+            if let Some(highest) = state.issued.get(&key)
+                && let Err(e) = wallet.reveal_through(mixdepth, internal, *highest)
+            {
+                return (Err(e.to_string()), false);
             }
-            .map_err(|e| e.to_string())?;
-            if self.take(&address)? {
-                return Ok(address);
+            match wallet.next_address_indexed(mixdepth, internal) {
+                Ok((index, address)) => {
+                    let entry = state.issued.entry(key).or_insert(index);
+                    *entry = (*entry).max(index);
+                    (Ok(address), true)
+                }
+                Err(e) => (Err(e.to_string()), false),
             }
-        }
-        Err("no address left that another command has not taken".into())
-    }
-
-    fn take(&self, address: &Address) -> Result<bool, String> {
-        let text = address.to_string();
-        self.with_lock(|state, _| {
-            if state.addresses.contains(&text) {
-                return (false, false);
-            }
-            state.addresses.push(text);
-            (true, true)
-        })
-    }
-
-    /// The coins other processes hold now.
-    pub(crate) fn held_by_others(&self) -> Result<HashSet<OutPoint>, String> {
-        let holder = self.holder.clone();
-        self.with_lock(|state, now| (state.held_elsewhere(&holder, now), false))
+        })?
     }
 }
 
@@ -222,8 +299,13 @@ impl WalletClaims for Claims {
         self.hold_until(coins, unix_now().saturating_add(seconds))
     }
 
-    fn take_address(&self, address: &Address) -> Result<bool, String> {
-        self.take(address)
+    fn fresh_address(
+        &self,
+        wallet: &mut PitWallet,
+        mixdepth: u32,
+        change: bool,
+    ) -> Result<Address, String> {
+        Claims::fresh_address(self, wallet, mixdepth, change)
     }
 }
 
@@ -231,10 +313,15 @@ impl WalletClaims for Claims {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use vortex_ng_core::bitcoin::Network;
     use vortex_ng_core::bitcoin::Txid;
     use vortex_ng_core::bitcoin::hashes::Hash;
+    use vortex_ng_core::offer::Pit;
+    use vortex_ng_wallet::Seed;
 
     use super::*;
+
+    const WORDS: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     fn wallet_in_new_dir(name: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -252,6 +339,12 @@ mod tests {
             txid: Txid::from_byte_array([byte; 32]),
             vout: u32::from(byte),
         }
+    }
+
+    /// The wallet as a process derives it anew: from the seed, knowing nothing of what others handed out.
+    fn fresh_wallet() -> PitWallet {
+        let seed = Seed::from_mnemonic(WORDS, "", Network::Regtest).unwrap();
+        PitWallet::new(&seed, Pit::Sw0).unwrap()
     }
 
     #[test]
@@ -280,6 +373,7 @@ mod tests {
         // An expired hold counts for nothing, and goes when the file is next written.
         assert!(pool.hold_until(&[coin(3)], now.saturating_sub(1)).unwrap());
         assert!(!maker.held_by_others().unwrap().contains(&coin(3)));
+        assert!(maker.hold_until(&[coin(4)], now + 300).unwrap());
         let file = dir.join("wallet.json.claims");
         assert!(
             !std::fs::read_to_string(&file)
@@ -294,46 +388,87 @@ mod tests {
     }
 
     #[test]
-    fn an_address_is_handed_out_once_across_commands() {
+    fn an_address_is_handed_out_once_across_commands_and_runs() {
         let (dir, wallet) = wallet_in_new_dir("addresses");
-        let seed = vortex_ng_wallet::Seed::from_mnemonic(
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-            "",
-            vortex_ng_core::bitcoin::Network::Regtest,
-        )
-        .unwrap();
-        let pit = vortex_ng_core::offer::Pit::Sw0;
         // Each process derives the wallet anew, so both would start at the same index.
-        let mut first = PitWallet::new(&seed, pit).unwrap();
-        let mut second = PitWallet::new(&seed, pit).unwrap();
+        let (mut first, mut second) = (fresh_wallet(), fresh_wallet());
         let (a, b) = (
             Claims::open(&wallet).unwrap(),
             Claims::open(&wallet).unwrap(),
         );
         let one = a.fresh_address(&mut first, 1, false).unwrap();
         let two = b.fresh_address(&mut second, 1, false).unwrap();
-        assert_ne!(one, two);
+        let reference = fresh_wallet();
+        assert_eq!(one, reference.peek_address(1, false, 0).unwrap());
         assert_eq!(
             two,
-            PitWallet::new(&seed, pit)
-                .unwrap()
-                .peek_address(1, false, 1)
-                .unwrap()
+            reference.peek_address(1, false, 1).unwrap(),
+            "the second process was moved past what the first handed out"
         );
-        // The change chain is its own.
-        let change = a.fresh_address(&mut first, 1, true).unwrap();
+        // The change chain and another mixdepth are their own.
         assert_eq!(
-            change,
-            PitWallet::new(&seed, pit)
+            a.fresh_address(&mut first, 1, true).unwrap(),
+            reference.peek_address(1, true, 0).unwrap()
+        );
+        assert_eq!(
+            b.fresh_address(&mut second, 2, false).unwrap(),
+            reference.peek_address(2, false, 0).unwrap()
+        );
+
+        // A later run starts past all of it, and so does the wallet `apply` moves before it syncs.
+        let mut later = fresh_wallet();
+        Claims::open(&wallet).unwrap().apply(&mut later).unwrap();
+        assert_eq!(
+            later.next_receive_address(1).unwrap(),
+            reference.peek_address(1, false, 2).unwrap()
+        );
+        // The file keeps one line per chain, however many addresses were handed out.
+        let lines = std::fs::read_to_string(dir.join("wallet.json.claims"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(lines, 3, "receive 1, change 1, receive 2");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_has_been_handed_out_costs_nothing_to_skip() {
+        let (dir, wallet) = wallet_in_new_dir("many");
+        let claims = Claims::open(&wallet).unwrap();
+        let mut busy = fresh_wallet();
+        for _ in 0..3_000 {
+            claims.fresh_address(&mut busy, 0, false).unwrap();
+        }
+        // A new process, which knows none of it: one call, one address, past the 3,000.
+        let mut restarted = fresh_wallet();
+        let next = Claims::open(&wallet)
+            .unwrap()
+            .fresh_address(&mut restarted, 0, false)
+            .unwrap();
+        assert_eq!(next, fresh_wallet().peek_address(0, false, 3_000).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("wallet.json.claims"))
                 .unwrap()
-                .peek_address(1, true, 0)
-                .unwrap()
+                .lines()
+                .count(),
+            1
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_damaged_or_linked_claims_file_is_refused() {
+    fn a_command_that_only_reads_creates_nothing() {
+        let (dir, wallet) = wallet_in_new_dir("reads");
+        let claims = Claims::open(&wallet).unwrap();
+        let mut reader = fresh_wallet();
+        claims.apply(&mut reader).unwrap();
+        assert!(claims.held_by_others().unwrap().is_empty());
+        assert!(!dir.join("wallet.json.claims").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_or_linked_claims_file_is_refused_and_an_old_one_is_read() {
         let (dir, wallet) = wallet_in_new_dir("damage");
         let file = dir.join("wallet.json.claims");
         for damaged in [
@@ -342,6 +477,11 @@ mod tests {
             format!("coin {} ab soon\n", coin(1)),
             "address\n".to_string(),
             "address bc1q!\n".to_string(),
+            "address sw0 9 receive 1\n".to_string(),
+            "address sw0 0 sideways 1\n".to_string(),
+            "address xx0 0 receive 1\n".to_string(),
+            "address sw0 0 receive 2147483648\n".to_string(),
+            "address sw0 0 receive -1\n".to_string(),
             "hold it\n".to_string(),
         ] {
             std::fs::write(&file, &damaged).unwrap();
@@ -351,6 +491,14 @@ mod tests {
                 "{damaged}: {refused}"
             );
         }
+        // Addresses named outright, as an earlier version wrote them, are read and let go.
+        std::fs::write(&file, "address bcrt1qexample\naddress sw0 0 receive 4\n").unwrap();
+        let mut moved = fresh_wallet();
+        Claims::open(&wallet).unwrap().apply(&mut moved).unwrap();
+        assert_eq!(
+            moved.next_receive_address(0).unwrap(),
+            fresh_wallet().peek_address(0, false, 5).unwrap()
+        );
         std::fs::remove_file(&file).unwrap();
         let elsewhere = dir.join("elsewhere");
         std::fs::write(&elsewhere, "").unwrap();

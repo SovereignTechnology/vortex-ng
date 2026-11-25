@@ -5760,6 +5760,7 @@ dependencies = [
  "vortex-ng-core",
  "vortex-ng-irc",
  "vortex-ng-joinstr",
+ "vortex-ng-ln",
  "vortex-ng-maker",
  "vortex-ng-node",
  "vortex-ng-nostr",
@@ -5810,7 +5811,10 @@ dependencies = [
 name = "vortex-ng-ln"
 version = "0.0.1"
 dependencies = [
+ "rustls",
+ "serde_json",
  "vortex-ng-core",
+ "zeroize",
 ]
 
 [[package]]
