@@ -179,6 +179,51 @@ fn private(out: &Outgoing) -> (&str, &str) {
     }
 }
 
+/// The NaCl key of a `!pubkey` body: its first token (a `features=` field follows it).
+fn key_of(body: &str) -> &str {
+    body.split(' ').next().unwrap()
+}
+
+#[test]
+fn the_pubkey_carries_one_field_after_the_key() {
+    let mut maker = funded_maker();
+    let (taker, chain) = new_taker();
+    let fill = Command::Fill {
+        oid: 0,
+        amount: AMOUNT,
+        nacl_pubkey: taker.nacl.public_hex(),
+        commitment: [0x42; 32],
+    };
+    let out = maker.handle("J5taker", fill.clone(), &chain, NOW);
+    let (cmd, body) = private(&out[0]);
+    assert_eq!(cmd, "pubkey");
+    // The layout joinmarket-ng's takers read: fields split on single ASCII spaces, none empty, none holding
+    // other whitespace, the first 64 hex characters.
+    let fields: Vec<&str> = body.split(' ').collect();
+    assert_eq!(fields.len(), 2, "{body}");
+    assert_eq!(fields[0].len(), 64);
+    assert!(
+        fields[0]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    );
+    assert_eq!(fields[1], "features=");
+    assert!(
+        fields
+            .iter()
+            .all(|f| !f.is_empty() && !f.chars().any(char::is_whitespace))
+    );
+    // Our own parser reads the key, with the field as an extension.
+    let parsed = vortex_ng_core::command::parse_plaintext(&format!("!pubkey {body}")).unwrap();
+    assert!(
+        matches!(&parsed[0], Command::Pubkey { nacl_pubkey, extensions }
+        if nacl_pubkey == fields[0] && extensions == &["features=".to_string()])
+    );
+    // The same `!fill` again gets the same body, field included.
+    let again = maker.handle("J5taker", fill, &chain, NOW);
+    assert_eq!(private(&again[0]), ("pubkey", body));
+}
+
 #[test]
 fn full_session_signs_a_valid_coinjoin() {
     let secp = Secp256k1::new();
@@ -196,7 +241,7 @@ fn full_session_signs_a_valid_coinjoin() {
     let out = maker.handle("J5taker", fill, &chain, NOW);
     let (cmd, maker_nacl) = private(&out[0]);
     assert_eq!(cmd, "pubkey");
-    let session = taker.nacl.session(maker_nacl).unwrap();
+    let session = taker.nacl.session(key_of(maker_nacl)).unwrap();
 
     // !auth -> !ioauth + !hp2
     let auth = Command::Encrypted {
@@ -222,7 +267,7 @@ fn full_session_signs_a_valid_coinjoin() {
     ));
     assert!(sigmsg::verify(
         &secp,
-        maker_nacl.as_bytes(),
+        key_of(maker_nacl).as_bytes(),
         &ioauth.btc_signature,
         &ioauth.auth_pubkey
     ));
@@ -423,7 +468,7 @@ fn a_line_relabelled_to_another_step_leaves_the_session() {
         commitment: podle.commitment(),
     };
     let out = maker.handle("J5taker", fill, &chain, NOW);
-    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    let session = taker.nacl.session(key_of(private(&out[0]).1)).unwrap();
     let encrypted = |name: &str, text: &str| Command::Encrypted {
         name: name.into(),
         ciphertext: session.encrypt(text).unwrap(),
@@ -488,7 +533,7 @@ fn auth_round_after(
     if cmd != "pubkey" {
         return None;
     }
-    let session = taker.nacl.session(maker_nacl).unwrap();
+    let session = taker.nacl.session(key_of(maker_nacl)).unwrap();
     let auth = Command::Encrypted {
         name: "auth".into(),
         ciphertext: session.encrypt(&podle.revelation()).unwrap(),
@@ -653,7 +698,7 @@ fn a_stray_line_leaves_the_session_as_it_was() {
     let out = maker.handle("J5taker", fill.clone(), &chain, NOW);
     assert_eq!(private(&out[0]).0, "pubkey");
     let pubkey = private(&out[0]).1.to_string();
-    let session = taker.nacl.session(&pubkey).unwrap();
+    let session = taker.nacl.session(key_of(&pubkey)).unwrap();
     assert_eq!(maker.progress("J5taker", NOW), 1);
     // The same `!fill` again, delivered another way: the same answer, and the session as it was. A few
     // times only: copies cannot draw a stream of answers.
@@ -773,7 +818,7 @@ fn refusals_end_the_session_with_a_fixed_error() {
             Some(c) => chain.utxos.values_mut().for_each(|u| u.confirmations = c),
         }
         let out = maker.handle("J5taker", fill(AMOUNT), &chain, NOW);
-        let session = taker.nacl.session(private(&out[0]).1).unwrap();
+        let session = taker.nacl.session(key_of(private(&out[0]).1)).unwrap();
         let auth = Command::Encrypted {
             name: "auth".into(),
             ciphertext: session.encrypt(&podle.revelation()).unwrap(),
@@ -788,7 +833,7 @@ fn refusals_end_the_session_with_a_fixed_error() {
     // More than the maker holds.
     let mut maker = funded_maker();
     let out = maker.handle("J5taker", fill(900_000), &chain, NOW);
-    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    let session = taker.nacl.session(key_of(private(&out[0]).1)).unwrap();
     let auth = Command::Encrypted {
         name: "auth".into(),
         ciphertext: session.encrypt(&podle.revelation()).unwrap(),
@@ -813,7 +858,7 @@ fn a_transaction_that_shortchanges_the_maker_is_not_signed() {
         &chain,
         NOW,
     );
-    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    let session = taker.nacl.session(key_of(private(&out[0]).1)).unwrap();
     let out = maker.handle(
         "J5taker",
         Command::Encrypted {
@@ -905,7 +950,7 @@ fn an_undeclared_utxo_of_the_maker_is_never_signed() {
         &chain,
         NOW,
     );
-    let session = taker.nacl.session(private(&out[0]).1).unwrap();
+    let session = taker.nacl.session(key_of(private(&out[0]).1)).unwrap();
     let auth = Command::Encrypted {
         name: "auth".into(),
         ciphertext: session.encrypt(&podle.revelation()).unwrap(),

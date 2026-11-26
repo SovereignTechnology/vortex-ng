@@ -56,6 +56,15 @@ pub struct MakerConfig {
 /// verified itself, and every commitment loaded from an earlier run, are refused at once.
 pub const ANNOUNCED_GRACE: u64 = 300;
 
+/// The body of our `!pubkey`: our NaCl key, one ASCII space, and `features=` naming no feature. joinmarket-ng's
+/// makers always put a field after the key (`features=neutrino_compat`), and its takers from 0.44 on answer a
+/// `!pubkey` holding the key alone only over a direct connection to the maker's onion, leaving the maker out of
+/// the round otherwise. With the field, such a taker answers us on any channel. Takers that read only the key
+/// ignore it.
+fn pubkey_body(our_nacl: &str) -> String {
+    format!("{our_nacl} features=")
+}
+
 impl MakerConfig {
     /// A config for `offers` with the deployed defaults (indices 0..=2, 5 confirmations, 20 %).
     pub fn new(offers: Vec<Offer>) -> MakerConfig {
@@ -642,7 +651,7 @@ impl Maker {
                     Ok(vec![Outgoing::Private {
                         to: from.to_string(),
                         command: "pubkey".into(),
-                        body: filled.our_nacl.clone(),
+                        body: pubkey_body(&filled.our_nacl),
                     }])
                 }
                 _ => Err(MakerError::Stray("session exists")),
@@ -684,7 +693,7 @@ impl Maker {
         let reply = Outgoing::Private {
             to: from.to_string(),
             command: "pubkey".into(),
-            body: ours.public_hex(),
+            body: pubkey_body(&ours.public_hex()),
         };
         self.sessions.insert(
             from.to_string(),
