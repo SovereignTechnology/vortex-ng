@@ -3,7 +3,7 @@
 # (docs/upstream-pins.md). Run it in a throwaway VM, never on a workstation: it installs packages.
 #   kata-run --net --cwd <vortex-ng> -- bash tools/jmng-vectors/run.sh
 set -euo pipefail
-SHA=c3312cb4ede6de89bd36a1d5b26786905ffc210f
+SHA=3dc893bc5a9bb30ae63ffd42c40d7c3456313183
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 export DEBIAN_FRONTEND=noninteractive

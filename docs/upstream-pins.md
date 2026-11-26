@@ -8,12 +8,12 @@ references and test vectors, and record the reason below.
 |---|---|---|---|
 | `joinmarket-ng/jmp` main (JMP-0001 base protocol, JMP-0002…0005) | `9b9483ef4bb90b66fcacd269325d8120256eab27` | 2026-08-28 | the base protocol (`sw0`) |
 | `joinmarket-ng/jmp` branch `jmp-taproot-ring-market` (JMP-0010…0014, draft, JMP PR #8) | `2f20ac5d97fb2f054efd66819c06b56d659daf10` | 2026-09-26 | `tr0`, channel rings, credential market |
-| `joinmarket-ng/joinmarket-ng` main | `c3312cb4ede6de89bd36a1d5b26786905ffc210f` (release 0.43.0) | 2026-11-05 | `sw0` behaviour and test vectors |
+| `joinmarket-ng/joinmarket-ng` main | `3dc893bc5a9bb30ae63ffd42c40d7c3456313183` (release 0.44.1) | 2026-11-26 | `sw0` behaviour and test vectors |
 | `joinmarket-ng/joinmarket-ng` PR #643 head (`feat/taproot-pit-ring-market`, draft) | `606765ba3efa3bcda9f3c5b271da684ac48a3c8a` | 2026-10-27 | `tr0` and rings as implemented; where code and JMP drafts differ, both are noted in our specs |
 | `joinmarket-ng/joinmarket-ng` branch `nostr` (offer PoC) | `f9a99b342e6011b594c7a6c152ea1cf05fd6bc0d` | 2025-12-06 | kind 31402 offer events |
 | `JoinMarket-Org/joinmarket-clientserver` release | `v0.9.12` (`77a426c504cbf6fa56ba0316dfd8da63a76d2bbf`) | 2026-04-20 | the reference implementation's behaviour, and the onion and IRC channels' wire format (ADR 0007); announced as its final release, the repository to be archived |
 | `JoinMarket-Org/miniircd` master | `20a391f490a58ba9ef295b0d813a95a7e9337382` | 2026-11-25 | the reference's own IRC test server, which `tools/ref-interop` runs (the reference's v0.9.12 test script fetches the same content as `master.tar.gz`) |
-| `joinmarket-ng/joinmarket-ng` main, `directory_server/` and `jmcore` directory client | `c3312cb4ede6de89bd36a1d5b26786905ffc210f` (release 0.43.0) | 2026-11-05 | the onion directory channel as JoinMarket-NG runs it: handshake features, nick authentication (JMP-0005), ping 798/799, directory limits |
+| `joinmarket-ng/joinmarket-ng` main, `directory_server/` and `jmcore` directory client | `3dc893bc5a9bb30ae63ffd42c40d7c3456313183` (release 0.44.1) | 2026-11-26 | the onion directory channel as JoinMarket-NG runs it: handshake features, nick authentication (JMP-0005), ping 798/799, directory limits |
 
 ## joinstr (ADR 0006)
 
@@ -46,3 +46,11 @@ references and test vectors, and record the reason below.
   check on `!hp2` commitments. v0.9.12's defaults: five directory nodes (all five also in JoinMarket-NG's defaults)
   and the hackint IRC server over Tor; Darkscience and ILITA were removed. JoinMarket-NG's directory server pinned
   as the second onion reference.
+- 2026-11-26: joinmarket-ng main and its directory moved to release 0.44.1. Between 0.43.0 and it, `jmcore`'s
+  PoDLE and signing code is unchanged; directory admission and the peerlist parser bound a nick to 64 and a
+  location to 300 UTF-8 bytes, and message deduplication is capped in memory. Its maker refuses a locktime more
+  than 6 blocks past the tip, any time locktime, and a BIP68 relative locktime on any input; vortex-ng's maker now
+  refuses the last as well (its locktime guard stays PR #643's). Its taker drops a maker whose coinjoin and change
+  addresses are equal or that declares one of the taker's own coins, which vortex-ng's taker already did, and by
+  default answers a `!pubkey` holding the key alone only over a direct connection to the maker
+  (`bare_pubkey_policy`), which vortex-ng's makers meet by sending `features=` after the key.

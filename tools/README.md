@@ -7,7 +7,8 @@
 - `jmng-vectors/`: the same vectors produced by joinmarket-ng's own `jmcore` at the pinned commit, in a
   throwaway VM (it downloads and runs upstream code). **Run 2026-11-10** (Kata, agentrun, jmcore at
   `c3312cb`, Python 3.11.2): its 4 PoDLE proofs and 3 signatures are byte-identical to `ref-vectors` and to the
-  vectors pinned in `vortex-ng-core`; its J_2 NUMS point is pinned too.
+  vectors pinned in `vortex-ng-core`; its J_2 NUMS point is pinned too. **Run again 2026-11-26** at the 0.44.1
+  pin (`3dc893b`) beside a run at `c3312cb` in the same VM: every vector line identical.
 - `itest/run.sh`: whole CoinJoins against a real regtest node, so consensus code judges what vortex-ng signs
   (`crates/vortex-ng-node/tests/regtest.rs`; without its two environment variables that test skips itself).
   For `sw0`, `tr0` and `wsh0`: two bonded makers and a taker are funded by mined coinbases, sync from the node's
@@ -79,7 +80,7 @@
   both directions. Still not covered: `wsh0` (joinmarket-ng has no such pit), Tor, more than one relay, channel
   rings.
 - `mixed-interop/run.sh`: one JoinMarket round with makers of three implementations (issue #51):
-  joinmarket-clientserver (v0.9.12), JoinMarket-NG (0.43.0) and vortex-ng, one maker each, on regtest. They
+  joinmarket-clientserver (v0.9.12), JoinMarket-NG (0.44.1) and vortex-ng, one maker each, on regtest. They
   meet on joinmarket-clientserver's directory node in its testing mode (plain TCP on loopback, no Tor), where
   everyone says `testnet` in the handshake; each maker serves on loopback. Each implementation's taker then does
   a round with all three makers, and vortex-ng's taker also checks that a commitment one of its makers announces

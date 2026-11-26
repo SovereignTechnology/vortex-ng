@@ -1,8 +1,10 @@
 //! The maker's check of an unsigned CoinJoin transaction before signing.
 //!
 //! joinmarket-ng's `maker/tx_verification.py` (`verify_unsigned_transaction`, documented in
-//! `docs/technical/maker-verification-checklist.md`) at the pinned main, plus PR #643's locktime guard,
-//! plus the pit rules of JMP-0010 (`tr0`) and the `wsh0` draft: every output, and every input's prevout,
+//! `docs/technical/maker-verification-checklist.md`) at the pinned main, plus PR #643's locktime guard
+//! (the pinned main's own guard, in `maker/coinjoin.py`, is narrower: 6 blocks past the tip and no time
+//! locktime), plus the pinned main's refusal of a BIP68 relative locktime on any input, plus the pit rules
+//! of JMP-0010 (`tr0`) and the `wsh0` draft: every output, and every input's prevout,
 //! of the pit's script family, and a non-negative fee once every prevout is known. Two further checks a
 //! correct taker never trips: no duplicate inputs, and distinct coinjoin and change scripts.
 //!
@@ -21,6 +23,10 @@ pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 pub const LOCKTIME_HEIGHT_TOLERANCE: u32 = 12;
 /// How far into the future a time locktime may be, seconds (PR #643).
 pub const LOCKTIME_TIME_TOLERANCE: u64 = 2 * 60 * 60;
+/// BIP68: an input sequence with this bit set carries no relative locktime.
+const SEQUENCE_DISABLE_FLAG: u32 = 1 << 31;
+/// BIP68: the relative locktime's value, in blocks or in units of 512 seconds.
+const SEQUENCE_DELAY_MASK: u32 = 0xFFFF;
 
 /// What the maker agreed to in this session.
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +67,8 @@ pub enum TxError {
     DuplicateInput(OutPoint),
     /// The locktime could strand our inputs.
     Locktime(u32),
+    /// This input's sequence holds the whole transaction back (a BIP68 relative locktime).
+    RelativeLocktime(OutPoint),
     /// One of our declared UTXOs is not an input.
     MissingOurInput(OutPoint),
     /// One of our inputs already carries a signature.
@@ -146,6 +154,15 @@ pub fn verify_unsigned(
         }
     }
     check_locktime(tx.lock_time.to_consensus_u32(), chain)?;
+    // From version 2, any input can delay the whole transaction until its coin is old enough, by up to
+    // 65,535 blocks or about 388 days, stranding our inputs as a far locktime would.
+    if version >= 2
+        && let Some(input) = tx.input.iter().find(|i| {
+            i.sequence.0 & SEQUENCE_DISABLE_FLAG == 0 && i.sequence.0 & SEQUENCE_DELAY_MASK != 0
+        })
+    {
+        return Err(TxError::RelativeLocktime(input.previous_output));
+    }
 
     for outpoint in terms.our_utxos.keys() {
         let input = tx
@@ -486,6 +503,34 @@ mod tests {
             verify_unsigned(&c.tx, &terms, &c.others, &blind),
             Err(TxError::Locktime(899_000))
         );
+    }
+
+    #[test]
+    fn relative_locktime_guard() {
+        let pit = Pit::Sw0;
+        let seq = |i: usize, s: u32, v: i32| {
+            let mut c = case(pit);
+            c.tx.version = Version(v);
+            c.tx.input[i].sequence = Sequence(s);
+            c
+        };
+        // The sequences takers send: final, locktime enabled, replaceable; a zero delay holds nothing back.
+        for s in [0xFFFF_FFFF, 0xFFFF_FFFE, 0xFFFF_FFFD, 0] {
+            check(pit, &seq(1, s, 2)).unwrap();
+        }
+        // A delay in blocks or in time, on our input or another's.
+        assert_eq!(
+            check(pit, &seq(0, 1, 2)),
+            Err(TxError::RelativeLocktime(op(1)))
+        );
+        assert_eq!(
+            check(pit, &seq(1, 0x0040_FFFF, 3)),
+            Err(TxError::RelativeLocktime(op(2)))
+        );
+        // Bits outside the flag, the type and the value carry no delay of their own.
+        check(pit, &seq(1, 0x0001_0000, 2)).unwrap();
+        // BIP68 does not apply to version 1.
+        check(pit, &seq(1, 1, 1)).unwrap();
     }
 
     #[test]

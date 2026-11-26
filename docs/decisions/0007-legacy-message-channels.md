@@ -24,7 +24,7 @@ project has connected to the live network):
   the onion channel with five directory nodes **and** one IRC server, hackint, reached over Tor (`#joinmarket-pit`).
   All configured channels are used at once. Its message-channel code is the same as 0.9.11's, except that a
   received `!hp2` commitment must now be canonical hex before it is stored or announced.
-- **JoinMarket-NG** (0.43.0, our pin): onion directories and direct onion connections only; it never
+- **JoinMarket-NG** (0.44.1, our pin): onion directories and direct onion connections only; it never
   implemented IRC. Its eight default mainnet directory nodes include the five above, so both implementations
   meet on the same directories.
 
