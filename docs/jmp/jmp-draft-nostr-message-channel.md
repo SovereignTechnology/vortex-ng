@@ -114,6 +114,11 @@ Every key used on this channel is new and used for nothing else:
 Receivers MUST ignore events whose `network` differs from their own. Relays index only single-letter tags
 (NIP-01), so subscriptions filter on `t`, `f`, `p` and `d`, never on `network`, `jmpk` or `relay`.
 
+A `relay` value is a `ws://` or `wss://` URL of printable ASCII without spaces. Receivers MUST drop a 31402 or
+21402 event with no `relay` tag, more than eight, or one that is not such a URL of at most 256 bytes. In a
+rumor (below) they MUST pass over a `relay` tag that is not, use at most the first eight that are, and drop
+the message if none is.
+
 ### Offers (kind 31402)
 
 A maker publishes its live offers for one pit as one addressable event:

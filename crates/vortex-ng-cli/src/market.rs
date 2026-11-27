@@ -41,8 +41,6 @@ use crate::seen_log::SeenLog;
 use crate::wallet::{failed, network_name, parse};
 use crate::{Failure, lightning, secret, wallet};
 
-/// Relays a nick connects to at most.
-const MAX_RELAYS: usize = 8;
 /// The options that say how to reach the node.
 const RPC_OPTIONS: [&str; 4] = [
     "rpc-url",
@@ -55,9 +53,14 @@ fn usage(why: &str) -> Failure {
     Failure::Usage(why.into())
 }
 
-/// The relays `--relays` names: one to eight `ws://` or `wss://` URLs, separated by commas.
+/// The relays `--relays` names: one to eight `ws://` or `wss://` URLs of at most 256 bytes, separated by
+/// commas.
 pub(crate) fn relays(args: &Args) -> Result<Vec<String>, Failure> {
-    let wrong = || usage("`--relays` is one to eight ws:// or wss:// URLs, separated by commas");
+    let wrong = || {
+        usage(
+            "`--relays` is one to eight ws:// or wss:// URLs of at most 256 bytes, separated by commas",
+        )
+    };
     let Some(given) = args.get("relays") else {
         return Ok(Vec::new());
     };
@@ -65,13 +68,14 @@ pub(crate) fn relays(args: &Args) -> Result<Vec<String>, Failure> {
         .split(',')
         .map(|relay| relay.trim().to_string())
         .collect();
+    // A relay tag's rule (the draft's common tags), and something after the scheme.
     let valid = |relay: &String| {
-        ["ws://", "wss://"]
-            .iter()
-            .any(|scheme| relay.len() > scheme.len() && relay.starts_with(*scheme))
-            && !relay.contains(char::is_whitespace)
+        vortex_ng_nostr::valid_relay_url(relay) && !["ws://", "wss://"].contains(&relay.as_str())
     };
-    if relays.is_empty() || relays.len() > MAX_RELAYS || !relays.iter().all(valid) {
+    if relays.is_empty()
+        || relays.len() > vortex_ng_nostr::MAX_RELAY_TAGS
+        || !relays.iter().all(valid)
+    {
         return Err(wrong());
     }
     Ok(relays)

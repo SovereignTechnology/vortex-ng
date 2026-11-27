@@ -18,7 +18,7 @@ use vortex_ng_core::line::{PrivMsg, verify_line};
 use vortex_ng_core::protocol::NOSTR_HOSTID;
 
 use crate::keys::{NickKeys, nostr_public};
-use crate::{ChannelError, KIND_PRIVATE};
+use crate::{ChannelError, KIND_PRIVATE, check_relays, valid_relay_url};
 
 /// Largest part of a line, bytes.
 pub const MAX_PART: usize = 16_000;
@@ -29,7 +29,7 @@ pub const WRAP_TTL: u64 = 600;
 /// How long a receiver keeps an incomplete message, seconds.
 pub const REASSEMBLY_WINDOW: u64 = 60;
 /// Most `relay` tags a rumor carries (where the sender reads its private messages).
-pub const MAX_REPLY_RELAYS: usize = 8;
+pub const MAX_REPLY_RELAYS: usize = crate::MAX_RELAY_TAGS;
 /// Incomplete messages kept per sender.
 pub const MAX_PENDING_PER_SENDER: usize = 4;
 
@@ -46,9 +46,7 @@ pub fn wrap_line(
     reply_relays: &[String],
     now: u64,
 ) -> Result<Vec<Event>, ChannelError> {
-    if reply_relays.is_empty() || reply_relays.len() > MAX_REPLY_RELAYS {
-        return Err(ChannelError::Invalid("one to eight reply relays"));
-    }
+    check_relays(reply_relays)?;
     if line.is_empty() || !line.is_ascii() {
         return Err(ChannelError::Invalid("line must be non-empty ASCII"));
     }
@@ -65,7 +63,6 @@ pub fn wrap_line(
     } else {
         String::new()
     };
-    let ts = Timestamp::from_secs(now);
     let mut wraps = Vec::with_capacity(parts.len());
     for (i, part) in parts.iter().enumerate() {
         let mut tags = vec![Tag::public_key(*recipient)];
@@ -79,38 +76,49 @@ pub fn wrap_line(
                     .map_err(crypto)?,
             );
         }
-        let rumor = EventBuilder::new(Kind::Custom(KIND_PRIVATE), *part)
-            .tags(tags)
-            .custom_created_at(ts)
-            .finalize_unsigned(sender.nostr().public_key());
-        let sealed = nip44::encrypt(
-            sender.nostr().secret_key(),
-            recipient,
-            rumor.as_json(),
-            Version::V2,
-        )
-        .map_err(crypto)?;
-        let seal = EventBuilder::new(Kind::Seal, sealed)
-            .custom_created_at(ts)
-            .finalize(sender.nostr())?;
-        let one_time = Keys::generate();
-        let wrapped = nip44::encrypt(
-            one_time.secret_key(),
-            recipient,
-            seal.as_json(),
-            Version::V2,
-        )
-        .map_err(crypto)?;
-        let wrap = EventBuilder::new(Kind::GiftWrap, wrapped)
-            .tags([
-                Tag::public_key(*recipient),
-                Tag::expiration(Timestamp::from_secs(now + WRAP_TTL)),
-            ])
-            .custom_created_at(ts)
-            .finalize(&one_time)?;
-        wraps.push(wrap);
+        wraps.push(seal_and_wrap(sender, recipient, part, tags, now)?);
     }
     Ok(wraps)
+}
+
+/// A rumor of `content` and `tags` from `sender`, sealed and gift-wrapped for `recipient` (NIP-59).
+fn seal_and_wrap(
+    sender: &NickKeys,
+    recipient: &nostr::key::PublicKey,
+    content: &str,
+    tags: Vec<Tag>,
+    now: u64,
+) -> Result<Event, ChannelError> {
+    let ts = Timestamp::from_secs(now);
+    let rumor = EventBuilder::new(Kind::Custom(KIND_PRIVATE), content)
+        .tags(tags)
+        .custom_created_at(ts)
+        .finalize_unsigned(sender.nostr().public_key());
+    let sealed = nip44::encrypt(
+        sender.nostr().secret_key(),
+        recipient,
+        rumor.as_json(),
+        Version::V2,
+    )
+    .map_err(crypto)?;
+    let seal = EventBuilder::new(Kind::Seal, sealed)
+        .custom_created_at(ts)
+        .finalize(sender.nostr())?;
+    let one_time = Keys::generate();
+    let wrapped = nip44::encrypt(
+        one_time.secret_key(),
+        recipient,
+        seal.as_json(),
+        Version::V2,
+    )
+    .map_err(crypto)?;
+    Ok(EventBuilder::new(Kind::GiftWrap, wrapped)
+        .tags([
+            Tag::public_key(*recipient),
+            Tag::expiration(Timestamp::from_secs(now + WRAP_TTL)),
+        ])
+        .custom_created_at(ts)
+        .finalize(&one_time)?)
 }
 
 /// Which part of a split line a wrap carries.
@@ -174,7 +182,7 @@ pub fn unwrap(recipient: &NickKeys, wrap: &Event) -> Result<Received, ChannelErr
         .iter()
         .filter(|t| t.kind() == "relay")
         .filter_map(|t| t.content())
-        .filter(|r| r.starts_with("wss://") || r.starts_with("ws://"))
+        .filter(|r| valid_relay_url(r))
         .take(MAX_REPLY_RELAYS)
         .map(str::to_string)
         .collect();
@@ -495,5 +503,86 @@ mod tests {
             open_line(&maker, &taker.nostr().public_key(), &other),
             Err(ChannelError::Line(_))
         ));
+    }
+
+    /// Eight relay URLs of the longest length a `relay` tag may hold.
+    fn longest_relays() -> Vec<String> {
+        (0..8)
+            .map(|i| format!("wss://{i}{}", "r".repeat(249)))
+            .collect()
+    }
+
+    #[test]
+    fn reply_relays_follow_the_relay_tag_rules() {
+        let (taker, maker) = (keys(1), keys(2));
+        let text = line(&taker, &maker, "fill", "0 1");
+        let to = maker.nostr().public_key();
+        let wraps = wrap_line(&taker, &to, &text, &longest_relays(), NOW).unwrap();
+        assert_eq!(unwrap(&maker, &wraps[0]).unwrap().relays, longest_relays());
+        let mut nine = longest_relays();
+        nine.push("wss://ninth.example".to_string());
+        for bad in [
+            vec![],
+            nine,
+            vec![format!("wss://{}", "r".repeat(251))],
+            vec!["https://relay.example".to_string()],
+        ] {
+            assert!(wrap_line(&taker, &to, &text, &bad, NOW).is_err(), "{bad:?}");
+        }
+        // A sender breaking the rules: its unusable relay tags are passed over, the first eight usable kept.
+        let mut tags = vec![Tag::public_key(to)];
+        for relay in [
+            format!("wss://{}", "r".repeat(251)),
+            "https://relay.example".to_string(),
+            "wss://relay.example/a b".to_string(),
+        ]
+        .into_iter()
+        .chain(longest_relays())
+        .chain(["wss://ninth.example".to_string()])
+        {
+            tags.push(Tag::parse(["relay", relay.as_str()]).unwrap());
+        }
+        let wrap = seal_and_wrap(&taker, &to, &text, tags, NOW).unwrap();
+        assert_eq!(unwrap(&maker, &wrap).unwrap().relays, longest_relays());
+        // With none usable the message is dropped.
+        let tags = vec![
+            Tag::public_key(to),
+            Tag::parse(["relay", "https://relay.example"]).unwrap(),
+        ];
+        let wrap = seal_and_wrap(&taker, &to, &text, tags, NOW).unwrap();
+        assert_eq!(
+            unwrap(&maker, &wrap),
+            Err(ChannelError::Invalid("rumor names no reply relay"))
+        );
+    }
+
+    #[test]
+    fn the_largest_wrap_fits_the_draft_size_floor() {
+        // The draft's worst case: a full 16,000-byte part of a split line, with eight 256-byte relay tags.
+        let (taker, maker) = (keys(1), keys(2));
+        // A one-byte body gives the length of everything else in the line.
+        let rest = line(&taker, &maker, "tx", "A").len() - 1;
+        let text = line(
+            &taker,
+            &maker,
+            "tx",
+            &"A".repeat(MAX_PART * MAX_PARTS - rest),
+        );
+        assert_eq!(text.len(), MAX_PART * MAX_PARTS);
+        let wraps = wrap_line(
+            &taker,
+            &maker.nostr().public_key(),
+            &text,
+            &longest_relays(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(wraps.len(), MAX_PARTS);
+        let first = &wraps[0];
+        assert_eq!(unwrap(&maker, first).unwrap().content.len(), MAX_PART);
+        let message = format!(r#"["EVENT",{}]"#, first.as_json());
+        // What the draft states, and what it asks every relay to accept (40,000 and 39,000).
+        assert_eq!((message.len(), first.content.len()), (38_775, 38_320));
+        assert!(message.len() <= 40_000 && first.content.len() <= 39_000);
     }
 }
