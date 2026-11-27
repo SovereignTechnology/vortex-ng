@@ -68,13 +68,10 @@ pub(crate) fn relays(args: &Args) -> Result<Vec<String>, Failure> {
         .split(',')
         .map(|relay| relay.trim().to_string())
         .collect();
-    // A relay tag's rule (the draft's common tags), and something after the scheme.
-    let valid = |relay: &String| {
-        vortex_ng_nostr::valid_relay_url(relay) && !["ws://", "wss://"].contains(&relay.as_str())
-    };
+    // A relay tag's rule (the draft's common tags).
     if relays.is_empty()
         || relays.len() > vortex_ng_nostr::MAX_RELAY_TAGS
-        || !relays.iter().all(valid)
+        || !relays.iter().all(|r| vortex_ng_nostr::valid_relay_url(r))
     {
         return Err(wrong());
     }

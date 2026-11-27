@@ -32,12 +32,22 @@ pub const MAX_RELAY_TAGS: usize = 8;
 /// Longest URL a `relay` tag may hold, bytes.
 pub const MAX_RELAY_URL: usize = 256;
 
-/// Whether `url` may stand in a `relay` tag: a `ws://` or `wss://` URL of at most [`MAX_RELAY_URL`] bytes,
-/// printable ASCII without spaces. The draft's size limits assume no longer tag.
+/// Whether `url` may stand in a `relay` tag: a `ws://` or `wss://` URL naming a host, at most
+/// [`MAX_RELAY_URL`] bytes of printable ASCII without spaces. The draft's size limits assume no longer tag.
 pub fn valid_relay_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+    else {
+        return false;
+    };
     url.len() <= MAX_RELAY_URL
-        && (url.starts_with("wss://") || url.starts_with("ws://"))
         && url.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        && !rest
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .is_empty()
 }
 
 /// One to [`MAX_RELAY_TAGS`] relay URLs, each one [`valid_relay_url`].

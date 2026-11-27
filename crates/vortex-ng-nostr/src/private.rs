@@ -32,6 +32,15 @@ pub const REASSEMBLY_WINDOW: u64 = 60;
 pub const MAX_REPLY_RELAYS: usize = crate::MAX_RELAY_TAGS;
 /// Incomplete messages kept per sender.
 pub const MAX_PENDING_PER_SENDER: usize = 4;
+/// Largest `EVENT` message a wrap may make, bytes: the floor every relay must accept (the draft).
+pub const MAX_EVENT_MESSAGE: usize = 40_000;
+/// Longest `content` a wrap may carry, characters: the same floor.
+pub const MAX_EVENT_CONTENT: usize = 39_000;
+
+/// The length of the `["EVENT",<event>]` message that publishes `event`, bytes.
+fn event_message_len(event: &Event) -> usize {
+    r#"["EVENT",]"#.len() + event.as_json().len()
+}
 
 fn crypto<E: std::fmt::Display>(e: E) -> ChannelError {
     ChannelError::Crypto(e.to_string())
@@ -76,7 +85,15 @@ pub fn wrap_line(
                     .map_err(crypto)?,
             );
         }
-        wraps.push(seal_and_wrap(sender, recipient, part, tags, now)?);
+        let wrap = seal_and_wrap(sender, recipient, part, tags, now)?;
+        // JSON escaping grows a part inside the encryption (a quote or a backslash takes two bytes, a
+        // control character six): a wrap past the floor would be refused by relays that keep to it.
+        if wrap.content.len() > MAX_EVENT_CONTENT || event_message_len(&wrap) > MAX_EVENT_MESSAGE {
+            return Err(ChannelError::Invalid(
+                "line too large for relays once escaped",
+            ));
+        }
+        wraps.push(wrap);
     }
     Ok(wraps)
 }
@@ -514,7 +531,7 @@ mod tests {
 
     #[test]
     fn reply_relays_follow_the_relay_tag_rules() {
-        let (taker, maker) = (keys(1), keys(2));
+        let (taker, maker) = (NickKeys::generate(), NickKeys::generate());
         let text = line(&taker, &maker, "fill", "0 1");
         let to = maker.nostr().public_key();
         let wraps = wrap_line(&taker, &to, &text, &longest_relays(), NOW).unwrap();
@@ -526,6 +543,7 @@ mod tests {
             nine,
             vec![format!("wss://{}", "r".repeat(251))],
             vec!["https://relay.example".to_string()],
+            vec!["wss://".to_string()],
         ] {
             assert!(wrap_line(&taker, &to, &text, &bad, NOW).is_err(), "{bad:?}");
         }
@@ -535,6 +553,7 @@ mod tests {
             format!("wss://{}", "r".repeat(251)),
             "https://relay.example".to_string(),
             "wss://relay.example/a b".to_string(),
+            "wss://".to_string(),
         ]
         .into_iter()
         .chain(longest_relays())
@@ -559,7 +578,7 @@ mod tests {
     #[test]
     fn the_largest_wrap_fits_the_draft_size_floor() {
         // The draft's worst case: a full 16,000-byte part of a split line, with eight 256-byte relay tags.
-        let (taker, maker) = (keys(1), keys(2));
+        let (taker, maker) = (NickKeys::generate(), NickKeys::generate());
         // A one-byte body gives the length of everything else in the line.
         let rest = line(&taker, &maker, "tx", "A").len() - 1;
         let text = line(
@@ -580,9 +599,26 @@ mod tests {
         assert_eq!(wraps.len(), MAX_PARTS);
         let first = &wraps[0];
         assert_eq!(unwrap(&maker, first).unwrap().content.len(), MAX_PART);
-        let message = format!(r#"["EVENT",{}]"#, first.as_json());
-        // What the draft states, and what it asks every relay to accept (40,000 and 39,000).
-        assert_eq!((message.len(), first.content.len()), (38_775, 38_320));
-        assert!(message.len() <= 40_000 && first.content.len() <= 39_000);
+        // What the draft states, under what it asks every relay to accept.
+        let sizes = (event_message_len(first), first.content.len());
+        assert_eq!(sizes, (38_775, 38_320));
+        assert!(sizes.0 <= MAX_EVENT_MESSAGE && sizes.1 <= MAX_EVENT_CONTENT);
+    }
+
+    #[test]
+    fn a_line_that_escapes_past_the_floor_is_not_sent() {
+        let (taker, maker) = (NickKeys::generate(), NickKeys::generate());
+        let to = maker.nostr().public_key();
+        // One part of quotes: each takes two bytes in the rumor's JSON, and the wrap outgrows the floor.
+        let quotes = line(&taker, &maker, "tx", &"\"".repeat(MAX_PART - 300));
+        assert!(quotes.len() <= MAX_PART);
+        assert_eq!(
+            wrap_line(&taker, &to, &quotes, &longest_relays(), NOW).unwrap_err(),
+            ChannelError::Invalid("line too large for relays once escaped")
+        );
+        // The same length without escaping is sent.
+        let plain = line(&taker, &maker, "tx", &"A".repeat(MAX_PART - 300));
+        let wraps = wrap_line(&taker, &to, &plain, &longest_relays(), NOW).unwrap();
+        assert!(event_message_len(&wraps[0]) <= MAX_EVENT_MESSAGE);
     }
 }

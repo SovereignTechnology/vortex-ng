@@ -176,9 +176,12 @@ pub fn verify_author(event: &Event, kind: u16, network: &str) -> Result<Author, 
     if nick != nick_from_pubkey(&key) {
         return Err(ChannelError::Invalid("nick is not the jmpk's nick"));
     }
-    let relays: Vec<String> = values(event, "relay")
-        .into_iter()
-        .map(str::to_string)
+    // Every `relay` tag counts, one without a value too (it names no relay, so the event is dropped).
+    let relays: Vec<String> = event
+        .tags
+        .iter()
+        .filter(|t| t.kind() == "relay")
+        .map(|t| t.content().unwrap_or_default().to_string())
         .collect();
     check_relays(&relays)?;
     let features = values(event, "F")
@@ -349,6 +352,14 @@ mod tests {
 
     /// An offer event signed by `k` with exactly these `relay` tags, built past the builder's checks.
     fn offer_with_relays(k: &NickKeys, relays: &[String]) -> Event {
+        offer_with_relay_tags(
+            k,
+            relays.iter().map(|r| tag(&["relay", r]).unwrap()).collect(),
+        )
+    }
+
+    /// An offer event signed by `k` whose relay tags are `relay_tags`.
+    fn offer_with_relay_tags(k: &NickKeys, relay_tags: Vec<Tag>) -> Event {
         let mut tags = vec![
             tag(&["d", "regtest:sw0"]).unwrap(),
             tag(&["n", k.nick()]).unwrap(),
@@ -357,7 +368,7 @@ mod tests {
             tag(&["t", "joinmarket-regtest"]).unwrap(),
             Tag::expiration(Timestamp::from_secs(NOW + 60)),
         ];
-        tags.extend(relays.iter().map(|r| tag(&["relay", r]).unwrap()));
+        tags.extend(relay_tags);
         EventBuilder::new(Kind::Custom(KIND_OFFER), "!sw0absoffer 1 50000 60000 0 1")
             .tags(tags)
             .custom_created_at(Timestamp::from_secs(NOW))
@@ -367,7 +378,7 @@ mod tests {
 
     #[test]
     fn relay_tags_are_one_to_eight_short_websocket_urls() {
-        let k = keys(1);
+        let k = NickKeys::generate();
         // 256 bytes is the longest allowed, 257 one too many.
         let longest = format!("wss://{}", "r".repeat(250));
         let eight: Vec<String> = (0..8)
@@ -406,6 +417,9 @@ mod tests {
             vec!["https://relay.example".to_string()],
             vec!["wss://relay.example/a b".to_string()],
             vec!["wss://relä.example".to_string()],
+            vec!["wss://".to_string()],
+            vec!["ws:///relay".to_string()],
+            vec!["wss://?relay".to_string()],
             vec![
                 "wss://relay.example".to_string(),
                 "relay2.example".to_string(),
@@ -423,6 +437,17 @@ mod tests {
             );
         }
         read_offer_event(&offer_with_relays(&k, &eight), "regtest", NOW).unwrap();
+        // A `relay` tag without a value names no relay, and it still counts: beside one usable relay, and as a
+        // ninth beside eight.
+        for usable in [&eight[..1], &eight[..]] {
+            let mut tags: Vec<Tag> = usable.iter().map(|r| tag(&["relay", r]).unwrap()).collect();
+            tags.push(tag(&["relay"]).unwrap());
+            assert!(
+                read_offer_event(&offer_with_relay_tags(&k, tags), "regtest", NOW).is_err(),
+                "{} usable",
+                usable.len()
+            );
+        }
     }
 
     #[test]
