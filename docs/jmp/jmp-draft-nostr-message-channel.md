@@ -114,6 +114,11 @@ Every key used on this channel is new and used for nothing else:
 Receivers MUST ignore events whose `network` differs from their own. Relays index only single-letter tags
 (NIP-01), so subscriptions filter on `t`, `f`, `p` and `d`, never on `network`, `jmpk` or `relay`.
 
+A `relay` value is a `ws://` or `wss://` URL naming a host, of printable ASCII without spaces. Receivers MUST drop
+a 31402 or 21402 event with no `relay` tag, more than eight, or one that is not such a URL of at most 256 bytes
+(a `relay` tag without a value is not). In a rumor (below) they MUST pass over a `relay` tag that is not, use at
+most the first eight that are, and drop the message if none is.
+
 ### Offers (kind 31402)
 
 A maker publishes its live offers for one pit as one addressable event:
@@ -197,7 +202,10 @@ order once all `n` with the same sender and `id` have arrived, and drops parts i
 seconds. The sender is the seal's authenticated `pubkey`, so no one can inject parts into another sender's
 message. A receiver MUST bound the memory reassembly can take: at most 4 incomplete messages per sender and a
 global cap it chooses; parts beyond a cap are dropped. This keeps each wrap inside NIP-44 v2's 65,535-byte
-plaintext limit and common relay event limits.
+plaintext limit and common relay event limits. JSON escaping (`"` and `\` take two bytes, control characters
+six) grows a part inside the encryption, so a sender MUST NOT publish a wrap whose `EVENT` message exceeds 40,000
+bytes or whose `content` exceeds 39,000 characters (the floor under "Relay requirements"): such a line is not
+sent. JoinMarket's lines contain no such characters.
 
 **Receiving.** The receiver MUST unwrap and unseal per NIP-59, verify the seal's signature, and drop the message
 unless all of the following hold: the rumor's `pubkey` equals the seal's `pubkey`; the line's `to_nick` is the

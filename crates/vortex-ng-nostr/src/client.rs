@@ -109,8 +109,11 @@ impl NickClient {
         outbound: &Outbound,
         timeout: Duration,
     ) -> Result<NickClient, ChannelError> {
-        if relays.is_empty() {
-            return Err(ChannelError::Invalid("at least one relay"));
+        // Every relay may be named in our `relay` tags, so each must fit one; the first eight are.
+        if relays.is_empty() || !relays.iter().all(|r| crate::valid_relay_url(r)) {
+            return Err(ChannelError::Invalid(
+                "at least one relay, each a ws:// or wss:// URL of at most 256 bytes",
+            ));
         }
         let path = outbound.path().await.map_err(io)?;
         let client = match path.proxy() {

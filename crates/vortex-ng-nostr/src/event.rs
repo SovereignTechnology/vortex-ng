@@ -8,7 +8,7 @@ use vortex_ng_core::nick::nick_from_pubkey;
 use vortex_ng_core::offer::{Offer, Pit};
 
 use crate::keys::{NickKeys, nostr_public};
-use crate::{ChannelError, KIND_OFFER, KIND_PUBLIC};
+use crate::{ChannelError, KIND_OFFER, KIND_PUBLIC, check_relays};
 
 /// Longest an offer event may live, seconds.
 pub const MAX_OFFER_TTL: u64 = 3600;
@@ -36,9 +36,7 @@ fn tag(values: &[&str]) -> Result<Tag, ChannelError> {
 }
 
 fn common_tags(keys: &NickKeys, network: &str, relays: &[&str]) -> Result<Vec<Tag>, ChannelError> {
-    if relays.is_empty() {
-        return Err(ChannelError::Invalid("at least one relay tag"));
-    }
+    check_relays(relays)?;
     let mut tags = vec![
         tag(&["n", keys.nick()])?,
         tag(&["jmpk", &keys.jmpk_hex()])?,
@@ -178,13 +176,14 @@ pub fn verify_author(event: &Event, kind: u16, network: &str) -> Result<Author, 
     if nick != nick_from_pubkey(&key) {
         return Err(ChannelError::Invalid("nick is not the jmpk's nick"));
     }
-    let relays: Vec<String> = values(event, "relay")
-        .into_iter()
-        .map(str::to_string)
+    // Every `relay` tag counts, one without a value too (it names no relay, so the event is dropped).
+    let relays: Vec<String> = event
+        .tags
+        .iter()
+        .filter(|t| t.kind() == "relay")
+        .map(|t| t.content().unwrap_or_default().to_string())
         .collect();
-    if relays.is_empty() {
-        return Err(ChannelError::Invalid("relay"));
-    }
+    check_relays(&relays)?;
     let features = values(event, "F")
         .first()
         .map(|f| {
@@ -349,6 +348,106 @@ mod tests {
         assert!(offer_event(&k, "regtest", Pit::Sw0, &[], &[], &RELAYS, NOW, 60).is_err());
         assert!(offer_event(&k, "regtest", Pit::Sw0, &offers(), &[], &[], NOW, 60).is_err());
         assert!(offer_event(&k, "regtest", Pit::Sw0, &offers(), &[], &RELAYS, NOW, 3601).is_err());
+    }
+
+    /// An offer event signed by `k` with exactly these `relay` tags, built past the builder's checks.
+    fn offer_with_relays(k: &NickKeys, relays: &[String]) -> Event {
+        offer_with_relay_tags(
+            k,
+            relays.iter().map(|r| tag(&["relay", r]).unwrap()).collect(),
+        )
+    }
+
+    /// An offer event signed by `k` whose relay tags are `relay_tags`.
+    fn offer_with_relay_tags(k: &NickKeys, relay_tags: Vec<Tag>) -> Event {
+        let mut tags = vec![
+            tag(&["d", "regtest:sw0"]).unwrap(),
+            tag(&["n", k.nick()]).unwrap(),
+            tag(&["jmpk", &k.jmpk_hex()]).unwrap(),
+            tag(&["network", "regtest"]).unwrap(),
+            tag(&["t", "joinmarket-regtest"]).unwrap(),
+            Tag::expiration(Timestamp::from_secs(NOW + 60)),
+        ];
+        tags.extend(relay_tags);
+        EventBuilder::new(Kind::Custom(KIND_OFFER), "!sw0absoffer 1 50000 60000 0 1")
+            .tags(tags)
+            .custom_created_at(Timestamp::from_secs(NOW))
+            .finalize(k.nostr())
+            .unwrap()
+    }
+
+    #[test]
+    fn relay_tags_are_one_to_eight_short_websocket_urls() {
+        let k = NickKeys::generate();
+        // 256 bytes is the longest allowed, 257 one too many.
+        let longest = format!("wss://{}", "r".repeat(250));
+        let eight: Vec<String> = (0..8)
+            .map(|i| format!("wss://{i}{}", "r".repeat(249)))
+            .collect();
+        assert!(eight.iter().all(|r| r.len() == 256));
+        fn refs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        let build = |relays: &[String]| {
+            offer_event(
+                &k,
+                "regtest",
+                Pit::Sw0,
+                &offers(),
+                &[],
+                &refs(relays),
+                NOW,
+                60,
+            )
+        };
+        let (author, _) = read_offer_event(&build(&eight).unwrap(), "regtest", NOW).unwrap();
+        assert_eq!(author.relays, eight);
+        read_public_event(
+            &public_event(&k, "regtest", "!orderbook", &[longest.as_str()], NOW).unwrap(),
+            "regtest",
+        )
+        .unwrap();
+
+        let mut nine = eight.clone();
+        nine.push("wss://ninth.example".to_string());
+        let bad: Vec<Vec<String>> = vec![
+            vec![],
+            nine,
+            vec![format!("{longest}r")],
+            vec!["https://relay.example".to_string()],
+            vec!["wss://relay.example/a b".to_string()],
+            vec!["wss://relä.example".to_string()],
+            vec!["wss://".to_string()],
+            vec!["ws:///relay".to_string()],
+            vec!["wss://?relay".to_string()],
+            vec![
+                "wss://relay.example".to_string(),
+                "relay2.example".to_string(),
+            ],
+        ];
+        for relays in &bad {
+            // Neither built nor accepted from someone else.
+            assert!(build(relays).is_err(), "{relays:?}");
+            assert_eq!(
+                read_offer_event(&offer_with_relays(&k, relays), "regtest", NOW).map(|_| ()),
+                Err(ChannelError::Invalid(
+                    "one to eight ws:// or wss:// relay URLs of at most 256 bytes"
+                )),
+                "{relays:?}"
+            );
+        }
+        read_offer_event(&offer_with_relays(&k, &eight), "regtest", NOW).unwrap();
+        // A `relay` tag without a value names no relay, and it still counts: beside one usable relay, and as a
+        // ninth beside eight.
+        for usable in [&eight[..1], &eight[..]] {
+            let mut tags: Vec<Tag> = usable.iter().map(|r| tag(&["relay", r]).unwrap()).collect();
+            tags.push(tag(&["relay"]).unwrap());
+            assert!(
+                read_offer_event(&offer_with_relay_tags(&k, tags), "regtest", NOW).is_err(),
+                "{} usable",
+                usable.len()
+            );
+        }
     }
 
     #[test]

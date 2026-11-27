@@ -27,6 +27,42 @@ pub const KIND_PUBLIC: u16 = 21402;
 /// Kind of the rumor that carries a private message line. Provisional until agreed with joinmarket-ng.
 pub const KIND_PRIVATE: u16 = 21403;
 
+/// Most `relay` tags an event or rumor carries (the draft's common tags: one to eight).
+pub const MAX_RELAY_TAGS: usize = 8;
+/// Longest URL a `relay` tag may hold, bytes.
+pub const MAX_RELAY_URL: usize = 256;
+
+/// Whether `url` may stand in a `relay` tag: a `ws://` or `wss://` URL naming a host, at most
+/// [`MAX_RELAY_URL`] bytes of printable ASCII without spaces. The draft's size limits assume no longer tag.
+pub fn valid_relay_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+    else {
+        return false;
+    };
+    url.len() <= MAX_RELAY_URL
+        && url.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        && !rest
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .is_empty()
+}
+
+/// One to [`MAX_RELAY_TAGS`] relay URLs, each one [`valid_relay_url`].
+fn check_relays<S: AsRef<str>>(relays: &[S]) -> Result<(), ChannelError> {
+    if relays.is_empty()
+        || relays.len() > MAX_RELAY_TAGS
+        || !relays.iter().all(|r| valid_relay_url(r.as_ref()))
+    {
+        return Err(ChannelError::Invalid(
+            "one to eight ws:// or wss:// relay URLs of at most 256 bytes",
+        ));
+    }
+    Ok(())
+}
+
 /// Why an event was not built or not accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelError {
